@@ -10,6 +10,8 @@ Install from this project with `python -m pip install .` or use
 `requirements.txt` to build a station-local virtual environment. Keep the
 same release version in both Lab Station snapshots.
 
+Python 3.11 or newer is required by the supported runtime dependencies.
+
 ## Quick start
 
 ```bash

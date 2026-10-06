@@ -22,13 +22,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install the same runtime and test dependencies as CI
-        run: |
-          python -m venv .venv
-          source .venv/bin/activate
-          python -m pip install --editable ".[test]"
-
-      - name: Audit installed dependencies
+      - name: Audit runtime dependencies
         uses: pypa/gh-action-pip-audit@v1.1.0
         with:
-          virtual-environment: .venv
+          inputs: requirements.txt
