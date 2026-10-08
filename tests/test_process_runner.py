@@ -421,6 +421,62 @@ def test_realtime_session_runs_in_a_real_spawned_process(tmp_path):
     assert not session._process.is_alive()
 
 
+def bare_realtime_session():
+    session = process_runner.RealtimeSession.__new__(process_runner.RealtimeSession)
+    session._terminated = False
+    session._attached = False
+    session._attach_deadline = None
+    session._attachment_owner = None
+    session.expires_at = None
+    return session
+
+
+def test_realtime_attachment_grace_period_and_owner_are_enforced(monkeypatch):
+    session = bare_realtime_session()
+    owner = object()
+    other_owner = object()
+    monkeypatch.setattr(process_runner.time, "time", lambda: 1000.0)
+
+    session.mark_attached(owner)
+    session.mark_detached(30, attachment_owner=other_owner)
+    assert session._attached is True
+
+    session.mark_detached(30, attachment_owner=owner)
+    assert session._attached is False
+    assert session.can_attach() is True
+    assert session.can_attach(now=1030.0) is False
+
+    session.mark_attached(owner)
+    assert session.can_attach() is True
+    session.mark_detached(10, attachment_owner=other_owner)
+    assert session._attached is True
+    session.mark_detached(10, attachment_owner=owner)
+    assert session._attached is False
+    assert session.can_attach(now=1009.0) is True
+    assert session.can_attach(now=1010.0) is False
+
+
+@pytest.mark.parametrize("expires_at", [1000.0, "invalid"])
+def test_realtime_attachment_rejects_expired_or_invalid_expiry(monkeypatch, expires_at):
+    session = bare_realtime_session()
+    session.mark_attached()
+    session.expires_at = expires_at
+    monkeypatch.setattr(process_runner.time, "time", lambda: 1000.0)
+
+    assert session.can_attach() is False
+
+
+def test_terminated_realtime_session_remains_non_attachable():
+    session = bare_realtime_session()
+    session._terminated = True
+
+    session.mark_detached(5)
+    session.mark_attached()
+
+    assert session._attached is True
+    assert session.can_attach() is False
+
+
 def test_registry_releases_crashed_worker_even_while_client_is_attached(monkeypatch):
     from unittest.mock import Mock
 
@@ -500,8 +556,13 @@ def test_realtime_worker_dispatches_only_allowlisted_session_methods(monkeypatch
 
 def test_module_entrypoint_does_not_start_uvicorn_when_spawn_reimports_it():
     from unittest.mock import patch
+    import sys
 
-    with patch("uvicorn.run") as run_server:
-        runpy.run_module("app.__main__", run_name="__mp_main__")
-
-    run_server.assert_not_called()
+    entrypoint = sys.modules.pop("app.__main__", None)
+    try:
+        with patch("uvicorn.run") as run_server:
+            runpy.run_module("app.__main__", run_name="__mp_main__")
+        run_server.assert_not_called()
+    finally:
+        if entrypoint is not None:
+            sys.modules["app.__main__"] = entrypoint
