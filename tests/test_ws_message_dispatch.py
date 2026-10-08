@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 from fastapi import HTTPException
 
-from app import engine, main
+from app import engine, main, process_runner
 
 
 class Session:
@@ -123,6 +123,35 @@ def test_session_creation_and_capacity_failure(dispatch, monkeypatch, tmp_path):
     with pytest.raises(HTTPException) as exc:
         call({"type": "session.create"}, {"accessKey": "demo.fmu", "claims": {}}, selected_session=None)
     assert exc.value.status_code == 429
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_factory"),
+    [("process", process_runner.RealtimeSession), ("in-process", engine.FmuSession)],
+)
+def test_session_creation_uses_configured_worker_boundary(dispatch, monkeypatch, tmp_path, mode, expected_factory):
+    _session, call = dispatch
+    new_session = Session()
+    created = {}
+    monkeypatch.setattr(main.config, "execution_mode", lambda: mode)
+    monkeypatch.setattr(main.fmu_storage, "fmu_exists", lambda _key: True)
+    monkeypatch.setattr(main.fmu_storage, "get_fmu_path", lambda _key: tmp_path / "demo.fmu")
+
+    def create_session(*args, **kwargs):
+        created["args"] = args
+        created["kwargs"] = kwargs
+        return new_session
+
+    monkeypatch.setattr(engine, "create_session", create_session)
+
+    response = call(
+        {"type": "session.create"},
+        {"accessKey": "demo.fmu", "claims": {}},
+        selected_session=None,
+    )
+
+    assert response["_session"] is new_session
+    assert created["kwargs"]["session_factory"] is expected_factory
 
 
 def test_session_creation_rejects_missing_context_access_key_and_fmu(dispatch, monkeypatch):

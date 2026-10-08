@@ -118,10 +118,13 @@ the FMU runtime exposes the corresponding API. Binary values use base64 in the
 JSON contract, and FMI 3 `Int64`/`UInt64` outputs are serialized as strings to
 avoid loss of precision in JavaScript clients.
 
-One-shot and NDJSON streaming simulations run in a spawned worker process by
-default. Realtime sessions remain in the Station process because they need a
-long-lived interactive state. Set `FMU_EXECUTION_MODE=in-process` only for
-diagnostics or environments where native FMU isolation is managed elsewhere.
+One-shot and NDJSON streaming simulations run in spawned worker processes.
+Each realtime session also owns a separate spawned worker; the API process keeps
+only the session registry and sends an allowlisted control set over private IPC.
+This keeps native FMU crashes and blocking calls scoped to one session while
+preserving session reconnects during the configured grace period. Set
+`FMU_EXECUTION_MODE=in-process` only for diagnostics or environments where
+native FMU isolation is managed elsewhere.
 
 The realtime session advertises `start`, `pause`, `resume`, `reset`, `step`,
 input/output and reconnect capabilities. `reset` recreates the FMU instance

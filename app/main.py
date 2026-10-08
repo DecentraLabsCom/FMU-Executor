@@ -37,7 +37,7 @@ _session_cleanup_task: asyncio.Task | None = None
 async def _cleanup_sessions_loop() -> None:
     try:
         while True:
-            engine.cleanup_expired_sessions()
+            await asyncio.to_thread(engine.cleanup_expired_sessions)
             await asyncio.sleep(1)
     except asyncio.CancelledError:
         return
@@ -69,7 +69,7 @@ async def _shutdown() -> None:
             pass
         _session_cleanup_task = None
     logger.info("Shutting down – terminating all sessions")
-    engine.terminate_all()
+    await asyncio.to_thread(engine.terminate_all)
 
 
 # ── Dependency ───────────────────────────────────────────────────
@@ -325,7 +325,7 @@ async def ws_sessions(ws: WebSocket):
         return
 
     await ws.accept()
-    session: engine.FmuSession | None = None
+    session: Any | None = None
     _emitter_task: asyncio.Task | None = None
     _runner_task: asyncio.Task | None = None
     _expiry_task: asyncio.Task | None = None
@@ -345,7 +345,7 @@ async def ws_sessions(ws: WebSocket):
     async def _run_session() -> None:
         try:
             while session and session.state == "running" and not session._terminated:
-                session.step()
+                await asyncio.to_thread(session.step)
                 await ws.send_text(json.dumps({
                     "type": "sim.progress",
                     "sessionId": session.session_id,
@@ -382,7 +382,7 @@ async def ws_sessions(ws: WebSocket):
         if _runner_task is None or _runner_task.done():
             _runner_task = asyncio.create_task(_run_session())
 
-    async def _expire_session_after_deadline(expiring_session: engine.FmuSession):
+    async def _expire_session_after_deadline(expiring_session: Any):
         nonlocal session
         try:
             expires_at = expiring_session.expires_at
@@ -392,7 +392,7 @@ async def ws_sessions(ws: WebSocket):
             await asyncio.sleep(max(0.0, expires_at - time.time()))
             if session is not expiring_session or expiring_session._terminated:
                 return
-            engine.remove_session(expiring_session.session_id)
+            await asyncio.to_thread(engine.remove_session, expiring_session.session_id)
             session = None
             await ws.send_text(json.dumps({
                 "type": "session.closed",
@@ -412,7 +412,7 @@ async def ws_sessions(ws: WebSocket):
         try:
             while True:
                 if session and session.subscription and session._initialised and not session._terminated:
-                    payload = session.sample_subscription()
+                    payload = await asyncio.to_thread(session.sample_subscription)
                     if payload:
                         await ws.send_text(json.dumps(payload, default=str))
                 await asyncio.sleep(0.01)  # 10 ms polling resolution
@@ -459,7 +459,7 @@ async def ws_sessions(ws: WebSocket):
                         _expiry_task.cancel()
                         _expiry_task = None
                     if session:
-                        engine.remove_session(session.session_id)
+                        await asyncio.to_thread(engine.remove_session, session.session_id)
                     session = None
 
                 if request_id:
@@ -511,15 +511,18 @@ async def ws_sessions(ws: WebSocket):
 
 
 def _sim_outputs_payload(session: engine.FmuSession, outputs: dict[str, Any]) -> dict[str, Any]:
+    next_sequence = getattr(session, "next_sequence", None)
+    sequence = next_sequence() if callable(next_sequence) else session.seq
     payload = {
         "type": "sim.outputs",
         "sessionId": session.session_id,
-        "seq": session.seq,
+        "seq": sequence,
         "dropped": 0,
         "simTime": session._time,
         "values": outputs,
     }
-    session.seq += 1
+    if not callable(next_sequence):
+        session.seq += 1
     return payload
 
 
@@ -527,7 +530,7 @@ async def _handle_ws_message(
     msg_type: str,
     msg: dict,
     gateway_ctx: dict | None,
-    session: engine.FmuSession | None,
+    session: Any | None,
     *,
     start_runner=None,
     stop_runner=None,
@@ -553,15 +556,26 @@ async def _handle_ws_message(
         claims = (gateway_ctx.get("claims") or {})
         exp = claims.get("exp")
         try:
-            new_session = engine.create_session(
+            session_factory = (
+                process_runner.RealtimeSession
+                if config.execution_mode() == "process"
+                else engine.FmuSession
+            )
+            new_session = await asyncio.to_thread(
+                engine.create_session,
                 fmu_path,
                 access_key=access_key,
                 expires_at=exp,
                 gateway_context=gateway_ctx,
+                session_factory=session_factory,
             )
         except engine.CapacityExceededError as exc:
             raise HTTPException(429, "STATION_CAPACITY_EXHAUSTED") from exc
-        new_session.load()
+        try:
+            await asyncio.to_thread(new_session.load)
+        except Exception:
+            await asyncio.to_thread(engine.remove_session, new_session.session_id)
+            raise
 
         return {
             "type": "session.created",
@@ -653,7 +667,8 @@ async def _handle_ws_message(
             await stop_runner()
         options = msg.get("options", {})
         params = msg.get("parameters", {})
-        session.initialize(
+        await asyncio.to_thread(
+            session.initialize,
             start_time=float(options.get("startTime", 0.0)),
             stop_time=float(options.get("stopTime", 1.0)),
             step_size=float(options.get("stepSize")) if options.get("stepSize") is not None else None,
@@ -669,7 +684,7 @@ async def _handle_ws_message(
     if msg_type == "sim.start":
         if session.state not in ("initialized", "paused"):
             raise HTTPException(409, f"Cannot start from state {session.state}")
-        session.resume()
+        await asyncio.to_thread(session.resume)
         if start_runner is not None:
             start_runner()
         return {
@@ -682,7 +697,7 @@ async def _handle_ws_message(
     if msg_type == "sim.pause":
         if stop_runner is not None:
             await stop_runner()
-        session.pause()
+        await asyncio.to_thread(session.pause)
         return {
             "type": "sim.state",
             "sessionId": session.session_id,
@@ -691,7 +706,7 @@ async def _handle_ws_message(
         }
 
     if msg_type == "sim.resume":
-        session.resume()
+        await asyncio.to_thread(session.resume)
         if start_runner is not None:
             start_runner()
         return {
@@ -704,7 +719,7 @@ async def _handle_ws_message(
     if msg_type == "sim.reset":
         if stop_runner is not None:
             await stop_runner()
-        session.reset()
+        await asyncio.to_thread(session.reset)
         return {
             "type": "sim.state",
             "sessionId": session.session_id,
@@ -714,25 +729,28 @@ async def _handle_ws_message(
 
     if msg_type == "sim.step":
         step_size = msg.get("deltaT", msg.get("stepSize"))
-        session.step(float(step_size) if step_size is not None else None)
-        return _sim_outputs_payload(session, session.get_outputs()["outputs"])
+        await asyncio.to_thread(session.step, float(step_size) if step_size is not None else None)
+        outputs = await asyncio.to_thread(session.get_outputs)
+        return _sim_outputs_payload(session, outputs["outputs"])
 
     if msg_type == "sim.runUntil":
         target = msg.get("time", msg.get("targetTime"))
         if target is None:
             raise HTTPException(400, "INVALID_COMMAND – missing targetTime")
         step_size = msg.get("stepSize", msg.get("deltaT"))
-        session.run_until(
+        await asyncio.to_thread(
+            session.run_until,
             float(target),
             step_size=float(step_size) if step_size is not None else None,
         )
-        return _sim_outputs_payload(session, session.get_outputs()["outputs"])
+        outputs = await asyncio.to_thread(session.get_outputs)
+        return _sim_outputs_payload(session, outputs["outputs"])
 
     if msg_type == "sim.setInputs":
         values = msg.get("values", {})
         if not isinstance(values, dict):
             raise HTTPException(400, "sim.setInputs requires an object 'values'")
-        session.set_inputs(values)
+        await asyncio.to_thread(session.set_inputs, values)
         return {
             "type": "sim.inputs.updated",
             "sessionId": session.session_id,
@@ -755,7 +773,7 @@ async def _handle_ws_message(
             ]
         else:
             refs = msg.get("valueReferences")
-        result = session.get_outputs(refs)
+        result = await asyncio.to_thread(session.get_outputs, refs)
         return _sim_outputs_payload(session, result["outputs"])
 
     if msg_type == "sim.subscribeOutputs":
@@ -801,7 +819,7 @@ async def _handle_ws_message(
         }
 
     if msg_type == "session.terminate":
-        session.terminate()
+        await asyncio.to_thread(session.terminate)
         return {
             "type": "session.closed",
             "sessionId": session.session_id,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import queue
+import runpy
 import sys
 from types import SimpleNamespace
 
@@ -267,3 +268,240 @@ def test_new_process_uses_spawn_and_starts_named_worker(monkeypatch, tmp_path):
     assert context.kwargs["args"][-1] is True
     assert process.started
     assert returned_context is context
+
+
+class FakeRealtimeConnection:
+    def __init__(self):
+        self.requests = []
+        self.responses = []
+        self.closed = False
+
+    def send(self, request):
+        self.requests.append(request)
+        method = request["method"]
+        snapshot = {
+            "state": "loaded" if method == "load" else "running",
+            "time": 0.5 if method == "step" else 0.0,
+            "startTime": 0.0,
+            "stopTime": 2.0,
+            "stepSize": 0.5,
+            "initialised": method != "load",
+            "terminated": method == "terminate",
+            "modelVariables": [{"name": "y", "valueReference": 2, "type": "Real", "causality": "output"}],
+        }
+        result = {"modelName": "isolated-demo"} if method == "load" else {"time": 0.5, "state": "running"}
+        self.responses.append({"requestId": request["requestId"], "ok": True, "result": result, "snapshot": snapshot})
+
+    def poll(self, _timeout=None):
+        return bool(self.responses)
+
+    def recv(self):
+        return self.responses.pop(0)
+
+    def close(self):
+        self.closed = True
+
+
+class FakeRealtimeProcess(FakeProcess):
+    pass
+
+
+class SpawnSafeSession:
+    """Small picklable session used to exercise the real spawn/IPC boundary."""
+
+    def __init__(self, *_args, **_kwargs):
+        self._time = 0.0
+        self._start_time = 0.0
+        self._stop_time = 1.0
+        self._step_size = 0.1
+        self._initialised = False
+        self._terminated = False
+        self._state = "new"
+        self._md = SimpleNamespace(modelVariables=[
+            SimpleNamespace(name="y", valueReference=2, type="Real", causality="output")
+        ])
+
+    @property
+    def state(self):
+        return "terminated" if self._terminated else self._state
+
+    def load(self):
+        self._state = "loaded"
+        return {"modelName": "spawn-safe"}
+
+    def initialize(self, *, start_time=0.0, stop_time=1.0, step_size=None, parameters=None):
+        self._time = start_time
+        self._start_time = start_time
+        self._stop_time = stop_time
+        self._step_size = step_size or 0.1
+        self._initialised = True
+        self._state = "initialized"
+        return {"time": self._time, "state": self._state}
+
+    def step(self, step_size=None):
+        self._time += step_size or self._step_size
+        self._state = "running"
+        return {"time": self._time, "state": self._state}
+
+    def get_outputs(self, refs=None):
+        return {"time": self._time, "outputs": {"y": self._time}}
+
+    def terminate(self):
+        self._terminated = True
+
+
+def test_realtime_session_uses_spawn_worker_and_mirrors_worker_state(monkeypatch, tmp_path):
+    connection = FakeRealtimeConnection()
+    process = FakeRealtimeProcess(alive=True)
+
+    class Context:
+        def Pipe(self, duplex=True):
+            assert duplex is True
+            return connection, SimpleNamespace(close=lambda: None)
+
+        def Process(self, **kwargs):
+            self.kwargs = kwargs
+            self.process = process
+            return process
+
+    context = Context()
+    monkeypatch.setattr(process_runner.mp, "get_context", lambda method: (setattr(context, "method", method) or context))
+
+    session = process_runner.RealtimeSession("realtime-1", tmp_path / "demo.fmu", access_key="demo.fmu")
+    description = session.load()
+    result = session.step(0.5)
+
+    assert context.method == "spawn"
+    assert context.kwargs["name"] == "LabStation-FMU-Realtime"
+    assert context.kwargs["target"] is process_runner._realtime_session_worker
+    assert description == {"modelName": "isolated-demo"}
+    assert result == {"time": 0.5, "state": "running"}
+    assert session.state == "running"
+    assert session._time == 0.5
+    assert session._md.modelVariables[0].valueReference == 2
+    assert [request["method"] for request in connection.requests] == ["load", "step"]
+
+
+def test_realtime_session_terminates_child_and_closes_ipc(monkeypatch, tmp_path):
+    connection = FakeRealtimeConnection()
+    process = FakeRealtimeProcess(alive=True)
+
+    class Context:
+        def Pipe(self, duplex=True):
+            return connection, SimpleNamespace(close=lambda: None)
+
+        def Process(self, **kwargs):
+            return process
+
+    monkeypatch.setattr(process_runner.mp, "get_context", lambda _method: Context())
+    session = process_runner.RealtimeSession("realtime-2", tmp_path / "demo.fmu", access_key="demo.fmu")
+
+    session.terminate()
+
+    assert connection.requests[-1]["method"] == "terminate"
+    assert connection.closed
+    assert process.join_calls
+
+
+def test_realtime_session_runs_in_a_real_spawned_process(tmp_path):
+    session = process_runner.RealtimeSession(
+        "spawn-session",
+        tmp_path / "demo.fmu",
+        access_key="demo.fmu",
+        _worker_session_factory=SpawnSafeSession,
+    )
+    try:
+        assert session.load() == {"modelName": "spawn-safe"}
+        assert session.initialize(start_time=1.0, stop_time=2.0, step_size=0.25)["state"] == "initialized"
+        assert session.step()["time"] == 1.25
+        assert session.get_outputs()["outputs"] == {"y": 1.25}
+        assert session.state == "running"
+    finally:
+        session.terminate()
+    assert not session._process.is_alive()
+
+
+def test_registry_releases_crashed_worker_even_while_client_is_attached(monkeypatch):
+    from unittest.mock import Mock
+
+    from app import engine
+
+    dead_session = SimpleNamespace(
+        _terminated=True,
+        _attached=True,
+        can_attach=lambda _now=None: True,
+        terminate=Mock(),
+    )
+    monkeypatch.setattr(engine, "_sessions", {"dead-session": dead_session})
+
+    engine.cleanup_expired_sessions()
+
+    assert engine.get_session("dead-session") is None
+    dead_session.terminate.assert_called_once_with()
+
+
+def test_realtime_worker_dispatches_only_allowlisted_session_methods(monkeypatch, tmp_path):
+    class Session:
+        def __init__(self, *_args, **_kwargs):
+            self._time = 0.0
+            self._start_time = 0.0
+            self._state = "new"
+            self._stop_time = 1.0
+            self._step_size = 0.1
+            self._initialised = False
+            self._terminated = False
+            self._md = SimpleNamespace(modelVariables=[])
+
+        @property
+        def state(self):
+            return self._state
+
+        def load(self):
+            self._state = "loaded"
+            return {"modelName": "test"}
+
+        def step(self, amount=0.1):
+            self._time += amount
+            self._state = "running"
+            return {"time": self._time, "state": self._state}
+
+        def terminate(self):
+            self._terminated = True
+
+    class Connection:
+        def __init__(self):
+            self.incoming = [
+                {"requestId": "1", "method": "load", "args": [], "kwargs": {}},
+                {"requestId": "2", "method": "step", "args": [0.25], "kwargs": {}},
+                {"requestId": "3", "method": "arbitrary_shell", "args": [], "kwargs": {}},
+                {"requestId": "4", "method": "terminate", "args": [], "kwargs": {}},
+            ]
+            self.outgoing = []
+
+        def recv(self):
+            if not self.incoming:
+                raise EOFError
+            return self.incoming.pop(0)
+
+        def send(self, response):
+            self.outgoing.append(response)
+
+        def close(self):
+            pass
+
+    connection = Connection()
+    process_runner._realtime_session_worker(connection, "session", tmp_path / "demo.fmu", "demo.fmu", Session)
+
+    assert [response["ok"] for response in connection.outgoing] == [True, True, False, True]
+    assert connection.outgoing[1]["snapshot"]["time"] == 0.25
+    assert connection.outgoing[2]["error"] == "FMU worker command is not allowlisted"
+    assert connection.outgoing[3]["snapshot"]["terminated"] is True
+
+
+def test_module_entrypoint_does_not_start_uvicorn_when_spawn_reimports_it():
+    from unittest.mock import patch
+
+    with patch("uvicorn.run") as run_server:
+        runpy.run_module("app.__main__", run_name="__mp_main__")
+
+    run_server.assert_not_called()

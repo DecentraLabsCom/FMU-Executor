@@ -8,6 +8,7 @@ from functools import reduce
 from operator import mul
 import shutil
 import tempfile
+import threading
 import time as _time
 import uuid
 from dataclasses import dataclass
@@ -503,7 +504,8 @@ class FmuSession:
 
 # ── session registry ─────────────────────────────────────────────
 
-_sessions: dict[str, FmuSession] = {}
+_sessions: dict[str, Any] = {}
+_sessions_lock = threading.RLock()
 
 
 class CapacityExceededError(RuntimeError):
@@ -516,30 +518,35 @@ def create_session(
     access_key: str | None = None,
     expires_at: float | int | str | None = None,
     gateway_context: dict[str, Any] | None = None,
-) -> FmuSession:
+    session_factory: Any = None,
+) -> Any:
     cleanup_expired_sessions()
-    if len(_sessions) >= config.MAX_CONCURRENT_SESSIONS:
-        raise CapacityExceededError(
-            f"Max concurrent sessions ({config.MAX_CONCURRENT_SESSIONS}) reached"
+    with _sessions_lock:
+        if len(_sessions) >= config.MAX_CONCURRENT_SESSIONS:
+            raise CapacityExceededError(
+                f"Max concurrent sessions ({config.MAX_CONCURRENT_SESSIONS}) reached"
+            )
+        session_id = f"sess_{uuid.uuid4().hex[:12]}"
+        factory = session_factory or FmuSession
+        session = factory(
+            session_id,
+            fmu_path,
+            access_key=access_key,
+            expires_at=expires_at,
+            gateway_context=gateway_context,
         )
-    session_id = f"sess_{uuid.uuid4().hex[:12]}"
-    session = FmuSession(
-        session_id,
-        fmu_path,
-        access_key=access_key,
-        expires_at=expires_at,
-        gateway_context=gateway_context,
-    )
-    _sessions[session_id] = session
-    return session
+        _sessions[session_id] = session
+        return session
 
 
-def get_session(session_id: str) -> FmuSession | None:
-    return _sessions.get(session_id)
+def get_session(session_id: str) -> Any | None:
+    with _sessions_lock:
+        return _sessions.get(session_id)
 
 
-def get_attachable_session(session_id: str) -> FmuSession | None:
-    session = _sessions.get(session_id)
+def get_attachable_session(session_id: str) -> Any | None:
+    with _sessions_lock:
+        session = _sessions.get(session_id)
     if session is None or not session.can_attach():
         if session is not None and not session.can_attach():
             remove_session(session_id)
@@ -553,33 +560,39 @@ def detach_session(
     *,
     attachment_owner: object | None = None,
 ) -> None:
-    session = _sessions.get(session_id)
+    with _sessions_lock:
+        session = _sessions.get(session_id)
     if session is not None:
         session.mark_detached(grace_seconds, attachment_owner)
 
 
 def cleanup_expired_sessions(now: float | None = None) -> None:
     now = _time.time() if now is None else now
-    expired = [
-        session_id
-        for session_id, session in list(_sessions.items())
-        if not session._attached and not session.can_attach(now)
-    ]
+    with _sessions_lock:
+        expired = [
+            session_id
+            for session_id, session in list(_sessions.items())
+            if session._terminated or (not session._attached and not session.can_attach(now))
+        ]
     for session_id in expired:
         remove_session(session_id)
 
 
 def remove_session(session_id: str) -> None:
-    session = _sessions.pop(session_id, None)
+    with _sessions_lock:
+        session = _sessions.pop(session_id, None)
     if session:
         session.terminate()
 
 
 def active_session_count() -> int:
     cleanup_expired_sessions()
-    return len(_sessions)
+    with _sessions_lock:
+        return len(_sessions)
 
 
 def terminate_all() -> None:
-    for sid in list(_sessions):
+    with _sessions_lock:
+        session_ids = list(_sessions)
+    for sid in session_ids:
         remove_session(sid)

@@ -33,6 +33,7 @@ def _isolate_config(tmp_path: Path):
         "FMU_INTERNAL_TOKEN": "test-secret",
         "FMU_MAX_SESSIONS": "4",
         "FMU_ATTACH_GRACE_SECONDS": "120",
+        "FMU_EXECUTION_MODE": "in-process",
         "FMU_LOG_LEVEL": "WARNING",
     }):
         # Re-import config so the patched env takes effect

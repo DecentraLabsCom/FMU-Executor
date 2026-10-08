@@ -36,6 +36,7 @@ def _isolate_config(tmp_path: Path):
         "FMU_EXECUTOR_TEMP": str(temp_dir),
         "FMU_INTERNAL_TOKEN": "station-shared-secret",
         "FMU_MAX_SESSIONS": "4",
+        "FMU_EXECUTION_MODE": "in-process",
         "FMU_LOG_LEVEL": "WARNING",
     }):
         import importlib
