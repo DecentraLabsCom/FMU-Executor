@@ -34,6 +34,12 @@ def internal_token() -> str | None:
             return base64.b64decode(padded, altchars=b"-_", validate=True).decode("utf-8")
         except (ValueError, UnicodeDecodeError):
             return None
+    token_file = os.environ.get("FMU_INTERNAL_TOKEN_FILE")
+    if token_file:
+        try:
+            return Path(token_file).read_text(encoding="utf-8").strip() or None
+        except OSError:
+            return None
     return _env("FMU_INTERNAL_TOKEN")
 
 # Temp directory for FMU extraction during execution

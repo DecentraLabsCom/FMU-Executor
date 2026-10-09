@@ -25,6 +25,19 @@ station service; expose the configured port only to the Lab Gateway network and
 configure the same non-empty `FMU_INTERNAL_TOKEN` in the Station process
 environment and Gateway's `FMU_STATION_INTERNAL_TOKEN`.
 
+The repository's `Dockerfile` builds the container used by Lab Gateway's
+optional local Executor profile. Pushing a `vX.Y.Z` tag publishes
+`ghcr.io/decentralabscom/fmu-executor:X.Y.Z`; the tag must match both
+`VERSION` and the package version in `pyproject.toml`. Gateway pins a
+versioned image by default, so installing that profile does not require a
+separate FMU-Executor checkout. Station releases continue to package the
+service through their platform installers.
+
+After the first image is published, set its GitHub Container Registry package
+visibility to Public if Gateway installations must pull it without GitHub
+authentication. The source repository is linked automatically by the image's
+OCI source label and the publishing workflow.
+
 On Windows, when Lab Station starts the sidecar through `LabStation\BackgroundService`,
 Windows Task Scheduler runs that task as `SYSTEM`. A per-user Python install or
 user-scoped `pip install` is not visible to that account. Install the
@@ -58,6 +71,7 @@ the Gateway environment expected for station mode:
 | `FMU_EXECUTOR_PORT` | `8091` | Bind port |
 | `FMU_ROOT` | `./fmu-data` | Directory with provisioned `.fmu` files |
 | `FMU_INTERNAL_TOKEN` | *(required)* | Shared secret for `X-Internal-Session-Token`; requests fail closed when it is absent |
+| `FMU_INTERNAL_TOKEN_FILE` | *(unset)* | Optional path to a mounted token file; used when the direct token and base64 token are unset |
 | `FMU_MAX_SESSIONS` | `4` | Effective max concurrent FMU executions (one-shot, stream and realtime) |
 | `FMU_ATTACH_GRACE_SECONDS` | `120` | How long a disconnected realtime session remains attachable before its FMU state is terminated |
 | `FMU_EXECUTOR_TEMP` | `<FMU_ROOT>/.tmp` | Temp dir for FMU extraction |
