@@ -496,9 +496,12 @@ def _new_process(
     capture_series: bool = False,
 ) -> tuple[Any, Any]:
     context = mp.get_context("spawn")
+    worker_args = (str(fmu_path), access_key, parameters, options, output_queue, streaming)
+    if capture_series:
+        worker_args += (True,)
     process = context.Process(
         target=_execute_worker,
-        args=(str(fmu_path), access_key, parameters, options, output_queue, streaming, capture_series),
+        args=worker_args,
         name="LabStation-FMU-Worker",
     )
     process.start()

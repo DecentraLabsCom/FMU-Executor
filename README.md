@@ -26,7 +26,8 @@ configure the same non-empty `FMU_INTERNAL_TOKEN` in the Station process
 environment and Gateway's `FMU_STATION_INTERNAL_TOKEN`.
 
 The repository's `Dockerfile` builds the container used by Lab Gateway's
-optional local Executor profile. Pushing a `vX.Y.Z` tag publishes
+optional local Executor profile. It uses the Docker Official Python image
+from Amazon ECR Public. Pushing a `vX.Y.Z` tag publishes
 `ghcr.io/decentralabscom/fmu-executor:X.Y.Z`; the tag must match both
 `VERSION` and the package version in `pyproject.toml`. Gateway pins a
 versioned image by default, so installing that profile does not require a
