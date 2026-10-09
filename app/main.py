@@ -30,7 +30,7 @@ from . import auth, backends, config, engine, fmu_storage, process_runner
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="FMU Executor", version="0.1.0", docs_url=None, redoc_url=None)
+app = FastAPI(title="FMU Executor", version="0.1.1", docs_url=None, redoc_url=None)
 _session_cleanup_task: asyncio.Task | None = None
 
 

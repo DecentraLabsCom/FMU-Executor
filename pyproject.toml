@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "decentralabs-fmu-executor"
-version = "0.1.0"
+version = "0.1.1"
 description = "Shared FMI 2/3 Co-Simulation service for DecentraLabs stations"
 readme = "README.md"
 requires-python = ">=3.11"
