@@ -29,10 +29,12 @@ def validate_internal_token(request: Request) -> None:
 
 def validate_gateway_context(ctx: dict | None, access_key: str) -> None:
     """Validate that *ctx* is consistent with the requested *access_key*."""
-    if ctx is None:
+    if not isinstance(ctx, dict):
         raise HTTPException(status_code=400, detail="Missing gatewayContext")
 
     claims = ctx.get("claims") or {}
+    if not isinstance(claims, dict):
+        raise HTTPException(status_code=403, detail="INVALID_GATEWAY_CONTEXT")
 
     # Check accessKey match
     ctx_key = ctx.get("accessKey") or claims.get("accessKey") or claims.get("fmuFileName")
@@ -79,5 +81,9 @@ def validate_session_context(ctx: dict | None, expected_ctx: dict | None, access
 
 def extract_access_key_from_context(ctx: dict) -> str | None:
     """Return the canonical access key from a gatewayContext."""
+    if not isinstance(ctx, dict):
+        return None
     claims = ctx.get("claims") or {}
+    if not isinstance(claims, dict):
+        return None
     return ctx.get("accessKey") or claims.get("accessKey") or claims.get("fmuFileName")

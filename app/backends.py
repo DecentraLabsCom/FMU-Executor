@@ -22,7 +22,7 @@ def omsimulator_status() -> dict[str, Any]:
         "enabled": config.omsimulator_enabled(),
         "available": available,
         "commandConfigured": bool(command),
-        "supports": ["SSP", "multi-fmu", "ModelExchange", "CoSimulation"] if available else [],
+        "supports": ["SSP", "multi-fmu", "CoSimulation"] if available else [],
         "state": "available" if available else "planned",
     }
 

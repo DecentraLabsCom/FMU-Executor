@@ -153,7 +153,7 @@ with the original initialization options and inputs.
 | Scalar Real/Float32/Float64, integer, Boolean, String | Supported | Inputs and outputs |
 | FMI 3 arrays | Supported | Fixed-size arrays resolved by FMPy |
 | FMI 3 Binary and Clock | Supported | JSON uses base64 for Binary |
-| FMI 2/FMI 3 Model Exchange | Planned | Requires a solver/composition boundary; not claimed by the Station realtime API |
+| FMI 2/FMI 3 Model Exchange | Not supported; out of scope | DecentraLabs FMU execution is limited to FMI 2/FMI 3 Co-Simulation. |
 | FMI 3 Scheduled Execution | Planned | Not exposed by the current Station contract |
 | SSP/multi-FMU composition | Planned | OMSimulator adapter |
 
@@ -161,28 +161,42 @@ This table is the contract baseline for adding real FMU fixtures to the
 conformance suite; a new type must not be advertised as supported only because
 its model description can be parsed.
 
+`/internal/fmu/describe` reports the capabilities declared by the FMU artifact.
+Its `supportsModelExchange` field describes that artifact; it does not mean the
+Executor can run it. An FMU must provide Co-Simulation to be executable here.
+
 ### OMSimulator (future composition backend)
 
 OMSimulator is not a mandatory dependency of the Windows Station runtime and
-is not used for ordinary single-FMU requests today. The executor exposes its
-planned status and reserves `options.backend: "omsimulator"` for a future
-adapter that will execute SSP/multi-FMU compositions and Model Exchange
-scenarios. Until that adapter is implemented, such a request returns HTTP
-`501`; this keeps the backend choice explicit rather than silently pretending
-that a single-FMU FMPy execution was a composed model.
+is not used for ordinary single-FMU requests today. The executor reserves
+`options.backend: "omsimulator"` for a possible future SSP/multi-FMU composition
+adapter. FMI 2/FMI 3 Model Exchange is out of scope for DecentraLabs FMU
+execution. Until a composition adapter is implemented, an OMSimulator request
+returns HTTP `501`; this keeps the backend choice explicit rather than silently
+pretending that a single-FMU FMPy execution was a composed model.
 
 ### HTTP simulation payloads
+
+Gateway-to-Executor simulation requests include a trusted `gatewayContext`
+created by the authenticated Gateway. Direct calls without that reservation
+scope are rejected, so runs and history remain attached to the reservation
+that authorized them. The private channel also requires
+`X-Internal-Session-Token`.
 
 The one-shot and streaming endpoints accept this body shape:
 
 ```json
 {
   "accessKey": "Heater.fmu",
+  "simId": "gateway-generated-id",
+  "gatewayContext": {
+    "accessKey": "Heater.fmu",
+    "labId": "lab-01",
+    "reservationKey": "reservation-123",
+    "claims": {"accessKey": "Heater.fmu", "labId": "lab-01", "reservationKey": "reservation-123", "pucHash": "...", "exp": 1893456000}
+  },
   "parameters": {"ambient": 293.15},
-  "options": {"startTime": 0, "stopTime": 10, "stepSize": 0.01},
-  "claims": {},
-  "labId": "lab-01",
-  "reservationKey": "reservation-123"
+  "options": {"startTime": 0, "stopTime": 10, "stepSize": 0.01}
 }
 ```
 
@@ -191,6 +205,60 @@ The one-shot and streaming endpoints accept this body shape:
 `seq`, `time`, and `outputs`, followed by `sim.done`; capacity or execution
 failures are emitted as an `error` object with a short `code` and, where
 applicable, `retryable: true`.
+
+### Jobs, batches, cancellation, and history
+
+The Gateway exposes these reservation-authorized routes; callers do not
+address the Executor directly:
+
+| Method | Gateway route | Purpose |
+|---|---|---|
+| `POST` | `/api/v1/simulations/jobs` | Queue a cancellable one-shot simulation and return its ID |
+| `POST` | `/api/v1/simulations/batches` | Queue multiple scenarios against the same private FMU |
+| `GET` | `/api/v1/simulations/{id}` | Read status, elapsed time, and case progress |
+| `POST` | `/api/v1/simulations/{id}/cancel` | Stop the active child process or remaining batch cases |
+| `GET` | `/api/v1/simulations/{id}/result` | Read the completed result or terminal partial result |
+| `GET` | `/api/v1/simulations/history?limit=20&offset=0` | Page through this reservation's history |
+
+These public routes live in Lab Gateway. Its private Station-to-Executor
+contract uses `POST /internal/fmu/simulations/jobs` and
+`POST /internal/fmu/simulations/batches`; status, cancellation, result and
+history use corresponding `/internal/fmu/simulations/...` routes. Reads carry
+the Gateway-created reservation context in `X-Gateway-Context`, encoded as
+base64url JSON. The internal token authenticates the channel; the stored scope
+hash enforces reservation ownership.
+
+Batch requests have at most 8 scenarios. Each scenario can set up to 32
+parameters and at most 16 KiB of parameter JSON. A reservation is limited to
+100 scenario starts per UTC day by default; runs, streams, batch cases,
+realtime `sim.initialize`/`sim.reset` operations, and each non-empty realtime
+`sim.setInputs` update consume this budget.
+Each initialization is limited to 10,000 communication steps, and one batch
+may use at most 20,000 steps across its scenarios. The limits are configurable
+with the environment variables below. They constrain automated parameter
+sweeps; they do not make a black-box model impossible to study through its
+authorized inputs and outputs.
+
+History defaults to 7 days, with a global cap of 10,000 records, 8 MiB per
+stored result, and 256 MiB of stored results in total. History and result reads
+are filtered by the same Gateway, lab, reservation, and pseudonymous-user
+scope used when the work was submitted. Terminal partial results remain
+available until retention or storage pruning removes their output data.
+
+| Environment variable | Default | Bound |
+|---|---:|---:|
+| `FMU_MAX_BATCH_CASES` | 8 | 1–20 |
+| `FMU_MAX_SCENARIOS_PER_RESERVATION_PER_DAY` | 100 | 1–10,000 |
+| `FMU_MAX_SIMULATION_STEPS` | 10,000 | 100–100,000 |
+| `FMU_HISTORY_RETENTION_DAYS` | 7 | 1–30 |
+| `FMU_MAX_HISTORY_RECORDS` | 10,000 | 100–100,000 |
+| `FMU_MAX_RESULT_BYTES` | 8 MiB | 64 KiB–32 MiB |
+| `FMU_MAX_HISTORY_BYTES` | 256 MiB | 16 MiB–2 GiB |
+
+`FMU_EXECUTOR_STATE_DIR` selects the directory for the SQLite job store. It
+must be persistent and writable by the Executor service account. If the
+service restarts during a run, its row is retained as `interrupted`; native
+workers are not resumed.
 
 ### Realtime WebSocket protocol
 

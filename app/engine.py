@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import math
 from functools import reduce
 from operator import mul
 import shutil
@@ -82,6 +83,7 @@ class FmuSession:
         self.seq: int = 0
         self._pending_samples: list[dict[str, Any]] = []
         self._pending_queue_drops: int = 0
+        self._step_count: int = 0
 
     # ── lifecycle ────────────────────────────────────────────────
 
@@ -118,12 +120,15 @@ class FmuSession:
         )
         self._start_time = float(start_time)
         self._stop_time = float(stop_time)
+        if not all(math.isfinite(value) for value in (self._start_time, self._stop_time, self._step_size)):
+            raise ValueError("startTime, stopTime and stepSize must be finite")
         if self._stop_time <= self._start_time:
             raise ValueError("stopTime must be greater than startTime")
         if self._step_size <= 0:
             raise ValueError("stepSize must be positive")
         self._time = self._start_time
         self._parameters = dict(parameters or {})
+        self._step_count = 0
 
         slave = self._instantiate()
         if slave is None:
@@ -155,29 +160,35 @@ class FmuSession:
         slave = self._require_slave()
         if self._state == "paused":
             raise RuntimeError("Session is paused")
-        h = step_size or self._step_size
-        if h <= 0:
+        h = self._step_size if step_size is None else step_size
+        if not math.isfinite(h) or h <= 0:
             raise ValueError("stepSize must be positive")
+        self._ensure_step_budget(1)
         slave.doStep(currentCommunicationPoint=self._time, communicationStepSize=h)
         self._time += h
+        self._step_count += 1
         self._state = "running"
         return {"time": self._time, "state": "running"}
 
     def run_until(self, target_time: float, step_size: float | None = None) -> dict[str, Any]:
         slave = self._require_slave()
+        if not math.isfinite(target_time):
+            raise ValueError("targetTime must be finite")
         if target_time < self._time:
             raise ValueError("targetTime must not be earlier than current simulation time")
         if self._state == "paused":
             raise RuntimeError("Session is paused")
-        h = step_size or self._step_size
-        if h <= 0:
+        h = self._step_size if step_size is None else step_size
+        if not math.isfinite(h) or h <= 0:
             raise ValueError("stepSize must be positive")
+        self._ensure_step_budget(math.ceil(max(0.0, target_time - self._time) / h))
         self._state = "running"
         while self._time < target_time - 1e-12:
             remaining = target_time - self._time
             actual_h = min(h, remaining)
             slave.doStep(currentCommunicationPoint=self._time, communicationStepSize=actual_h)
             self._time += actual_h
+            self._step_count += 1
         return {"time": self._time, "state": "running"}
 
     def run_until_streaming(
@@ -188,13 +199,16 @@ class FmuSession:
     ) -> Generator[dict[str, Any], None, None]:
         """Step until *target_time*, yielding output snapshots at each step."""
         slave = self._require_slave()
+        if not math.isfinite(target_time):
+            raise ValueError("targetTime must be finite")
         if target_time < self._time:
             raise ValueError("targetTime must not be earlier than current simulation time")
         if self._state == "paused":
             raise RuntimeError("Session is paused")
-        h = step_size or self._step_size
-        if h <= 0:
+        h = self._step_size if step_size is None else step_size
+        if not math.isfinite(h) or h <= 0:
             raise ValueError("stepSize must be positive")
+        self._ensure_step_budget(math.ceil(max(0.0, target_time - self._time) / h))
         self._state = "running"
         seq = 0
         while self._time < target_time - 1e-12:
@@ -202,9 +216,14 @@ class FmuSession:
             actual_h = min(h, remaining)
             slave.doStep(currentCommunicationPoint=self._time, communicationStepSize=actual_h)
             self._time += actual_h
+            self._step_count += 1
             outputs = self._read_outputs(output_refs)
             yield {"type": "sim.step", "seq": seq, "time": self._time, "outputs": outputs}
             seq += 1
+
+    def _ensure_step_budget(self, additional_steps: int) -> None:
+        if self._step_count + additional_steps > config.MAX_SIMULATION_STEPS:
+            raise ValueError("MAX_SIMULATION_STEPS_EXCEEDED")
 
     def set_inputs(self, values: dict[str, Any]) -> None:
         self._ensure_live()
