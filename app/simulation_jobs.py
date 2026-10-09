@@ -241,6 +241,7 @@ class SimulationJobManager:
                         parameters=scenario["parameters"],
                         options=scenario["options"],
                         cancel_event=cancel_event,
+                        capture_series=True,
                     )
                 finally:
                     engine.remove_session(slot.session_id)

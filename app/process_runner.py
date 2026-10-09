@@ -400,6 +400,7 @@ def _execute_worker(
     options: dict[str, Any],
     output_queue: Any,
     streaming: bool,
+    capture_series: bool = False,
 ) -> None:
     """Worker entry point; imports the engine only inside the child process."""
     from .engine import FmuSession
@@ -433,7 +434,7 @@ def _execute_worker(
                 "kind": "message",
                 "payload": {"type": "sim.done", "time": session._time},
             })
-        else:
+        elif capture_series:
             initial = session.get_outputs()
             time_values = [initial["time"]]
             output_series = {name: [value] for name, value in initial["outputs"].items()}
@@ -462,6 +463,18 @@ def _execute_worker(
                     "outputVariables": list(output_series),
                 },
             })
+        else:
+            result = session.run_until(stop, step_size=step_value)
+            outputs = session.get_outputs()
+            output_queue.put({
+                "kind": "result",
+                "payload": {
+                    "type": "sim.result",
+                    "time": result["time"],
+                    "state": "terminated",
+                    "outputs": outputs.get("outputs", {}),
+                },
+            })
     except Exception:
         output_queue.put({
             "kind": "error",
@@ -480,11 +493,12 @@ def _new_process(
     options: dict[str, Any],
     output_queue: Any,
     streaming: bool,
+    capture_series: bool = False,
 ) -> tuple[Any, Any]:
     context = mp.get_context("spawn")
     process = context.Process(
         target=_execute_worker,
-        args=(str(fmu_path), access_key, parameters, options, output_queue, streaming),
+        args=(str(fmu_path), access_key, parameters, options, output_queue, streaming, capture_series),
         name="LabStation-FMU-Worker",
     )
     process.start()
@@ -498,11 +512,12 @@ def run(
     parameters: dict[str, Any],
     options: dict[str, Any],
     cancel_event: threading.Event | None = None,
+    capture_series: bool = False,
 ) -> dict[str, Any]:
     """Run a one-shot simulation in a spawned process."""
     context = mp.get_context("spawn")
     output_queue = context.Queue(maxsize=1)
-    process, _ = _new_process(fmu_path, access_key, parameters, options, output_queue, False)
+    process, _ = _new_process(fmu_path, access_key, parameters, options, output_queue, False, capture_series)
     deadline = time.monotonic() + config.execution_timeout_seconds()
     try:
         while True:

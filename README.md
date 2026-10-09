@@ -70,6 +70,7 @@ the Gateway environment expected for station mode:
 | `FMU_EXECUTOR_HOST` | `0.0.0.0` | Bind address |
 | `FMU_EXECUTOR_PORT` | `8091` | Bind port |
 | `FMU_ROOT` | `./fmu-data` | Directory with provisioned `.fmu` files |
+| `FMU_EXECUTOR_STATE_DIR` | Sibling `state/` beside `FMU_ROOT` | Persistent SQLite job history and quota store |
 | `FMU_INTERNAL_TOKEN` | *(required)* | Shared secret for `X-Internal-Session-Token`; requests fail closed when it is absent |
 | `FMU_INTERNAL_TOKEN_FILE` | *(unset)* | Optional path to a mounted token file; used when the direct token and base64 token are unset |
 | `FMU_MAX_SESSIONS` | `4` | Effective max concurrent FMU executions (one-shot, stream and realtime) |
@@ -114,6 +115,12 @@ All endpoints require `X-Internal-Session-Token` header (except `/internal/healt
 | GET | `/internal/fmu/quarantine` | Lists quarantined FMUs |
 | POST | `/internal/fmu/simulations/run` | One-shot simulation run; JSON body contains `accessKey` |
 | POST | `/internal/fmu/simulations/stream` | Streaming NDJSON simulation; JSON body contains `accessKey` |
+| POST | `/internal/fmu/simulations/jobs` | Submit a reservation-scoped cancellable one-shot job |
+| POST | `/internal/fmu/simulations/batches` | Submit a bounded reservation-scoped batch |
+| GET | `/internal/fmu/simulations/history` | Page the current reservation's history; requires `X-Gateway-Context` |
+| GET | `/internal/fmu/simulations/{job_id}` | Read reservation-scoped job status |
+| POST | `/internal/fmu/simulations/{job_id}/cancel` | Cancel a reservation-scoped job |
+| GET | `/internal/fmu/simulations/{job_id}/result` | Read a reservation-scoped terminal result |
 | WS | `/internal/fmu/sessions` | Realtime session (step, setInputs, getOutputs, authenticated reconnect) |
 
 `catalog` and `describe` also require the `X-FMU-Access-Key` header. The
@@ -177,13 +184,14 @@ pretending that a single-FMU FMPy execution was a composed model.
 
 ### HTTP simulation payloads
 
-Gateway-to-Executor simulation requests include a trusted `gatewayContext`
-created by the authenticated Gateway. Direct calls without that reservation
-scope are rejected, so runs and history remain attached to the reservation
-that authorized them. The private channel also requires
-`X-Internal-Session-Token`.
+The synchronous `run` and `stream` routes remain for existing integrations and
+do not create retained job history. Authenticated Gateway calls include a
+`gatewayContext`, which the Executor validates and uses for reservation quotas.
+The jobs, batches, status, cancellation, history, and result routes always
+require a complete reservation scope; stored records are visible only to that
+scope. The private channel also requires `X-Internal-Session-Token`.
 
-The one-shot and streaming endpoints accept this body shape:
+Gateway calls to these routes use this body shape:
 
 ```json
 {
@@ -230,9 +238,11 @@ hash enforces reservation ownership.
 
 Batch requests have at most 8 scenarios. Each scenario can set up to 32
 parameters and at most 16 KiB of parameter JSON. A reservation is limited to
-100 scenario starts per UTC day by default; runs, streams, batch cases,
-realtime `sim.initialize`/`sim.reset` operations, and each non-empty realtime
-`sim.setInputs` update consume this budget.
+100 scenario starts per UTC day by default. Authenticated Gateway one-shot
+runs, streams, async jobs, batch cases, realtime `sim.initialize`/`sim.reset`
+operations, and each non-empty realtime `sim.setInputs` update consume this
+budget. Direct legacy calls that omit the Gateway context are available only on
+the private token-protected channel and do not create history.
 Each initialization is limited to 10,000 communication steps, and one batch
 may use at most 20,000 steps across its scenarios. The limits are configurable
 with the environment variables below. They constrain automated parameter
@@ -256,7 +266,9 @@ available until retention or storage pruning removes their output data.
 | `FMU_MAX_HISTORY_BYTES` | 256 MiB | 16 MiB–2 GiB |
 
 `FMU_EXECUTOR_STATE_DIR` selects the directory for the SQLite job store. It
-must be persistent and writable by the Executor service account. If the
+must be persistent and writable by the Executor service account. The Windows
+Lab Station service sets it to `%ProgramData%\DecentraLabs\Lab Station\fmu-executor-state`
+and restricts that directory to `SYSTEM` and local Administrators. If the
 service restarts during a run, its row is retained as `interrupted`; native
 workers are not resumed.
 
