@@ -56,6 +56,10 @@ async def _startup() -> None:
     config.FMU_ROOT.mkdir(parents=True, exist_ok=True)
     config.TEMP_DIR.mkdir(parents=True, exist_ok=True)
     await asyncio.to_thread(_simulation_store.initialize)
+    # Reap abandoned sessions before startup returns. The background loop is
+    # deliberately periodic; relying on its first scheduled iteration races
+    # with immediate TestClient/server shutdown on short-lived processes.
+    await asyncio.to_thread(engine.cleanup_expired_sessions)
     logger.info(
         "FMU Executor starting – root=%s, port=%s, max_sessions=%s",
         config.FMU_ROOT, config.bind_port(), config.MAX_CONCURRENT_SESSIONS,
