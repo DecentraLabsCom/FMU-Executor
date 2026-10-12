@@ -14,6 +14,10 @@ def _variable(name: str, value_reference: int, variable_type: str, causality: st
     variable.valueReference = value_reference
     variable.type = variable_type
     variable.causality = causality
+    variable.variability = "continuous"
+    variable.min = None
+    variable.max = None
+    variable.declaredType = None
     variable.shape = shape
     variable.dimensions = []
     return variable
@@ -24,6 +28,7 @@ def _fmi3_model_description():
     model.fmiVersion = "3.0"
     model.guid = "{fmi3-guid}"
     model.coSimulation = MagicMock(modelIdentifier="Fmi3Model")
+    model.coSimulation.hasEventMode = False
     model.defaultExperiment = None
     model.modelVariables = [
         _variable("vectorInput", 1, "Float32", "input", shape=(2,)),
@@ -54,7 +59,10 @@ def test_fmi3_cosimulation_uses_generic_instantiation_and_arrays(tmp_path: Path)
             parameters={"vectorInput": [1, 2]},
         )
 
-    instantiate.assert_called_once_with(str(tmp_path), model, fmi_type="CoSimulation")
+    instantiate.assert_called_once_with(
+        str(tmp_path), model, fmi_type="CoSimulation",
+        early_return_allowed=False, event_mode_used=False,
+    )
     fmu.enterInitializationMode.assert_called_once_with(startTime=0.0, stopTime=2.0)
     fmu.setFloat32.assert_called_once_with([1], [1.0, 2.0])
     assert result["state"] == "initialized"
@@ -95,5 +103,6 @@ def test_array_inputs_require_the_declared_flat_size(tmp_path: Path):
     from app import engine
 
     variable = _variable("input", 1, "Float64", "input", shape=(2,))
-    with pytest.raises(ValueError, match="expects 2 values"):
-        engine.FmuSession._coerce_values(variable, [1.0])
+    session = engine.FmuSession("array-input-test", tmp_path / "model.fmu")
+    with pytest.raises(ValueError, match="expects exactly 2 values"):
+        session._coerce_values(variable, [1.0])

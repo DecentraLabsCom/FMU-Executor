@@ -13,6 +13,7 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
+from tests.fmu_fixture import write_test_fmu
 
 
 # ---------------------------------------------------------------------------
@@ -33,15 +34,23 @@ def _isolate_config(tmp_path: Path):
         "FMU_INTERNAL_TOKEN": "test-secret",
         "FMU_MAX_SESSIONS": "4",
         "FMU_ATTACH_GRACE_SECONDS": "120",
-        "FMU_EXECUTION_MODE": "in-process",
+        "FMU_EXECUTION_MODE": "process",
         "FMU_LOG_LEVEL": "WARNING",
     }):
         # Re-import config so the patched env takes effect
         import importlib
         from app import config as cfg
         importlib.reload(cfg)
+        from app import engine, process_runner
+
+        def in_process_test_session(*args, resource_policy=None, **kwargs):
+            return engine.FmuSession(*args, **kwargs)
+
         try:
-            yield fmu_root
+            # Session lifecycle tests use the in-process engine as a test double;
+            # production still selects RealtimeSession when process mode is enabled.
+            with patch.object(process_runner, "RealtimeSession", in_process_test_session):
+                yield fmu_root
         finally:
             # Cleanup while the test configuration is still active.
             from app.engine import terminate_all
@@ -165,7 +174,7 @@ class TestDescribeWithFmu:
         fmu_root = _isolate_config
         # Create a dummy .fmu file
         dummy_fmu = fmu_root / "TestModel.fmu"
-        dummy_fmu.write_bytes(b"PK\x03\x04dummy")
+        write_test_fmu(dummy_fmu)
 
         md = self._mock_model_description()
         with patch("fmpy.read_model_description", return_value=md):
@@ -186,7 +195,7 @@ class TestDescribeWithFmu:
 
     def test_describe_serializes_fmi3_binary_start_as_base64(self, client, auth_headers, _isolate_config):
         dummy_fmu = _isolate_config / "BinaryModel.fmu"
-        dummy_fmu.write_bytes(b"PK\x03\x04dummy")
+        write_test_fmu(dummy_fmu)
 
         md = MagicMock()
         md.modelName = "BinaryModel"
@@ -220,7 +229,7 @@ class TestDescribeWithFmu:
     def test_catalog_returns_files_and_describe(self, client, auth_headers, _isolate_config):
         fmu_root = _isolate_config
         dummy_fmu = fmu_root / "TestModel.fmu"
-        dummy_fmu.write_bytes(b"PK\x03\x04dummy")
+        write_test_fmu(dummy_fmu)
 
         md = self._mock_model_description()
         with patch("fmpy.read_model_description", return_value=md):
@@ -574,7 +583,7 @@ class TestWebSocketSubscription:
         """variables must be a list or None, not a string."""
         fmu_root = _isolate_config
         dummy_fmu = fmu_root / "Test.fmu"
-        dummy_fmu.write_bytes(b"PK\x03\x04dummy")
+        write_test_fmu(dummy_fmu)
 
         md = MagicMock()
         md.modelName = "Test"
@@ -707,7 +716,7 @@ def _mock_fmu_patches(fmu_root: Path):
     """Return a context manager that patches fmpy calls for session creation."""
     dummy_fmu = fmu_root / "Test.fmu"
     if not dummy_fmu.exists():
-        dummy_fmu.write_bytes(b"PK\x03\x04dummy")
+        write_test_fmu(dummy_fmu)
 
     md = MagicMock()
     md.modelName = "Test"
@@ -976,12 +985,12 @@ class TestSessionAttach:
 # ---------------------------------------------------------------------------
 
 class TestSubscriptionBackpressure:
-    def test_rate_limiting_drops_samples(self):
-        """When sample_subscription is called faster than min_interval,
-        intermediate samples are collected but only one payload is emitted
-        per interval, with a correct 'dropped' count."""
-        import time as _time_mod
+    def test_rate_limiting_drops_samples(self, monkeypatch):
+        """Rate-limited polls are counted in the next emitted payload."""
         from app.engine import OutputSubscription, FmuSession
+
+        now = [1.0]
+        monkeypatch.setattr("app.engine._time.monotonic", lambda: now[0])
 
         session = FmuSession.__new__(FmuSession)
         session.session_id = "bp-test"
@@ -1021,17 +1030,15 @@ class TestSubscriptionBackpressure:
         assert result["dropped"] == 0
 
         # Immediately call again — should be rate-limited (returns None)
-        session.subscription.last_emit_monotonic = _time_mod.monotonic()
         result2 = session.sample_subscription()
         assert result2 is None
 
         # And again
-        session.subscription.last_emit_monotonic = _time_mod.monotonic()
         result3 = session.sample_subscription()
         assert result3 is None
 
         # Simulate time passing beyond the interval
-        session.subscription.last_emit_monotonic = _time_mod.monotonic() - 0.2
+        now[0] += 0.2
 
         # Now should emit with exactly the two rate-limited calls dropped
         result4 = session.sample_subscription()
@@ -1148,36 +1155,42 @@ class TestFmuValidation:
         resp = client.post("/internal/fmu/validate/nonexistent.fmu", headers=auth_headers)
         body = resp.json()
         assert body["valid"] is False
-        assert "not found" in body["reason"].lower()
+        assert any("not found" in issue.lower() for issue in body["issues"])
 
     def test_validate_valid_fmu(self, client, _isolate_config, auth_headers):
         fmu_root = _isolate_config
         fmu_file = fmu_root / "Good.fmu"
-        fmu_file.write_bytes(b"PK\x03\x04dummy")
+        write_test_fmu(fmu_file)
 
         md = MagicMock()
+        md.fmiVersion = "2.0"
         md.coSimulation = MagicMock()
+        md.coSimulation.modelIdentifier = "TestModel"
+        md.modelExchange = None
         md.guid = "{valid-guid}"
 
         with patch("fmpy.read_model_description", return_value=md):
             resp = client.post("/internal/fmu/validate/Good.fmu", headers=auth_headers)
         body = resp.json()
         assert body["valid"] is True
-        assert body["reason"] == ""
+        assert body["issues"] == []
 
     def test_validate_unparseable_auto_quarantine(self, client, _isolate_config, auth_headers):
         """An unparseable FMU with auto_quarantine=true gets quarantined."""
         fmu_root = _isolate_config
         fmu_file = fmu_root / "Broken.fmu"
-        fmu_file.write_bytes(b"not-a-zip")
+        write_test_fmu(fmu_file)
 
-        resp = client.post(
-            "/internal/fmu/validate/Broken.fmu?auto_quarantine=true",
-            headers=auth_headers,
-        )
+        with patch("fmpy.read_model_description", side_effect=RuntimeError("invalid model description")):
+            resp = client.post(
+                "/internal/fmu/validate/Broken.fmu?auto_quarantine=true",
+                headers=auth_headers,
+            )
         body = resp.json()
         assert body["valid"] is False
         assert "Broken.fmu" == body["accessKey"]
+        assert "Cannot parse model description" in body["issues"]
+        assert any("model description" in issue.lower() for issue in body["issues"])
 
         # Should now be quarantined
         from app import fmu_storage
@@ -1186,22 +1199,24 @@ class TestFmuValidation:
     def test_validate_no_cosim_support(self, client, _isolate_config, auth_headers):
         fmu_root = _isolate_config
         fmu_file = fmu_root / "NoCS.fmu"
-        fmu_file.write_bytes(b"PK\x03\x04dummy")
+        write_test_fmu(fmu_file)
 
         md = MagicMock()
+        md.fmiVersion = "2.0"
         md.coSimulation = None
+        md.modelExchange = None
         md.guid = "{noCS}"
 
         with patch("fmpy.read_model_description", return_value=md):
             resp = client.post("/internal/fmu/validate/NoCS.fmu", headers=auth_headers)
         body = resp.json()
         assert body["valid"] is False
-        assert "Co-Simulation" in body["reason"]
+        assert any("Co-Simulation" in issue for issue in body["issues"])
 
     def test_validate_does_not_expose_exception_details(
         self, client, _isolate_config, auth_headers
     ):
-        (_isolate_config / "Broken.fmu").write_bytes(b"not-a-zip")
+        write_test_fmu(_isolate_config / "Broken.fmu")
         with patch(
             "fmpy.read_model_description",
             side_effect=RuntimeError("secret path C:\\private\\model.fmu"),
@@ -1212,8 +1227,8 @@ class TestFmuValidation:
             )
 
         assert resp.status_code == 200
-        assert resp.json()["reason"] == "Cannot parse model description"
-        assert "private" not in resp.text
+        assert "Cannot parse model description" in resp.json()["issues"]
+        assert "secret path C:" not in resp.text
 
 
 class TestQuarantine:

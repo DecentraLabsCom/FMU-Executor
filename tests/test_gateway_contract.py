@@ -18,6 +18,7 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
+from tests.fmu_fixture import write_test_fmu
 
 
 # ---------------------------------------------------------------------------
@@ -36,14 +37,20 @@ def _isolate_config(tmp_path: Path):
         "FMU_EXECUTOR_TEMP": str(temp_dir),
         "FMU_INTERNAL_TOKEN": "station-shared-secret",
         "FMU_MAX_SESSIONS": "4",
-        "FMU_EXECUTION_MODE": "in-process",
+        "FMU_EXECUTION_MODE": "process",
         "FMU_LOG_LEVEL": "WARNING",
     }):
         import importlib
         from app import config as cfg
         importlib.reload(cfg)
+        from app import engine, process_runner
+
+        def in_process_test_session(*args, resource_policy=None, **kwargs):
+            return engine.FmuSession(*args, **kwargs)
+
         try:
-            yield fmu_root
+            with patch("app.process_runner.RealtimeSession", in_process_test_session):
+                yield fmu_root
         finally:
             from app.engine import terminate_all
             terminate_all()
@@ -103,8 +110,7 @@ def _make_mock_md():
 
 def _provision_fmu(fmu_root: Path, name: str = "BouncingBall.fmu"):
     fmu = fmu_root / name
-    fmu.write_bytes(b"PK\x03\x04dummy-fmu-archive")
-    return fmu
+    return write_test_fmu(fmu)
 
 
 # ===================================================================

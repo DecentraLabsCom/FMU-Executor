@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -18,23 +19,31 @@ class Session:
     _time = 0.0
     _stop_time = 1.0
     _step_size = 0.1
+    _time_mode = "simtime"
+    _playback_speed = 1.0
     _terminated = False
     _initialised = True
-    _md = SimpleNamespace(modelVariables=[SimpleNamespace(name="x", valueReference=4)])
+    _md = SimpleNamespace(modelVariables=[SimpleNamespace(name="x", valueReference=4, causality="output", type="Real")])
     subscription = None
     _pending_samples = []
     seq = 0
 
     def load(self): self.loaded = True
-    def initialize(self, *, start_time, stop_time, step_size=None, parameters=None):
+    def validate_initial_values(self, values):
+        return values
+    def validate_inputs(self, values):
+        return values
+    def initialize(self, *, start_time, stop_time, step_size=None, parameters=None, time_mode="simtime", playback_speed=1.0, early_return_allowed=False):
         self.state = "initialized"
         self._time = start_time
         self._stop_time = stop_time
         self._step_size = step_size or 0.1
+        self._time_mode = time_mode
+        self._playback_speed = playback_speed
         self.initialized_with = (start_time, stop_time, step_size, parameters)
     def resume(self): self.state = "running"
     def pause(self): self.state = "paused"
-    def reset(self): self.state = "initialized"; self._time = 0.0
+    def reset(self, defer_initialization=False): self.state = "initialized"; self._time = 0.0
     def step(self, delta=None): self._time += delta or self._step_size
     def run_until(self, target, step_size=None): self._time = target
     def set_inputs(self, values): self.inputs = values
@@ -76,7 +85,7 @@ def test_live_session_commands_cover_state_model_and_data_operations(dispatch, m
     assert session.inputs == {"x": 5}
     selected = call({"type": "sim.getOutputs", "variables": ["x"]})
     assert selected["values"] == {"x": 9} and session.output_refs == [4]
-    subscribed = call({"type": "sim.subscribeOutputs", "variables": ["x"], "periodMs": 0, "maxBatchSize": 0, "maxHz": 5})
+    subscribed = call({"type": "sim.subscribeOutputs", "variables": ["x"], "periodMs": 1, "maxBatchSize": 1, "maxHz": 5})
     assert subscribed["periodMs"] == 1 and subscribed["maxBatchSize"] == 1 and subscribed["maxHz"] == 5
     assert call({"type": "sim.unsubscribeOutputs"})["type"] == "sim.unsubscribed"
     assert session.subscription is None and session._pending_samples == []
@@ -96,6 +105,9 @@ def test_live_session_commands_reject_invalid_shapes_and_states(dispatch):
     with pytest.raises(HTTPException):
         call({"type": "sim.subscribeOutputs", "variables": "x"})
     with pytest.raises(HTTPException) as exc:
+        call({"type": "sim.subscribeOutputs", "variables": ["x"], "periodMs": 0})
+    assert exc.value.status_code == 400
+    with pytest.raises(HTTPException) as exc:
         call({"type": "sim.runUntil"})
     assert exc.value.status_code == 400
     session.state = "created"
@@ -114,8 +126,16 @@ def test_session_creation_and_capacity_failure(dispatch, monkeypatch, tmp_path):
     new_session = Session()
     monkeypatch.setattr(main.fmu_storage, "fmu_exists", lambda _key: True)
     monkeypatch.setattr(main.fmu_storage, "get_fmu_path", lambda _key: tmp_path / "demo.fmu")
+    monkeypatch.setattr(main.config, "execution_mode", lambda: "process")
+    monkeypatch.setattr(main.fmu_storage, "inspect_fmu", lambda *_args, **_kwargs: {
+        "archiveValid": True, "modelDescriptionValid": True, "stationCompatible": True, "issues": [],
+    })
+    monkeypatch.setattr(main.fmu_storage, "snapshot_fmu", lambda path: (path, "a" * 64))
+    monkeypatch.setattr(main.fmu_storage, "inspect_fmu_path", lambda *_args, **_kwargs: {
+        "archiveValid": True, "modelDescriptionValid": True, "stationCompatible": True, "issues": [],
+    })
     monkeypatch.setattr(engine, "create_session", lambda *_args, **_kwargs: new_session)
-    created = call({"type": "session.create"}, {"accessKey": "demo.fmu", "claims": {"exp": 99}}, selected_session=None)
+    created = call({"type": "session.create"}, {"accessKey": "demo.fmu", "claims": {"exp": time.time() + 3600}}, selected_session=None)
     assert created["type"] == "session.created" and created["_session"] is new_session
     assert new_session.loaded
 
@@ -127,7 +147,7 @@ def test_session_creation_and_capacity_failure(dispatch, monkeypatch, tmp_path):
 
 @pytest.mark.parametrize(
     ("mode", "expected_factory"),
-    [("process", process_runner.RealtimeSession), ("in-process", engine.FmuSession)],
+    [("process", process_runner.RealtimeSession)],
 )
 def test_session_creation_uses_configured_worker_boundary(dispatch, monkeypatch, tmp_path, mode, expected_factory):
     _session, call = dispatch
@@ -136,6 +156,13 @@ def test_session_creation_uses_configured_worker_boundary(dispatch, monkeypatch,
     monkeypatch.setattr(main.config, "execution_mode", lambda: mode)
     monkeypatch.setattr(main.fmu_storage, "fmu_exists", lambda _key: True)
     monkeypatch.setattr(main.fmu_storage, "get_fmu_path", lambda _key: tmp_path / "demo.fmu")
+    monkeypatch.setattr(main.fmu_storage, "inspect_fmu", lambda *_args, **_kwargs: {
+        "archiveValid": True, "modelDescriptionValid": True, "stationCompatible": True, "issues": [],
+    })
+    monkeypatch.setattr(main.fmu_storage, "snapshot_fmu", lambda path: (path, "a" * 64))
+    monkeypatch.setattr(main.fmu_storage, "inspect_fmu_path", lambda *_args, **_kwargs: {
+        "archiveValid": True, "modelDescriptionValid": True, "stationCompatible": True, "issues": [],
+    })
 
     def create_session(*args, **kwargs):
         created["args"] = args
@@ -152,6 +179,19 @@ def test_session_creation_uses_configured_worker_boundary(dispatch, monkeypatch,
 
     assert response["_session"] is new_session
     assert created["kwargs"]["session_factory"] is expected_factory
+
+
+def test_session_creation_rejects_in_process_execution(dispatch, monkeypatch):
+    _session, call = dispatch
+    monkeypatch.setattr(main.config, "execution_mode", lambda: "in-process")
+    with pytest.raises(HTTPException) as error:
+        call(
+            {"type": "session.create"},
+            {"accessKey": "demo.fmu", "claims": {}},
+            selected_session=None,
+        )
+    assert error.value.status_code == 409
+    assert error.value.detail == "FMU_PROCESS_ISOLATION_REQUIRED"
 
 
 def test_session_creation_rejects_missing_context_access_key_and_fmu(dispatch, monkeypatch):

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import time
 from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import Mock
 
 import pytest
@@ -16,6 +18,7 @@ from app.simulation_jobs import (
     _validate_parameters,
 )
 from app.simulation_store import QuotaExceededError, SimulationStore, reservation_scope
+from tests.fmu_fixture import write_test_fmu
 
 
 CONTEXT = {
@@ -23,6 +26,7 @@ CONTEXT = {
     "labId": "lab-a",
     "reservationKey": "reservation-a",
     "pucHash": "puc-a",
+    "claims": {"exp": time.time() + 3600},
 }
 PARAMETERS = {"gain": 2}
 OPTIONS = {"stopTime": 1.0}
@@ -41,9 +45,25 @@ def jobs(monkeypatch, tmp_path):
         "supportsCoSimulation": True, "defaultStepSize": 0.1,
     })
     monkeypatch.setattr(auth, "validate_gateway_context", lambda _context, _key: None)
-    monkeypatch.setattr(fmu_storage, "get_fmu_path", lambda _key: tmp_path / "model.fmu")
+    fmu_path = write_test_fmu(tmp_path / "model.fmu")
+    monkeypatch.setattr(fmu_storage, "get_fmu_path", lambda _key: fmu_path)
+    monkeypatch.setattr(fmu_storage, "inspect_fmu", lambda *_args, **_kwargs: {
+        "archiveValid": True, "modelDescriptionValid": True, "stationCompatible": True,
+        "issues": [], "sha256": "a" * 64,
+    })
+    monkeypatch.setattr(fmu_storage, "inspect_fmu_path", lambda *_args, **_kwargs: {
+        "archiveValid": True, "modelDescriptionValid": True, "stationCompatible": True,
+        "issues": [],
+    })
+    monkeypatch.setattr(fmu_storage, "snapshot_fmu", lambda path: (path, "a" * 64))
+    model_metadata = {
+        "supportsCoSimulation": True, "defaultStepSize": 0.1,
+        "modelVariables": [{"name": "speed", "causality": "output"}],
+    }
+    monkeypatch.setattr(fmu_storage, "describe_path", lambda _path: model_metadata)
     monkeypatch.setattr(engine, "create_session", lambda *_args, **_kwargs: SimpleNamespace(session_id="job-session"))
     monkeypatch.setattr(engine, "remove_session", Mock())
+    monkeypatch.setattr(engine, "release_capacity", Mock(wraps=engine.release_capacity))
     monkeypatch.setattr(process_runner, "run", Mock(return_value={
         "type": "sim.result", "time": 1.0, "outputs": {"speed": 2.0},
     }))
@@ -78,7 +98,7 @@ def test_options_require_cosimulation_and_a_supported_finite_time_range(monkeypa
     })
     assert _validate_options("model.fmu", {"stopTime": 1, "stepSize": 0.2}) == 5
     for value in (
-        {"backend": "fmpy"}, {"startTime": "nope"}, {"stopTime": 0},
+        {"unsupported": True}, {"startTime": "nope"}, {"stopTime": 0},
         {"stepSize": 0}, {"stopTime": float("inf")},
     ):
         with pytest.raises(HTTPException):
@@ -127,8 +147,11 @@ def test_submit_single_executes_and_records_scoped_result(jobs):
     assert response["kind"] == "single"
     assert result["status"] == "completed"
     assert result["completedCases"] == 1
-    assert result["result"] == {"type": "sim.result", "time": 1.0, "outputs": {"speed": 2.0}}
-    engine.remove_session.assert_called_once_with("job-session")
+    assert result["result"]["type"] == "sim.result"
+    assert result["result"]["time"] == 1.0
+    assert result["result"]["outputs"] == {"speed": 2.0}
+    assert result["result"]["evidence"]["fmuSha256"] == "a" * 64
+    engine.release_capacity.assert_called_once()
     process_runner.run.assert_called_once()
 
 
@@ -159,6 +182,7 @@ def test_submit_batch_merges_options_and_records_labeled_results(jobs, monkeypat
     assert result["status"] == "completed"
     assert result["result"]["partial"] is False
     assert [case["label"] for case in result["result"]["cases"]] == ["baseline", "case-2"]
+    assert all(case["evidence"]["fmuSha256"] == "a" * 64 for case in result["result"]["cases"])
     assert calls[0]["options"] == {"stopTime": 1.0, "stepSize": 0.5}
     assert calls[1]["options"] == OPTIONS
     assert result["completedCases"] == 2
@@ -220,7 +244,8 @@ def test_submission_maps_quota_duplicate_and_invalid_storage_errors(jobs, monkey
             asyncio.run(_submit(manager, requested_id=f"job-{status}"))
         assert error.value.status_code == status
         if status == 429:
-            assert error.value.detail["remaining"] == 0
+            detail = cast(dict[str, Any], error.value.detail)
+            assert detail["remaining"] == 0
         else:
             assert error.value.detail == detail
     monkeypatch.setattr(store, "create_job", original_create)
@@ -233,16 +258,10 @@ def sqlite_error():
 def test_submission_rejects_full_station_capacity(jobs, monkeypatch):
     manager, _ = jobs
     monkeypatch.setattr(config, "MAX_CONCURRENT_SESSIONS", 1)
-
-    async def run():
-        manager._tasks["occupied"] = asyncio.create_task(asyncio.sleep(30))
-        try:
-            await _submit(manager)
-        finally:
-            manager._tasks["occupied"].cancel()
+    monkeypatch.setattr(engine, "reserve_capacity", Mock(side_effect=engine.CapacityExceededError("full")))
 
     with pytest.raises(HTTPException) as error:
-        asyncio.run(run())
+        asyncio.run(_submit(manager))
     assert error.value.status_code == 429
     assert error.value.detail == "STATION_CAPACITY_EXHAUSTED"
 
@@ -250,7 +269,6 @@ def test_submission_rejects_full_station_capacity(jobs, monkeypatch):
 @pytest.mark.parametrize(
     ("failure", "status", "code"),
     [
-        (engine.CapacityExceededError("busy"), "failed", "STATION_CAPACITY_EXHAUSTED"),
         (process_runner.ProcessExecutionError("cancelled", code="FMU_EXECUTION_CANCELLED"), "cancelled", None),
         (process_runner.ProcessExecutionError("timed out", code="FMU_EXECUTION_TIMEOUT"), "failed", "FMU_EXECUTION_TIMEOUT"),
         (ValueError("oversized result"), "failed", "RESULT_SIZE_LIMIT_EXCEEDED"),
@@ -261,7 +279,7 @@ def test_execution_maps_worker_failures_and_cleans_up(jobs, monkeypatch, failure
     manager, _ = jobs
     scope_key, _ = reservation_scope(CONTEXT)
     if isinstance(failure, engine.CapacityExceededError):
-        monkeypatch.setattr(engine, "create_session", Mock(side_effect=failure))
+        monkeypatch.setattr(engine, "reserve_capacity", Mock(side_effect=failure))
     else:
         monkeypatch.setattr(process_runner, "run", Mock(side_effect=failure))
 
@@ -272,8 +290,17 @@ def test_execution_maps_worker_failures_and_cleans_up(jobs, monkeypatch, failure
     result = asyncio.run(run())
     assert result["status"] == status
     assert result["errorCode"] == code
-    if not isinstance(failure, engine.CapacityExceededError):
-        engine.remove_session.assert_called_once_with("job-session")
+    engine.release_capacity.assert_called_once()
+
+
+def test_capacity_failure_is_rejected_before_job_creation(jobs, monkeypatch):
+    manager, store = jobs
+    monkeypatch.setattr(engine, "reserve_capacity", Mock(side_effect=engine.CapacityExceededError("busy")))
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(_submit(manager))
+    assert error.value.status_code == 429
+    assert error.value.detail == "STATION_CAPACITY_EXHAUSTED"
+    assert store.list_history(reservation_scope(CONTEXT)[0], limit=10, offset=0)["total"] == 0
 
 
 def test_cancel_before_execution_prevents_fmu_session_creation(jobs, monkeypatch):

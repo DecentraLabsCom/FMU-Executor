@@ -709,6 +709,21 @@ async def stream_simulation(body: SimulationBody):
         engine.release_capacity(capacity_token)
         raise
 
+    capacity_release_lock = threading.Lock()
+    capacity_released = False
+
+    def _release_stream_capacity() -> None:
+        nonlocal capacity_released
+        with capacity_release_lock:
+            if capacity_released:
+                return
+            capacity_released = True
+        try:
+            if slot is not None:
+                slot.terminate()
+        finally:
+            engine.release_capacity(capacity_token)
+
     def _generate():
         stream_digest = hashlib.sha256()
 
@@ -785,14 +800,7 @@ async def stream_simulation(body: SimulationBody):
             logger.exception("FMU streaming simulation failed")
             yield json.dumps({"type": "error", "message": "FMU simulation failed"}) + "\n"
         finally:
-            if slot is not None:
-                slot.terminate()
-            engine.release_capacity(capacity_token)
-
-    def _release_stream_capacity() -> None:
-        if slot is not None:
-            slot.terminate()
-        engine.release_capacity(capacity_token)
+            _release_stream_capacity()
 
     return StreamingResponse(
         _generate(),

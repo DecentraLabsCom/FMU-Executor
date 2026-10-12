@@ -36,6 +36,10 @@ def add_job(store, job_id, *, context=CONTEXT, status="queued", result=None, cre
         total_cases=1,
         parameters={"gain": 2},
         options={"stopTime": 1},
+        metadata={},
+        authorization_expires_at=time.time() + 3600,
+        reservation_ends_at=None,
+        maximum_scenarios=config.MAX_SCENARIOS_PER_RESERVATION_PER_DAY,
     )
     if status != "queued" or result is not None:
         store.update_job(job_id, status=status, result=result)
@@ -104,12 +108,16 @@ def test_create_job_rolls_back_quota_and_rejects_non_json_numbers(store, monkeyp
         store.create_job(
             job_id="too-many", scope_key=scope_key, scope=scope, fmu_filename="m.fmu",
             kind="batch", total_cases=2, parameters={}, options={},
+            metadata={}, authorization_expires_at=time.time() + 3600,
+            reservation_ends_at=None, maximum_scenarios=1,
         )
     assert store.get_job("too-many", scope_key) is None
     with pytest.raises(ValueError):
         store.create_job(
             job_id="not-json", scope_key=scope_key, scope=scope, fmu_filename="m.fmu",
             kind="single", total_cases=1, parameters={"x": float("nan")}, options={},
+            metadata={}, authorization_expires_at=time.time() + 3600,
+            reservation_ends_at=None, maximum_scenarios=1,
         )
     assert store.reserve_scenarios(scope_key, 1) == 1
 

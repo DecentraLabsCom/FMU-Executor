@@ -3,11 +3,16 @@ from __future__ import annotations
 import queue
 import runpy
 import sys
+import threading
+import os
 from types import SimpleNamespace
+from typing import Any
+from unittest.mock import Mock
 
 import pytest
 
 from app import process_runner
+from tests.fmu_fixture import write_test_fmu
 
 
 class FakeQueue:
@@ -37,6 +42,7 @@ class FakeQueue:
 class FakeProcess:
     def __init__(self, *, alive=False):
         self.alive = alive
+        self.pid = 12345
         self.started = False
         self.terminated = False
         self.join_calls = []
@@ -54,29 +60,44 @@ class FakeProcess:
         self.terminated = True
         self.alive = False
 
+    def kill(self):
+        self.terminated = True
+        self.alive = False
 
-def install_run_fakes(monkeypatch, messages, *, alive=False):
+
+def install_run_fakes(monkeypatch, messages, tmp_path, *, alive=False):
     output = FakeQueue(*messages)
     process = FakeProcess(alive=alive)
+    worker_directory = tmp_path / "worker"
+    worker_directory.mkdir()
     monkeypatch.setattr(process_runner.mp, "get_context", lambda method: SimpleNamespace(Queue=lambda **kwargs: output))
-    monkeypatch.setattr(process_runner, "_new_process", lambda *args: (process, None))
+    monkeypatch.setattr(process_runner, "_new_process", lambda *args, **kwargs: (process, None, None, worker_directory))
     monkeypatch.setattr(process_runner.config, "execution_timeout_seconds", lambda: 20)
     return output, process
 
 
+def install_stream_fakes(monkeypatch, tmp_path, output, process):
+    worker_directory = tmp_path / "worker"
+    worker_directory.mkdir()
+    monkeypatch.setattr(process_runner.mp, "get_context", lambda _method: SimpleNamespace(Queue=lambda **_kwargs: output))
+    monkeypatch.setattr(process_runner, "_new_process", lambda *args, **kwargs: (process, None, None, worker_directory))
+    monkeypatch.setattr(process_runner.config, "execution_timeout_seconds", lambda: 20)
+    return worker_directory
+
+
 def test_run_returns_child_payload_and_closes_queue(monkeypatch, tmp_path):
-    output, process = install_run_fakes(monkeypatch, [{"kind": "result", "payload": {"type": "sim.result", "time": 2}}])
+    output, process = install_run_fakes(monkeypatch, [{"kind": "result", "payload": {"type": "sim.result", "time": 2}}], tmp_path)
 
     result = process_runner.run(tmp_path / "demo.fmu", access_key="demo.fmu", parameters={}, options={})
 
     assert result == {"type": "sim.result", "time": 2}
     assert output.closed and output.joined
-    assert process.join_calls == [2]
+    assert process.join_calls == []
     assert not process.terminated
 
 
 def test_run_converts_child_errors_to_typed_execution_error(monkeypatch, tmp_path):
-    install_run_fakes(monkeypatch, [{"kind": "error", "code": "FMU_EXECUTION_FAILED", "message": "safe message", "retryable": True}])
+    install_run_fakes(monkeypatch, [{"kind": "error", "code": "FMU_EXECUTION_FAILED", "message": "safe message", "retryable": True}], tmp_path)
 
     with pytest.raises(process_runner.ProcessExecutionError, match="safe message") as exc:
         process_runner.run(tmp_path / "demo.fmu", access_key="demo.fmu", parameters={}, options={})
@@ -86,7 +107,7 @@ def test_run_converts_child_errors_to_typed_execution_error(monkeypatch, tmp_pat
 
 
 def test_run_terminates_worker_on_deadline(monkeypatch, tmp_path):
-    output, process = install_run_fakes(monkeypatch, [], alive=True)
+    output, process = install_run_fakes(monkeypatch, [], tmp_path, alive=True)
     ticks = iter([0.0, 2.0])
     monkeypatch.setattr(process_runner.time, "monotonic", lambda: next(ticks))
     monkeypatch.setattr(process_runner.config, "execution_timeout_seconds", lambda: 1)
@@ -101,7 +122,7 @@ def test_run_terminates_worker_on_deadline(monkeypatch, tmp_path):
 
 
 def test_run_reports_worker_exit_without_result(monkeypatch, tmp_path):
-    install_run_fakes(monkeypatch, [queue.Empty()])
+    install_run_fakes(monkeypatch, [queue.Empty()], tmp_path)
 
     with pytest.raises(process_runner.ProcessExecutionError) as exc:
         process_runner.run(tmp_path / "demo.fmu", access_key="demo.fmu", parameters={}, options={})
@@ -111,13 +132,112 @@ def test_run_reports_worker_exit_without_result(monkeypatch, tmp_path):
 
 
 def test_run_terminates_worker_that_remains_alive_after_join(monkeypatch, tmp_path):
-    output, process = install_run_fakes(monkeypatch, [{"kind": "result", "payload": {"ok": True}}], alive=True)
+    output, process = install_run_fakes(monkeypatch, [{"kind": "result", "payload": {"ok": True}}], tmp_path, alive=True)
 
     assert process_runner.run(tmp_path / "demo.fmu", access_key="demo.fmu", parameters={}, options={}) == {"ok": True}
 
     assert process.terminated
-    assert process.join_calls == [2, 2]
+    assert process.join_calls == [2]
     assert output.closed and output.joined
+
+
+@pytest.mark.parametrize(
+    ("event", "kwargs", "expected_code"),
+    [
+        (threading.Event(), {}, "FMU_EXECUTION_CANCELLED"),
+        (None, {"authorization_expires_at": 999}, "EXECUTION_AUTHORIZATION_EXPIRED"),
+        (None, {"reservation_ends_at": 999}, "RESERVATION_ENDED"),
+    ],
+)
+def test_run_enforces_cancellation_and_authorization_deadlines(monkeypatch, tmp_path, event, kwargs, expected_code):
+    if event is not None:
+        event.set()
+    else:
+        monkeypatch.setattr(process_runner.time, "time", lambda: 1000)
+    output, process = install_run_fakes(monkeypatch, [], tmp_path, alive=True)
+    with pytest.raises(process_runner.ProcessExecutionError) as error:
+        process_runner.run(
+            tmp_path / "demo.fmu", access_key="demo.fmu", parameters={}, options={},
+            cancel_event=event, **kwargs,
+        )
+    assert error.value.code == expected_code
+    assert process.terminated
+    assert output.closed and output.joined
+
+
+def test_run_closes_queue_when_worker_cannot_start(monkeypatch, tmp_path):
+    output = FakeQueue()
+    monkeypatch.setattr(process_runner.mp, "get_context", lambda _method: SimpleNamespace(Queue=lambda **_kwargs: output))
+    monkeypatch.setattr(process_runner, "_new_process", Mock(side_effect=process_runner.ProcessExecutionError("no worker")))
+    with pytest.raises(process_runner.ProcessExecutionError, match="no worker"):
+        process_runner.run(tmp_path / "demo.fmu", access_key="demo.fmu", parameters={}, options={})
+    assert output.closed and output.joined
+
+
+def test_worker_directory_cleanup_uses_live_owner_marker(monkeypatch, tmp_path):
+    root = tmp_path / "tmp"
+    dead = root / "worker_dead"
+    live = root / "realtime_live"
+    invalid = root / "worker_invalid"
+    for directory in (dead, live, invalid):
+        directory.mkdir(parents=True)
+    process_runner._mark_worker_directory(dead, 101)
+    process_runner._mark_worker_directory(live, 202)
+    process_runner._worker_owner_marker_path(invalid).write_text("not-a-pid", encoding="ascii")
+    monkeypatch.setattr(process_runner.config, "TEMP_DIR", root)
+    monkeypatch.setattr(process_runner, "worker_process_is_alive", lambda pid: pid == 202)
+    delete_profile = Mock()
+    monkeypatch.setattr(process_runner, "delete_worker_appcontainer_profile", delete_profile)
+
+    assert process_runner.cleanup_abandoned_worker_directories() == 2
+    assert delete_profile.call_count == (2 if os.name == "nt" else 0)
+    assert not dead.exists() and not invalid.exists()
+    assert live.exists()
+    assert process_runner.cleanup_abandoned_worker_directories() == 0
+
+
+def test_worker_environment_removes_credentials_only(monkeypatch):
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "secret")
+    monkeypatch.setenv("GATEWAY_TOKEN", "secret")
+    monkeypatch.setenv("WORKER_SAFE_VALUE", "retained")
+    process_runner._sanitize_worker_environment()
+    assert "AWS_ACCESS_KEY_ID" not in os.environ
+    assert "GATEWAY_TOKEN" not in os.environ
+    assert os.environ["WORKER_SAFE_VALUE"] == "retained"
+
+
+def test_windows_fmu_staging_copies_and_checks_content_hash(monkeypatch, tmp_path):
+    source = tmp_path / "source.fmu"
+    source.write_bytes(b"archive bytes")
+    worker = tmp_path / "worker"
+    worker.mkdir()
+    monkeypatch.setattr(process_runner.os, "name", "nt")
+    staged = process_runner._stage_windows_fmu(source, worker)
+    assert staged.read_bytes() == b"archive bytes"
+
+    digest_named = tmp_path / ("0" * 64 + ".fmu")
+    digest_named.write_bytes(b"changed archive")
+    target = tmp_path / "worker-mismatch"
+    target.mkdir()
+    with pytest.raises(process_runner.ProcessExecutionError) as error:
+        process_runner._stage_windows_fmu(digest_named, target)
+    assert error.value.code == "FMU_SNAPSHOT_HASH_MISMATCH"
+    assert not (target / "model.fmu").exists()
+
+
+def test_realtime_snapshot_exports_only_normalized_model_metadata():
+    snapshot = process_runner._realtime_snapshot(SimpleNamespace(
+        state="loaded", _time=0.5, _start_time=0.0, _stop_time=2.0, _step_size=0.1,
+        _initialised=True, _terminated=False,
+        _md=SimpleNamespace(
+            modelVariables=[SimpleNamespace(name="y", valueReference=2, type="Real", causality="output")],
+            defaultExperiment=SimpleNamespace(stepSize=0.01),
+        ),
+    ))
+    assert snapshot["state"] == "loaded"
+    assert snapshot["time"] == 0.5
+    assert snapshot["modelVariables"] == [{"name": "y", "valueReference": 2, "type": "Real", "causality": "output"}]
+    assert snapshot["defaultExperiment"] == {"stepSize": 0.01}
 
 
 def test_stream_yields_child_messages_until_done_and_cleans_up(monkeypatch, tmp_path):
@@ -126,24 +246,20 @@ def test_stream_yields_child_messages_until_done_and_cleans_up(monkeypatch, tmp_
         {"kind": "message", "payload": {"type": "sim.done", "time": 1}},
     )
     process = FakeProcess()
-    monkeypatch.setattr(process_runner.mp, "get_context", lambda method: SimpleNamespace(Queue=lambda **kwargs: output))
-    monkeypatch.setattr(process_runner, "_new_process", lambda *args: (process, None))
-    monkeypatch.setattr(process_runner.config, "execution_timeout_seconds", lambda: 20)
+    install_stream_fakes(monkeypatch, tmp_path, output, process)
 
     assert list(process_runner.stream(tmp_path / "demo.fmu", access_key="demo.fmu", parameters={}, options={})) == [
         {"type": "sim.outputs", "time": 0.5},
         {"type": "sim.done", "time": 1},
     ]
     assert output.closed and output.joined
-    assert process.join_calls == [2]
+    assert process.join_calls == []
 
 
 def test_stream_reports_child_error_without_exposing_extra_fields(monkeypatch, tmp_path):
     output = FakeQueue({"kind": "error", "code": "FMU_EXECUTION_FAILED", "message": "generic", "retryable": True, "secret": "hidden"})
     process = FakeProcess()
-    monkeypatch.setattr(process_runner.mp, "get_context", lambda method: SimpleNamespace(Queue=lambda **kwargs: output))
-    monkeypatch.setattr(process_runner, "_new_process", lambda *args: (process, None))
-    monkeypatch.setattr(process_runner.config, "execution_timeout_seconds", lambda: 20)
+    install_stream_fakes(monkeypatch, tmp_path, output, process)
 
     assert list(process_runner.stream(tmp_path / "demo.fmu", access_key="demo.fmu", parameters={}, options={})) == [
         {"type": "error", "code": "FMU_EXECUTION_FAILED", "message": "generic", "retryable": True}
@@ -154,9 +270,7 @@ def test_stream_reports_child_error_without_exposing_extra_fields(monkeypatch, t
 def test_stream_reports_worker_exit_without_result(monkeypatch, tmp_path):
     output = FakeQueue(queue.Empty())
     process = FakeProcess()
-    monkeypatch.setattr(process_runner.mp, "get_context", lambda method: SimpleNamespace(Queue=lambda **kwargs: output))
-    monkeypatch.setattr(process_runner, "_new_process", lambda *args: (process, None))
-    monkeypatch.setattr(process_runner.config, "execution_timeout_seconds", lambda: 20)
+    install_stream_fakes(monkeypatch, tmp_path, output, process)
 
     assert list(process_runner.stream(tmp_path / "demo.fmu", access_key="demo.fmu", parameters={}, options={})) == [
         {"type": "error", "code": "FMU_EXECUTION_FAILED", "message": "FMU worker exited without a result"}
@@ -166,8 +280,7 @@ def test_stream_reports_worker_exit_without_result(monkeypatch, tmp_path):
 def test_stream_timeout_terminates_child(monkeypatch, tmp_path):
     output = FakeQueue()
     process = FakeProcess(alive=True)
-    monkeypatch.setattr(process_runner.mp, "get_context", lambda method: SimpleNamespace(Queue=lambda **kwargs: output))
-    monkeypatch.setattr(process_runner, "_new_process", lambda *args: (process, None))
+    install_stream_fakes(monkeypatch, tmp_path, output, process)
     monkeypatch.setattr(process_runner.config, "execution_timeout_seconds", lambda: 1)
     ticks = iter([0.0, 2.0])
     monkeypatch.setattr(process_runner.time, "monotonic", lambda: next(ticks))
@@ -203,7 +316,10 @@ def test_execute_worker_returns_result_and_always_terminates(monkeypatch, tmp_pa
 
     process_runner._execute_worker(str(tmp_path / "demo.fmu"), "demo.fmu", {"x": 2}, {"stopTime": 3, "stepSize": 0.25}, output, False)
 
-    assert output.items == [{"kind": "result", "payload": {"type": "sim.result", "time": 3, "state": "terminated", "outputs": {"x": 4}}}]
+    assert output.items == [{"kind": "result", "payload": {
+        "type": "sim.result", "time": 3.0, "state": "terminated", "outputs": {"x": 4},
+        "outputVariables": ["x"], "finishReason": None,
+    }}]
 
 
 def test_execute_worker_streams_snapshots_and_completion(monkeypatch, tmp_path):
@@ -212,10 +328,11 @@ def test_execute_worker_streams_snapshots_and_completion(monkeypatch, tmp_path):
 
         def __init__(self, *_args, **_kwargs):
             self.terminated = False
+            self._finished_reason = None
 
         def load(self): pass
         def initialize(self, **_kwargs): pass
-        def run_until_streaming(self, _stop, step_size=None): return iter([{"type": "sim.outputs", "time": 0.5}])
+        def run_until_streaming(self, _stop, step_size=None): return iter([{"type": "sim.outputs", "time": 0.5, "outputs": {}}])
         def terminate(self): self.terminated = True
 
     monkeypatch.setitem(sys.modules, "app.engine", SimpleNamespace(FmuSession=Session))
@@ -224,8 +341,8 @@ def test_execute_worker_streams_snapshots_and_completion(monkeypatch, tmp_path):
     process_runner._execute_worker(str(tmp_path / "demo.fmu"), "demo.fmu", {}, {}, output, True)
 
     assert output.items == [
-        {"kind": "message", "payload": {"type": "sim.outputs", "time": 0.5}},
-        {"kind": "message", "payload": {"type": "sim.done", "time": 1.0}},
+        {"kind": "message", "payload": {"type": "sim.outputs", "time": 0.5, "outputs": {}}},
+        {"kind": "message", "payload": {"type": "sim.done", "time": 1.0, "finishReason": None}},
     ]
 
 
@@ -252,6 +369,11 @@ def test_execute_worker_masks_native_error_details_and_terminates(monkeypatch, t
 
 def test_new_process_uses_spawn_and_starts_named_worker(monkeypatch, tmp_path):
     class Context:
+        method: str | None = None
+
+        def Event(self):
+            return threading.Event()
+
         def Process(self, **kwargs):
             self.kwargs = kwargs
             self.process = FakeProcess()
@@ -259,21 +381,33 @@ def test_new_process_uses_spawn_and_starts_named_worker(monkeypatch, tmp_path):
 
     context = Context()
     monkeypatch.setattr(process_runner.mp, "get_context", lambda method: (setattr(context, "method", method) or context))
+    monkeypatch.setattr(process_runner.config, "TEMP_DIR", tmp_path / "tmp")
+    monkeypatch.setattr(process_runner, "attach_worker_limits", lambda *_args, **_kwargs: None)
+    def make_process(_context, **kwargs):
+        context.kwargs = kwargs
+        context.process = FakeProcess()
+        return context.process
+    monkeypatch.setattr(process_runner, "_worker_process", make_process)
+    write_test_fmu(tmp_path / "model.fmu")
     output = FakeQueue()
 
-    process, returned_context = process_runner._new_process(tmp_path / "model.fmu", "model.fmu", {}, {}, output, True)
+    process, returned_context, job, worker_directory = process_runner._new_process(
+        tmp_path / "model.fmu", "model.fmu", {}, {}, output, True,
+    )
 
     assert context.method == "spawn"
     assert context.kwargs["name"] == "LabStation-FMU-Worker"
-    assert context.kwargs["args"][-1] is True
+    assert context.kwargs["args"][5] is True
     assert process.started
     assert returned_context is context
+    assert job is None
+    process_runner._cleanup_worker_directory(worker_directory)
 
 
 class FakeRealtimeConnection:
     def __init__(self):
-        self.requests = []
-        self.responses = []
+        self.requests: list[dict[str, Any]] = []
+        self.responses: list[dict[str, Any]] = [{"type": "ready"}]
         self.closed = False
 
     def send(self, request):
@@ -289,7 +423,12 @@ class FakeRealtimeConnection:
             "terminated": method == "terminate",
             "modelVariables": [{"name": "y", "valueReference": 2, "type": "Real", "causality": "output"}],
         }
-        result = {"modelName": "isolated-demo"} if method == "load" else {"time": 0.5, "state": "running"}
+        if method == "load":
+            result = {"modelName": "isolated-demo"}
+        elif method == "get_outputs":
+            result = {"outputs": {"y": 0.5}}
+        else:
+            result = {"time": 0.5, "state": "running"}
         self.responses.append({"requestId": request["requestId"], "ok": True, "result": result, "snapshot": snapshot})
 
     def poll(self, _timeout=None):
@@ -355,9 +494,14 @@ def test_realtime_session_uses_spawn_worker_and_mirrors_worker_state(monkeypatch
     process = FakeRealtimeProcess(alive=True)
 
     class Context:
+        method: str | None = None
+
         def Pipe(self, duplex=True):
             assert duplex is True
             return connection, SimpleNamespace(close=lambda: None)
+
+        def Event(self):
+            return threading.Event()
 
         def Process(self, **kwargs):
             self.kwargs = kwargs
@@ -366,6 +510,14 @@ def test_realtime_session_uses_spawn_worker_and_mirrors_worker_state(monkeypatch
 
     context = Context()
     monkeypatch.setattr(process_runner.mp, "get_context", lambda method: (setattr(context, "method", method) or context))
+    monkeypatch.setattr(process_runner.config, "TEMP_DIR", tmp_path / "tmp")
+    monkeypatch.setattr(process_runner, "attach_worker_limits", lambda *_args, **_kwargs: None)
+    def make_process(_context, **kwargs):
+        context.kwargs = kwargs
+        context.process = process
+        return process
+    monkeypatch.setattr(process_runner, "_worker_process", make_process)
+    write_test_fmu(tmp_path / "demo.fmu")
 
     session = process_runner.RealtimeSession("realtime-1", tmp_path / "demo.fmu", access_key="demo.fmu")
     description = session.load()
@@ -378,6 +530,7 @@ def test_realtime_session_uses_spawn_worker_and_mirrors_worker_state(monkeypatch
     assert result == {"time": 0.5, "state": "running"}
     assert session.state == "running"
     assert session._time == 0.5
+    assert session._md is not None
     assert session._md.modelVariables[0].valueReference == 2
     assert [request["method"] for request in connection.requests] == ["load", "step"]
 
@@ -390,10 +543,17 @@ def test_realtime_session_terminates_child_and_closes_ipc(monkeypatch, tmp_path)
         def Pipe(self, duplex=True):
             return connection, SimpleNamespace(close=lambda: None)
 
+        def Event(self):
+            return threading.Event()
+
         def Process(self, **kwargs):
             return process
 
     monkeypatch.setattr(process_runner.mp, "get_context", lambda _method: Context())
+    monkeypatch.setattr(process_runner.config, "TEMP_DIR", tmp_path / "tmp")
+    monkeypatch.setattr(process_runner, "attach_worker_limits", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(process_runner, "_worker_process", lambda _context, **_kwargs: process)
+    write_test_fmu(tmp_path / "demo.fmu")
     session = process_runner.RealtimeSession("realtime-2", tmp_path / "demo.fmu", access_key="demo.fmu")
 
     session.terminate()
@@ -403,7 +563,10 @@ def test_realtime_session_terminates_child_and_closes_ipc(monkeypatch, tmp_path)
     assert process.join_calls
 
 
-def test_realtime_session_runs_in_a_real_spawned_process(tmp_path):
+@pytest.mark.skipif(os.name == "nt", reason="AppContainer launch is covered with isolated WinAPI mocks")
+def test_realtime_session_runs_in_a_real_spawned_process(monkeypatch, tmp_path):
+    monkeypatch.setattr(process_runner.config, "TEMP_DIR", tmp_path / "tmp")
+    write_test_fmu(tmp_path / "demo.fmu")
     session = process_runner.RealtimeSession(
         "spawn-session",
         tmp_path / "demo.fmu",
@@ -423,12 +586,127 @@ def test_realtime_session_runs_in_a_real_spawned_process(tmp_path):
 
 def bare_realtime_session():
     session = process_runner.RealtimeSession.__new__(process_runner.RealtimeSession)
+    session.gateway_context = {}
     session._terminated = False
     session._attached = False
     session._attach_deadline = None
     session._attachment_owner = None
     session.expires_at = None
     return session
+
+
+def rpc_realtime_session(tmp_path, connection):
+    session = bare_realtime_session()
+    worker_directory = tmp_path / "rpc-worker"
+    worker_directory.mkdir()
+    session.session_id = "rpc-session"
+    session._closed = False
+    session._process = FakeRealtimeProcess(alive=True)
+    session._job = None
+    session._connection = connection
+    session._worker_directory = worker_directory
+    session._lock = threading.RLock()
+    session._request_counter = 0
+    session._state = "new"
+    session._time = 0.0
+    session._start_time = 0.0
+    session._stop_time = 1.0
+    session._step_size = 0.1
+    session._time_mode = "simtime"
+    session._playback_speed = 1.0
+    session._finished_reason = None
+    session._sequence_lock = threading.Lock()
+    session._pending_samples = []
+    session._pending_queue_drops = 0
+    session._initialised = True
+    session._md = SimpleNamespace(modelVariables=[
+        SimpleNamespace(name="y", valueReference=2, causality="output"),
+    ])
+    session.seq = 0
+    session.subscription = None
+    connection.responses.clear()
+    return session
+
+
+def test_realtime_rpc_methods_update_state_and_batch_subscriptions(monkeypatch, tmp_path):
+    from app import engine
+
+    connection = FakeRealtimeConnection()
+    session = rpc_realtime_session(tmp_path, connection)
+    monkeypatch.setattr(process_runner.time, "monotonic", lambda: 10.0)
+
+    assert session.load() == {"modelName": "isolated-demo"}
+    assert session.initialize(stop_time=2.0)["state"] == "running"
+    assert session.validate_initial_values({"y": 1})["state"] == "running"
+    assert session.step(0.25)["time"] == 0.5
+    assert session.run_until(1.0, 0.1)["time"] == 0.5
+    assert session.set_inputs({"x": 2}) is None
+    assert session.validate_inputs({"x": 2})["state"] == "running"
+    assert session.get_outputs([2]) == {"outputs": {"y": 0.5}}
+    assert session.pause()["state"] == "running"
+    assert session.resume()["state"] == "running"
+
+    session.subscription = engine.OutputSubscription(variables=["y"], period_ms=1, max_batch_size=2)
+    session._pending_queue_drops = 1
+    sample = session.sample_subscription()
+    assert sample is not None
+    assert sample["values"] == {"y": 0.5}
+    assert sample["dropped"] == 1 and sample["seq"] == 0
+    assert session.next_sequence() == 1
+    assert session.reset(defer_initialization=True)["state"] == "running"
+    assert session.subscription is not None
+    assert session.subscription.rate_dropped == 0
+
+    session.terminate()
+    assert session._closed and session.state == "terminated"
+    assert connection.closed
+
+
+def test_realtime_rpc_rejects_closed_dead_expired_and_malformed_workers(monkeypatch, tmp_path):
+    session = rpc_realtime_session(tmp_path, FakeRealtimeConnection())
+    session._closed = True
+    with pytest.raises(process_runner.ProcessExecutionError, match="closed"):
+        session.load()
+
+    session._closed = False
+    session._process.alive = False
+    with pytest.raises(process_runner.ProcessExecutionError, match="exited unexpectedly"):
+        session.load()
+
+    session._process.alive = True
+    session.expires_at = 999
+    monkeypatch.setattr(process_runner.time, "time", lambda: 1000)
+    with pytest.raises(process_runner.ProcessExecutionError) as error:
+        session.load()
+    assert error.value.code == "EXECUTION_AUTHORIZATION_EXPIRED"
+
+    connection = FakeRealtimeConnection()
+    session = rpc_realtime_session(tmp_path, connection)
+
+    def bad_response(request):
+        connection.responses.append({
+            "requestId": "wrong", "ok": True,
+            "snapshot": {"state": "loaded", "time": 0},
+        })
+
+    connection.send = bad_response
+    with pytest.raises(process_runner.ProcessExecutionError, match="invalid response"):
+        session.load()
+
+
+def test_realtime_rpc_maps_child_command_errors(tmp_path):
+    connection = FakeRealtimeConnection()
+    session = rpc_realtime_session(tmp_path, connection)
+    original_send = connection.send
+
+    def rejected(request):
+        original_send(request)
+        connection.responses[-1]["ok"] = False
+        connection.responses[-1]["error"] = "safe child error"
+
+    connection.send = rejected
+    with pytest.raises(RuntimeError, match="safe child error"):
+        session.load()
 
 
 def test_realtime_attachment_grace_period_and_owner_are_enforced(monkeypatch):
@@ -548,10 +826,11 @@ def test_realtime_worker_dispatches_only_allowlisted_session_methods(monkeypatch
     connection = Connection()
     process_runner._realtime_session_worker(connection, "session", tmp_path / "demo.fmu", "demo.fmu", Session)
 
-    assert [response["ok"] for response in connection.outgoing] == [True, True, False, True]
-    assert connection.outgoing[1]["snapshot"]["time"] == 0.25
-    assert connection.outgoing[2]["error"] == "FMU worker command is not allowlisted"
-    assert connection.outgoing[3]["snapshot"]["terminated"] is True
+    assert connection.outgoing[0] == {"type": "ready"}
+    assert [response["ok"] for response in connection.outgoing[1:]] == [True, True, False, True]
+    assert connection.outgoing[2]["snapshot"]["time"] == 0.25
+    assert connection.outgoing[3]["error"] == "FMU worker command is not allowlisted"
+    assert connection.outgoing[4]["snapshot"]["terminated"] is True
 
 
 def test_module_entrypoint_does_not_start_uvicorn_when_spawn_reimports_it():
