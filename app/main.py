@@ -818,6 +818,7 @@ async def ws_sessions(ws: WebSocket):
     _runner_task: asyncio.Task | None = None
     _expiry_task: asyncio.Task | None = None
     attachment_owner = object()
+    _output_sampler_changed = asyncio.Event()
 
     async def _stop_runner() -> None:
         nonlocal _runner_task
@@ -936,11 +937,30 @@ async def ws_sessions(ws: WebSocket):
         """Background task that streams subscribed outputs to the WS client."""
         try:
             while True:
-                if session and session.subscription and session._initialised and not session._terminated:
-                    payload = await asyncio.to_thread(session.sample_subscription)
-                    if payload:
-                        await ws.send_text(json.dumps(payload, default=str))
-                await asyncio.sleep(0.01)  # Output sampling is independent of the FMI step size.
+                active_session = session
+                subscription = active_session.subscription if active_session else None
+                if (
+                    not active_session
+                    or not subscription
+                    or not active_session._initialised
+                    or active_session._terminated
+                ):
+                    _output_sampler_changed.clear()
+                    await _output_sampler_changed.wait()
+                    continue
+
+                wait_seconds = subscription.seconds_until_due()
+                if wait_seconds > 0:
+                    try:
+                        await asyncio.wait_for(_output_sampler_changed.wait(), timeout=wait_seconds)
+                    except asyncio.TimeoutError:
+                        pass
+                    _output_sampler_changed.clear()
+                    continue
+
+                payload = await asyncio.to_thread(active_session.sample_subscription)
+                if payload:
+                    await ws.send_text(json.dumps(payload, default=str))
         except WebSocketDisconnect:
             logger.debug("Output emitter stopped after WebSocket disconnect")
         except asyncio.CancelledError:
@@ -979,9 +999,10 @@ async def ws_sessions(ws: WebSocket):
                             gateway_reservation_end = gateway_claims.get("reservationEndsAt")
                         if bound_session.expires_at is not None or gateway_reservation_end is not None:
                             _expiry_task = asyncio.create_task(_expire_session_after_deadline(bound_session))
-                        # Start emitter task on session creation
+                        # Start emitter task on session creation and wake it if it already exists.
                         if _emitter_task is None or _emitter_task.done():
                             _emitter_task = asyncio.create_task(_output_emitter())
+                        _output_sampler_changed.set()
                 elif msg_type == "session.terminate":
                     await _stop_runner()
                     if _expiry_task:
@@ -990,6 +1011,15 @@ async def ws_sessions(ws: WebSocket):
                     if session:
                         await asyncio.to_thread(engine.remove_session, session.session_id)
                     session = None
+                    _output_sampler_changed.set()
+                elif msg_type in (
+                    "sim.initialize",
+                    "sim.reset",
+                    "sim.resume",
+                    "sim.subscribeOutputs",
+                    "sim.unsubscribeOutputs",
+                ):
+                    _output_sampler_changed.set()
 
                 if request_id:
                     response["requestId"] = request_id

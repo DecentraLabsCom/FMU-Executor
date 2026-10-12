@@ -85,7 +85,7 @@ the Gateway environment expected for station mode:
 | `FMU_MAX_MODEL_DESCRIPTION_BYTES` | `8 MiB` | Maximum `modelDescription.xml` size |
 | `FMU_WORKER_CPU_SECONDS` | `300` | Per-worker CPU-time limit |
 | `FMU_WORKER_MEMORY_MIB` | `1024` | Per-worker memory limit |
-| `FMU_WORKER_FILE_MIB` | `128` | Linux per-file write limit; Windows Job Objects do not enforce it |
+| `FMU_WORKER_FILE_MIB` | `128` | Linux per-file write limit; Windows AppContainer workers have no per-file quota |
 | `FMU_EXECUTOR_COMMIT` | Build metadata | Source commit recorded in execution evidence |
 | `FMU_MAX_INPUT_UPDATE_BYTES` | `65536` | Maximum JSON size for one `sim.setInputs` update |
 | `FMU_MAX_INPUT_UPDATES_PER_DAY` | `10000` | Daily runtime input update limit per reservation and FMU |
@@ -221,15 +221,16 @@ variables with credential-like names removed. Linux workers additionally use
 CPU, memory, per-file and descriptor limits, Landlock write restrictions, and
 Landlock read rules limited to the Python/system runtime and the pinned FMU,
 and seccomp rules that deny network sockets and executable child processes. These
-Linux controls fail closed when unavailable. Windows workers use Job Objects
-for CPU time, memory, child-process count and complete tree termination. The
-Linux worker is bound to its supervisor's lifetime, and startup removes private
-worker directories whose recorded process has exited. The
-Windows worker still runs as the service identity: filesystem write access is
-not restricted to its temporary directory, network is not disabled, and there
-is no aggregate temporary-disk quota. `workerIsolation` in
-`/internal/fmu/validate` reports the controls available on the current Station;
-it does not claim that Windows has the Linux filesystem or network sandbox.
+Linux controls fail closed when unavailable. Windows workers use per-worker
+AppContainers with no network capabilities and filesystem access granted to the
+bundled runtime and private work directory. Their isolated package profile
+storage is private to each worker. Windows Job Objects enforce CPU time, memory,
+child-process count and complete tree termination. The Linux worker is bound to
+its supervisor's lifetime; startup removes abandoned worker directories and
+AppContainer profiles. The worker's underlying account remains the sidecar's
+account, normally `SYSTEM`, and Windows still has no per-file or aggregate
+temporary-disk quota. `workerIsolation` in `/internal/fmu/validate` reports the
+controls available on the current Station.
 The image defaults to a dedicated non-root user. The local Docker profile adds
 a read-only root, resource limits, process cap, and bounded `/tmp` tmpfs.
 

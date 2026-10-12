@@ -19,7 +19,7 @@ import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Iterator
+from typing import TYPE_CHECKING, Any, Iterator
 from uuid import uuid4
 
 from . import config
@@ -32,6 +32,10 @@ from .isolation import (
     terminate_worker,
     worker_process_is_alive,
 )
+from .windows_appcontainer import WindowsAppContainerProcess, delete_worker_appcontainer_profile
+
+if TYPE_CHECKING:
+    from .engine import OutputSubscription
 
 
 class ProcessExecutionError(RuntimeError):
@@ -69,6 +73,8 @@ def _worker_owner_marker_path(directory: Path) -> Path:
 
 
 def _cleanup_worker_directory(directory: Path) -> None:
+    if os.name == "nt" and not delete_worker_appcontainer_profile(directory.name):
+        return
     shutil.rmtree(directory, ignore_errors=True)
     try:
         _worker_owner_marker_path(directory).unlink()
@@ -102,6 +108,24 @@ def cleanup_abandoned_worker_directories() -> int:
 
 def _mark_worker_directory(directory: Path, pid: int) -> None:
     _worker_owner_marker_path(directory).write_text(str(pid), encoding="ascii")
+
+
+def _worker_process(
+    context: Any,
+    *,
+    target: Any,
+    args: tuple[Any, ...],
+    name: str,
+    worker_directory: Path,
+) -> Any:
+    if os.name == "nt":
+        return WindowsAppContainerProcess(
+            target=target,
+            args=args,
+            name=name,
+            worker_directory=worker_directory,
+        )
+    return context.Process(target=target, args=args, name=name)
 
 
 def _sanitize_worker_environment() -> None:
@@ -306,6 +330,7 @@ class RealtimeSession:
         self._attach_deadline: float | None = None
         self._attachment_owner: object | None = None
         self.seq = 0
+        self.subscription: OutputSubscription | None = None
         self._pending_samples: list[dict[str, Any]] = []
         self._pending_queue_drops = 0
         self._lock = threading.RLock()
@@ -328,7 +353,8 @@ class RealtimeSession:
             raise
         self._job: WindowsWorkerJob | None = None
         start_gate = context.Event()
-        self._process = context.Process(
+        self._process = _worker_process(
+            context,
             target=_realtime_session_worker,
             args=(
                 child_connection, self.session_id, worker_fmu_path, self.access_key,
@@ -336,6 +362,7 @@ class RealtimeSession:
                 os.getpid(),
             ),
             name="LabStation-FMU-Realtime",
+            worker_directory=self._worker_directory,
         )
         try:
             self._process.start()
@@ -560,40 +587,41 @@ class RealtimeSession:
         return result if isinstance(result, dict) else {}
 
     def sample_subscription(self) -> dict[str, Any] | None:
-        if not self.subscription or not self._initialised or self._terminated:
+        subscription = self.subscription
+        if not subscription or not self._initialised or self._terminated:
+            return None
+        if subscription.seconds_until_due() > 0:
             return None
         variable_refs = None
-        if self.subscription.variables is not None and self._md:
-            names = set(self.subscription.variables)
+        if subscription.variables is not None and self._md:
+            names = set(subscription.variables)
             variable_refs = [
                 variable.valueReference for variable in self._md.modelVariables
                 if variable.name in names and variable.causality == "output"
             ]
         sample = self.get_outputs(variable_refs)["outputs"]
-        self._pending_samples.append(sample)
-        if len(self._pending_samples) > self.subscription.max_batch_size:
-            excess = len(self._pending_samples) - self.subscription.max_batch_size
-            self._pending_samples = self._pending_samples[excess:]
-            self.subscription.rate_dropped += excess
-        min_interval = self.subscription.min_interval_seconds()
-        now = time.monotonic()
-        if now - self.subscription.last_emit_monotonic < min_interval:
-            self.subscription.rate_dropped += 1
+        if self.subscription is not subscription:
             return None
-        self.subscription.last_emit_monotonic = now
+        self._pending_samples.append(sample)
+        if len(self._pending_samples) > subscription.max_batch_size:
+            excess = len(self._pending_samples) - subscription.max_batch_size
+            self._pending_samples = self._pending_samples[excess:]
+            subscription.rate_dropped += excess
+        now = time.monotonic()
+        subscription.last_emit_monotonic = now
         with self._sequence_lock:
             payload = {
                 "type": "sim.outputs",
                 "sessionId": self.session_id,
                 "seq": self.seq,
-                "dropped": self.subscription.rate_dropped + self._pending_queue_drops,
+                "dropped": subscription.rate_dropped + self._pending_queue_drops,
                 "batchSize": len(self._pending_samples),
                 "simTime": self._time,
                 "values": self._pending_samples[-1],
             }
             self.seq += 1
         self._pending_samples.clear()
-        self.subscription.rate_dropped = 0
+        subscription.rate_dropped = 0
         self._pending_queue_drops = 0
         return payload
 
@@ -859,10 +887,12 @@ def _new_process(
         streaming, capture_series, start_gate, str(worker_directory),
         probe_only, resource_policy, os.getpid(),
     )
-    process = context.Process(
+    process = _worker_process(
+        context,
         target=_execute_worker,
         args=worker_args,
         name="LabStation-FMU-Worker",
+        worker_directory=worker_directory,
     )
     try:
         process.start()

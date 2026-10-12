@@ -50,6 +50,10 @@ class OutputSubscription:
             hz_interval = 1.0 / self.max_hz
         return max(period_interval, hz_interval)
 
+    def seconds_until_due(self, now: float | None = None) -> float:
+        now = _time.monotonic() if now is None else now
+        return max(0.0, self.min_interval_seconds() - (now - self.last_emit_monotonic))
+
 
 class FmuSession:
     """Manage one loaded FMI 2/FMI 3 Co-Simulation session."""
@@ -448,13 +452,17 @@ class FmuSession:
     def sample_subscription(self) -> dict[str, Any] | None:
         """Collect a subscription sample.  Returns an output-event dict ready
         to send, or ``None`` if the subscription rate-limit has not elapsed."""
-        if not self.subscription:
+        subscription = self.subscription
+        if not subscription:
+            return None
+        if subscription.seconds_until_due() > 0:
+            subscription.rate_dropped += 1
             return None
 
         # Resolve variable name filter → valueReference filter
         var_refs: list[int] | None = None
-        if self.subscription.variables is not None and self._md:
-            name_set = set(self.subscription.variables)
+        if subscription.variables is not None and self._md:
+            name_set = set(subscription.variables)
             var_refs = [
                 v.valueReference
                 for v in self._md.modelVariables
@@ -462,26 +470,23 @@ class FmuSession:
             ]
 
         sample = self._read_outputs(var_refs)
+        if self.subscription is not subscription:
+            return None
         self._pending_samples.append(sample)
 
         # Enforce max batch size
-        if len(self._pending_samples) > self.subscription.max_batch_size:
-            excess = len(self._pending_samples) - self.subscription.max_batch_size
+        if len(self._pending_samples) > subscription.max_batch_size:
+            excess = len(self._pending_samples) - subscription.max_batch_size
             self._pending_samples = self._pending_samples[excess:]
-            self.subscription.rate_dropped += excess
+            subscription.rate_dropped += excess
 
         now = _time.monotonic()
-        min_interval = self.subscription.min_interval_seconds()
-        if (now - self.subscription.last_emit_monotonic) < min_interval:
-            self.subscription.rate_dropped += 1
-            return None
-
-        self.subscription.last_emit_monotonic = now
+        subscription.last_emit_monotonic = now
         values = self._pending_samples[-1]
         batch_size = len(self._pending_samples)
         self._pending_samples.clear()
-        dropped = self.subscription.rate_dropped + self._pending_queue_drops
-        self.subscription.rate_dropped = 0
+        dropped = subscription.rate_dropped + self._pending_queue_drops
+        subscription.rate_dropped = 0
         self._pending_queue_drops = 0
 
         payload = {

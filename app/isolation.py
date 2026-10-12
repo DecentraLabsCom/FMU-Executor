@@ -78,16 +78,19 @@ def worker_isolation_capabilities() -> dict[str, Any]:
         }
     if os.name == "nt":
         return {
-            "mechanisms": ["windows-job-object", "private-working-directory"],
+            "mechanisms": ["windows-app-container", "windows-job-object", "private-working-directory"],
             "cpuLimit": True,
             "memoryLimit": True,
             "childProcessLimit": True,
-            "networkDisabled": False,
+            "networkDisabled": True,
             "writesLimitedToWorkDirectory": False,
+            "writesLimitedToPrivateLocations": True,
+            "isolatedProfileStorage": True,
             "temporaryFileLimitPerFile": False,
             "temporaryStorageAggregateLimit": False,
-            "readAccessRestricted": False,
+            "readAccessRestricted": True,
             "lowPrivilegeIdentity": False,
+            "appContainerToken": True,
             "failClosed": True,
         }
     return {
@@ -345,7 +348,12 @@ class WindowsWorkerJob:
     _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
     _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
 
-    def __init__(self, pid: int, policy: dict[str, Any] | None = None):
+    def __init__(
+        self,
+        pid: int,
+        policy: dict[str, Any] | None = None,
+        appcontainer: Any | None = None,
+    ):
         if os.name != "nt":
             raise WorkerIsolationError("Windows Job Objects are only available on Windows")
         self._kernel = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -367,6 +375,7 @@ class WindowsWorkerJob:
         if not self._job:
             raise WorkerIsolationError("Unable to create FMU worker Job Object")
         self._process = None
+        self._appcontainer = appcontainer
         try:
             limits = _JobExtendedLimitInformation()
             limits.BasicLimitInformation.LimitFlags = (
@@ -416,13 +425,20 @@ class WindowsWorkerJob:
         if self._job:
             self._kernel.CloseHandle(self._job)
             self._job = None
+        if self._appcontainer is not None:
+            appcontainer = self._appcontainer
+            self._appcontainer = None
+            appcontainer.close()
 
 
 def attach_worker_limits(process: Any, policy: dict[str, Any] | None = None) -> WindowsWorkerJob | None:
     """Attach a spawned worker to OS-level descendant/resource controls."""
     if os.name == "nt":
         try:
-            return WindowsWorkerJob(int(process.pid), policy)
+            appcontainer = getattr(process, "_fmu_appcontainer", None)
+            if appcontainer is None:
+                raise WorkerIsolationError("Windows FMU worker was not launched in an AppContainer")
+            return WindowsWorkerJob(int(process.pid), policy, appcontainer)
         except WorkerIsolationError:
             raise
         except Exception as exc:
@@ -435,6 +451,11 @@ def terminate_worker(process: Any, job: WindowsWorkerJob | None = None) -> None:
     if process.pid is None:
         if job is not None:
             job.close()
+        else:
+            appcontainer = getattr(process, "_fmu_appcontainer", None)
+            if appcontainer is not None:
+                appcontainer.close()
+                process._fmu_appcontainer = None
         return
     if process.is_alive():
         if job is not None:
@@ -450,3 +471,8 @@ def terminate_worker(process: Any, job: WindowsWorkerJob | None = None) -> None:
         process.join(timeout=2)
     if job is not None:
         job.close()
+    else:
+        appcontainer = getattr(process, "_fmu_appcontainer", None)
+        if appcontainer is not None:
+            appcontainer.close()
+            process._fmu_appcontainer = None
