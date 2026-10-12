@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import base64
+import binascii
+import copy
 import logging
 import math
 from functools import reduce
@@ -21,6 +23,8 @@ from fmpy import (
     instantiate_fmu as fmpy_instantiate_fmu,
     read_model_description,
 )
+from fmpy.fmi1 import FMICallException
+from fmpy.fmi2 import fmi2Discard, fmi2LastSuccessfulTime, fmi2Pending, fmi2Terminated
 
 from . import config
 
@@ -71,7 +75,12 @@ class FmuSession:
         self._step_size: float = 0.001
         self._start_time: float = 0.0
         self._stop_time: float = 1.0
-        self._parameters: dict[str, Any] = {}
+        self._initial_parameters: dict[str, Any] = {}
+        self._time_mode = "simtime"
+        self._playback_speed = 1.0
+        self._early_return_allowed = False
+        self._fmi3_event_mode_used = False
+        self._finished_reason: str | None = None
         self._state: str = "new"
         self._initialised: bool = False
         self._terminated: bool = False
@@ -105,6 +114,9 @@ class FmuSession:
         stop_time: float = 1.0,
         step_size: float | None = None,
         parameters: dict[str, Any] | None = None,
+        time_mode: str = "simtime",
+        playback_speed: float = 1.0,
+        early_return_allowed: bool = False,
     ) -> dict[str, Any]:
         if self._initialised:
             raise RuntimeError("Session already initialised")
@@ -124,10 +136,26 @@ class FmuSession:
             raise ValueError("startTime, stopTime and stepSize must be finite")
         if self._stop_time <= self._start_time:
             raise ValueError("stopTime must be greater than startTime")
+        if not math.isfinite(self._stop_time - self._start_time):
+            raise ValueError("Simulation duration must be finite")
         if self._step_size <= 0:
             raise ValueError("stepSize must be positive")
+        if time_mode not in {"simtime", "realtime", "external"}:
+            raise ValueError("timeMode must be simtime, realtime, or external")
+        if not math.isfinite(playback_speed) or not 0.1 <= playback_speed <= 100.0:
+            raise ValueError("playbackSpeed must be finite and between 0.1 and 100")
+        if type(early_return_allowed) is not bool:
+            raise ValueError("earlyReturnAllowed must be Boolean")
         self._time = self._start_time
-        self._parameters = dict(parameters or {})
+        if parameters is not None and not isinstance(parameters, dict):
+            raise ValueError("Initialization values must be an object")
+        original_parameters = parameters if parameters is not None else {}
+        validated_parameters = self._validate_values(original_parameters, phase="initialization")
+        self._initial_parameters = copy.deepcopy(original_parameters)
+        self._time_mode = time_mode
+        self._playback_speed = float(playback_speed)
+        self._early_return_allowed = early_return_allowed
+        self._finished_reason = None
         self._step_count = 0
 
         slave = self._instantiate()
@@ -146,29 +174,59 @@ class FmuSession:
             )
             slave.enterInitializationMode()
 
-        if self._parameters:
-            self._apply_parameters(self._parameters)
+        if validated_parameters:
+            self._apply_validated_values(validated_parameters)
 
         slave.exitInitializationMode()
         self._initialised = True
         self._terminated = False
         self._state = "initialized"
 
-        return {"sessionId": self.session_id, "time": self._time, "state": "initialized"}
+        return {
+            "sessionId": self.session_id,
+            "time": self._time,
+            "state": "initialized",
+            "timeMode": self._time_mode,
+            "playbackSpeed": self._playback_speed,
+        }
 
     def step(self, step_size: float | None = None) -> dict[str, Any]:
         slave = self._require_slave()
-        if self._state == "paused":
-            raise RuntimeError("Session is paused")
+        if self._state in {"paused", "stopped", "error"}:
+            raise RuntimeError(f"Session cannot step from state {self._state}")
         h = self._step_size if step_size is None else step_size
         if not math.isfinite(h) or h <= 0:
             raise ValueError("stepSize must be positive")
+        requested_h = h
+        requested_time = self._time + requested_h
+        if not math.isfinite(requested_time) or requested_time <= self._time:
+            raise ValueError("stepSize does not produce a finite later time")
+        remaining = max(0.0, self._stop_time - self._time)
+        tolerance = max(1e-12, abs(self._stop_time) * 1e-12)
+        if self._time_mode == "external" and requested_h > remaining + tolerance:
+            raise ValueError("stepSize would advance past stopTime")
+        h = min(requested_h, remaining)
+        if h <= 0.0:
+            self._state = "stopped"
+            self._finished_reason = self._finished_reason or "stop_time_reached"
+            return self._step_result(self._time, self._time, finished=True)
         self._ensure_step_budget(1)
-        slave.doStep(currentCommunicationPoint=self._time, communicationStepSize=h)
-        self._time += h
         self._step_count += 1
-        self._state = "running"
-        return {"time": self._time, "state": "running"}
+        previous_time = self._time
+        reached_time, result = self._do_step(slave, h)
+        result["requestedTime"] = requested_time
+        if h < requested_h - tolerance:
+            result["earlyReturn"] = True
+        self._time = reached_time
+        if result["terminateSimulation"]:
+            self._state = "stopped"
+            self._finished_reason = "fmu_termination_requested"
+        elif self._time >= self._stop_time - 1e-12:
+            self._state = "stopped"
+            self._finished_reason = "stop_time_reached"
+        else:
+            self._state = "running"
+        return self._step_result(previous_time, reached_time, **result)
 
     def run_until(self, target_time: float, step_size: float | None = None) -> dict[str, Any]:
         slave = self._require_slave()
@@ -176,20 +234,64 @@ class FmuSession:
             raise ValueError("targetTime must be finite")
         if target_time < self._time:
             raise ValueError("targetTime must not be earlier than current simulation time")
-        if self._state == "paused":
-            raise RuntimeError("Session is paused")
+        if self._state in {"paused", "stopped", "error"}:
+            raise RuntimeError(f"Session cannot run from state {self._state}")
+        requested_target = target_time
+        target_time = min(target_time, self._stop_time)
         h = self._step_size if step_size is None else step_size
         if not math.isfinite(h) or h <= 0:
             raise ValueError("stepSize must be positive")
-        self._ensure_step_budget(math.ceil(max(0.0, target_time - self._time) / h))
+        expected_steps = max(0.0, target_time - self._time) / h
+        if not math.isfinite(expected_steps) or expected_steps > config.MAX_SIMULATION_STEPS:
+            raise ValueError("MAX_SIMULATION_STEPS_EXCEEDED")
+        self._ensure_step_budget(math.ceil(expected_steps))
         self._state = "running"
+        initial_time = self._time
+        steps = 0
+        early_return = False
+        event_occurred = False
+        event_handling_needed = False
+        terminate_simulation = False
+        consecutive_no_progress_events = 0
         while self._time < target_time - 1e-12:
             remaining = target_time - self._time
             actual_h = min(h, remaining)
-            slave.doStep(currentCommunicationPoint=self._time, communicationStepSize=actual_h)
-            self._time += actual_h
+            self._ensure_step_budget(1)
             self._step_count += 1
-        return {"time": self._time, "state": "running"}
+            steps += 1
+            previous_time = self._time
+            self._time, step_result = self._do_step(slave, actual_h)
+            early_return = early_return or step_result["earlyReturn"]
+            event_occurred = event_occurred or step_result["eventOccurred"]
+            event_handling_needed = event_handling_needed or step_result["eventHandlingNeeded"]
+            terminate_simulation = terminate_simulation or step_result["terminateSimulation"]
+            if step_result["terminateSimulation"]:
+                self._state = "stopped"
+                self._finished_reason = "fmu_termination_requested"
+                break
+            if self._time <= previous_time + 1e-15:
+                consecutive_no_progress_events += 1
+                if not step_result["eventOccurred"] or consecutive_no_progress_events >= 100:
+                    raise RuntimeError("FMI step returned repeatedly without advancing simulation time")
+            else:
+                consecutive_no_progress_events = 0
+        if self._state != "stopped":
+            self._state = "stopped" if self._time >= self._stop_time - 1e-12 else "initialized"
+            if self._state == "stopped":
+                self._finished_reason = "stop_time_reached"
+        return {
+            "time": self._time,
+            "state": self._state,
+            "requestedTime": requested_target,
+            "timeAdvanced": max(0.0, self._time - initial_time),
+            "steps": steps,
+            "earlyReturn": early_return,
+            "eventOccurred": event_occurred,
+            "eventHandlingNeeded": event_handling_needed,
+            "terminateSimulation": terminate_simulation,
+            "finished": self._state == "stopped",
+            "finishReason": self._finished_reason,
+        }
 
     def run_until_streaming(
         self,
@@ -203,23 +305,59 @@ class FmuSession:
             raise ValueError("targetTime must be finite")
         if target_time < self._time:
             raise ValueError("targetTime must not be earlier than current simulation time")
-        if self._state == "paused":
-            raise RuntimeError("Session is paused")
+        if self._state in {"paused", "stopped", "error"}:
+            raise RuntimeError(f"Session cannot run from state {self._state}")
+        target_time = min(target_time, self._stop_time)
         h = self._step_size if step_size is None else step_size
         if not math.isfinite(h) or h <= 0:
             raise ValueError("stepSize must be positive")
-        self._ensure_step_budget(math.ceil(max(0.0, target_time - self._time) / h))
+        expected_steps = max(0.0, target_time - self._time) / h
+        if not math.isfinite(expected_steps) or expected_steps > config.MAX_SIMULATION_STEPS:
+            raise ValueError("MAX_SIMULATION_STEPS_EXCEEDED")
+        self._ensure_step_budget(math.ceil(expected_steps))
         self._state = "running"
         seq = 0
+        consecutive_no_progress_events = 0
         while self._time < target_time - 1e-12:
             remaining = target_time - self._time
             actual_h = min(h, remaining)
-            slave.doStep(currentCommunicationPoint=self._time, communicationStepSize=actual_h)
-            self._time += actual_h
+            self._ensure_step_budget(1)
             self._step_count += 1
+            previous_time = self._time
+            self._time, step_result = self._do_step(slave, actual_h)
+            if self._time <= previous_time + 1e-15 and not step_result["terminateSimulation"]:
+                consecutive_no_progress_events += 1
+                if not step_result["eventOccurred"] or consecutive_no_progress_events >= 100:
+                    raise RuntimeError("FMI step returned repeatedly without advancing simulation time")
+            else:
+                consecutive_no_progress_events = 0
+            finished = step_result["terminateSimulation"] or self._time >= self._stop_time - 1e-12
+            if step_result["terminateSimulation"]:
+                self._state = "stopped"
+                self._finished_reason = "fmu_termination_requested"
+            elif finished:
+                self._state = "stopped"
+                self._finished_reason = "stop_time_reached"
             outputs = self._read_outputs(output_refs)
-            yield {"type": "sim.step", "seq": seq, "time": self._time, "outputs": outputs}
+            yield {
+                "type": "sim.step",
+                "seq": seq,
+                "time": self._time,
+                "outputs": outputs,
+                **step_result,
+                "finished": finished,
+                "finishReason": self._finished_reason if finished else None,
+            }
             seq += 1
+            if step_result["terminateSimulation"]:
+                return
+            if finished:
+                return
+        if self._time >= self._stop_time - 1e-12:
+            self._state = "stopped"
+            self._finished_reason = "stop_time_reached"
+        else:
+            self._state = "initialized"
 
     def _ensure_step_budget(self, additional_steps: int) -> None:
         if self._step_count + additional_steps > config.MAX_SIMULATION_STEPS:
@@ -227,8 +365,25 @@ class FmuSession:
 
     def set_inputs(self, values: dict[str, Any]) -> None:
         self._ensure_live()
-        self._apply_parameters(values)
-        self._parameters.update(values)
+        if self._state in {"stopped", "error"}:
+            raise RuntimeError(f"Session cannot accept inputs from state {self._state}")
+        validated = self._validate_values(values, phase="runtime")
+        self._apply_validated_values(validated)
+
+    def validate_initial_values(self, values: dict[str, Any]) -> dict[str, Any]:
+        """Validate initialization parameters before a scenario is charged."""
+        if self._terminated:
+            raise RuntimeError("Session already terminated")
+        if self._initialised:
+            raise RuntimeError("Session already initialised")
+        return self._validate_values(values, phase="initialization")
+
+    def validate_inputs(self, values: dict[str, Any]) -> dict[str, Any]:
+        """Validate and normalize runtime inputs without changing FMU state."""
+        self._ensure_live()
+        if self._state in {"stopped", "error"}:
+            raise RuntimeError(f"Session cannot accept inputs from state {self._state}")
+        return self._validate_values(values, phase="runtime")
 
     def get_outputs(self, refs: list[int] | None = None) -> dict[str, Any]:
         self._ensure_live()
@@ -244,20 +399,41 @@ class FmuSession:
     def resume(self) -> dict[str, Any]:
         """Mark the session runnable; the websocket loop performs stepping."""
         self._ensure_live()
+        if self._time_mode == "external":
+            raise RuntimeError("EXTERNAL_STEP_MODE does not support automatic stepping")
         if self._state not in ("paused", "initialized"):
             raise RuntimeError(f"Cannot resume from state {self._state}")
         self._state = "running"
         return {"time": self._time, "state": self._state}
 
-    def reset(self) -> dict[str, Any]:
-        """Reset the FMU to its original initialization options."""
-        self._ensure_live()
+    def reset(self, defer_initialization: bool = False) -> dict[str, Any]:
+        """Recreate the FMU, optionally leaving it loaded for a fresh init call."""
+        if self._terminated:
+            raise RuntimeError("Session already terminated")
+        if self._md is None:
+            raise RuntimeError("FMU is not loaded")
+        if type(defer_initialization) is not bool:
+            raise ValueError("deferInitialization must be Boolean")
         self._release_fmu()
+        self._time = self._start_time
+        self._finished_reason = None
+        self._step_count = 0
+        self._pending_samples.clear()
+        self._pending_queue_drops = 0
+        if self.subscription is not None:
+            self.subscription.last_emit_monotonic = 0.0
+            self.subscription.rate_dropped = 0
+        self._state = "loaded"
+        if defer_initialization:
+            return {"sessionId": self.session_id, "time": self._time, "state": "loaded"}
         return self.initialize(
             start_time=self._start_time,
             stop_time=self._stop_time,
             step_size=self._step_size,
-            parameters=self._parameters,
+            parameters=self._initial_parameters,
+            time_mode=self._time_mode,
+            playback_speed=self._playback_speed,
+            early_return_allowed=self._early_return_allowed,
         )
 
     @property
@@ -380,33 +556,164 @@ class FmuSession:
         """Instantiate through FMPy's FMI 2/FMI 3 selector."""
         if self._extract_dir is None or self._md is None:
             raise RuntimeError("FMU is not loaded")
-        # instantiate_fmu() already calls instantiate() internally.
+        # Negotiate FMI 3 early return and event mode only when the FMU exposes
+        # Event Mode. FMPy reports the actual reached time on every FMI 3 step.
+        co_simulation = self._md.coSimulation
+        self._fmi3_event_mode_used = bool(
+            self._fmi_major() == "3" and getattr(co_simulation, "hasEventMode", False)
+        )
         return fmpy_instantiate_fmu(
             str(self._extract_dir),
             self._md,
             fmi_type="CoSimulation",
+            early_return_allowed=self._fmi_major() == "3" and self._early_return_allowed,
+            event_mode_used=self._fmi3_event_mode_used,
         )
+
+    def _do_step(self, slave: Any, step_size: float) -> tuple[float, dict[str, Any]]:
+        current_time = self._time
+        requested_time = current_time + step_size
+        if not math.isfinite(requested_time) or requested_time <= current_time:
+            raise ValueError("FMI step does not produce a finite later time")
+        event_handling_needed = False
+        terminate_simulation = False
+        early_return = False
+
+        if self._fmi_major() == "3":
+            event_handling_needed, terminate_simulation, early_return, reached_time = slave.doStep(
+                currentCommunicationPoint=current_time,
+                communicationStepSize=step_size,
+            )
+            reached_time = float(reached_time)
+            if event_handling_needed:
+                if not self._fmi3_event_mode_used:
+                    raise RuntimeError("FMI_EVENT_MODE_NOT_NEGOTIATED")
+                terminate_simulation = self._handle_fmi3_event(slave) or terminate_simulation
+        else:
+            try:
+                slave.doStep(currentCommunicationPoint=current_time, communicationStepSize=step_size)
+                reached_time = requested_time
+            except FMICallException as exc:
+                if exc.status == fmi2Pending:
+                    raise RuntimeError("FMI2_ASYNCHRONOUS_STEP_UNSUPPORTED") from exc
+                if exc.status != fmi2Discard:
+                    raise
+                reached_time = float(slave.getRealStatus(fmi2LastSuccessfulTime))
+                try:
+                    terminate_simulation = bool(slave.getBooleanStatus(fmi2Terminated))
+                except FMICallException:
+                    terminate_simulation = False
+                early_return = reached_time < requested_time - 1e-12
+
+        if not math.isfinite(reached_time):
+            raise RuntimeError("FMI returned a non-finite simulation time")
+        tolerance = max(1e-12, abs(requested_time) * 1e-12)
+        if reached_time < current_time - tolerance or reached_time > requested_time + tolerance:
+            raise RuntimeError("FMI returned a simulation time outside the requested step")
+        reached_time = min(requested_time, max(current_time, reached_time))
+        if reached_time <= current_time + 1e-15 and not terminate_simulation and not event_handling_needed:
+            raise RuntimeError("FMI step returned without advancing simulation time")
+
+        return reached_time, {
+            "requestedTime": requested_time,
+            "earlyReturn": bool(early_return),
+            # Event mode is resolved in the isolated executor before this
+            # response returns. Expose occurrence for telemetry, and report
+            # that the remote importer still needs event handling as false.
+            "eventOccurred": bool(event_handling_needed),
+            "eventHandlingNeeded": False,
+            "terminateSimulation": bool(terminate_simulation),
+        }
+
+    @staticmethod
+    def _handle_fmi3_event(slave: Any) -> bool:
+        slave.enterEventMode()
+        for _ in range(1000):
+            needs_update, terminate, *_ = slave.updateDiscreteStates()
+            if terminate:
+                return True
+            if not needs_update:
+                slave.enterStepMode()
+                return False
+        raise RuntimeError("FMI_EVENT_ITERATION_LIMIT_EXCEEDED")
+
+    def _step_result(
+        self,
+        previous_time: float,
+        reached_time: float,
+        *,
+        requestedTime: float | None = None,
+        earlyReturn: bool = False,
+        eventOccurred: bool = False,
+        eventHandlingNeeded: bool = False,
+        terminateSimulation: bool = False,
+        finished: bool = False,
+    ) -> dict[str, Any]:
+        return {
+            "time": reached_time,
+            "state": self._state,
+            "requestedTime": requestedTime if requestedTime is not None else reached_time,
+            "timeAdvanced": max(0.0, reached_time - previous_time),
+            "earlyReturn": earlyReturn,
+            "eventOccurred": eventOccurred,
+            "eventHandlingNeeded": eventHandlingNeeded,
+            "terminateSimulation": terminateSimulation,
+            "finished": finished or self._state == "stopped",
+            "finishReason": self._finished_reason,
+        }
 
     def _describe(self) -> dict[str, Any]:
         from . import fmu_storage
         # Re-use the same normalised describe logic
         return fmu_storage.describe(self.access_key)
 
-    def _apply_parameters(self, params: dict[str, Any]) -> None:
-        """Set variable values by name."""
-        if not self._md or not self._slave:
-            return
+    def _validate_values(self, params: dict[str, Any], *, phase: str) -> dict[str, Any]:
+        if not isinstance(params, dict):
+            raise ValueError("Variable values must be an object")
+        if not self._md:
+            raise RuntimeError("FMU model description is not loaded")
         var_map = {v.name: v for v in self._md.modelVariables}
+        normalized: dict[str, Any] = {}
         for name, value in params.items():
             var = var_map.get(name)
             if var is None:
-                logger.warning("Unknown variable %r – skipped", name)
-                continue
-            vtype = self._normalise_type(var)
+                raise ValueError(f"Unknown FMU variable '{name}'")
+            self._validate_write_access(var, phase=phase)
             values = self._coerce_values(var, value)
+            normalized[name] = values if self._is_array(var) else values[0]
+        return normalized
+
+    @staticmethod
+    def _validate_write_access(var: Any, *, phase: str) -> None:
+        causality = str(getattr(var, "causality", ""))
+        variability = str(getattr(var, "variability", ""))
+        if phase == "initialization":
+            allowed = (
+                causality == "input"
+                or (causality == "parameter" and variability != "constant")
+            )
+        elif phase == "runtime":
+            allowed = causality == "input"
+        else:
+            raise ValueError(f"Unknown variable write phase '{phase}'")
+        if not allowed:
+            raise ValueError(
+                f"FMU variable '{var.name}' cannot be modified during {phase} "
+                f"(causality={causality or 'unspecified'}, variability={variability or 'unspecified'})"
+            )
+
+    def _apply_validated_values(self, params: dict[str, Any]) -> None:
+        """Apply a fully validated set of values by variable name."""
+        if not self._md or not self._slave:
+            raise RuntimeError("FMU instance is not initialized")
+        var_map = {v.name: v for v in self._md.modelVariables}
+        for name, value in params.items():
+            var = var_map[name]
+            vtype = self._variable_type(var)
+            values = value if self._is_array(var) else [value]
             setter = getattr(self._slave, f"set{vtype}", None)
             if setter is None:
-                raise ValueError(f"FMU variable type {vtype} is not supported")
+                raise ValueError(f"FMU variable '{name}' has unsupported type {vtype}")
             setter([int(var.valueReference)], values)
 
     def _read_outputs(self, refs: list[int] | None = None) -> dict[str, Any]:
@@ -414,23 +721,30 @@ class FmuSession:
         if not self._md or not self._slave:
             return {}
         outputs: dict[str, Any] = {}
+        output_variables = [v for v in self._md.modelVariables if v.causality == "output"]
+        output_refs = {int(v.valueReference) for v in output_variables}
+        if refs is not None:
+            unknown_refs = set(int(ref) for ref in refs) - output_refs
+            if unknown_refs:
+                raise ValueError("Requested value reference is unknown or is not an output")
         for var in self._md.modelVariables:
             if var.causality != "output":
                 continue
             if refs is not None and var.valueReference not in refs:
                 continue
             vr = [int(var.valueReference)]
-            vtype = self._normalise_type(var)
+            vtype = self._variable_type(var)
+            getter = getattr(self._slave, f"get{vtype}", None)
+            if getter is None:
+                raise RuntimeError(f"FMU output '{var.name}' uses unsupported type {vtype}")
+            size = self._variable_size(var)
             try:
-                getter = getattr(self._slave, f"get{vtype}", None)
-                if getter is None:
-                    continue
-                size = self._variable_size(var)
-                values = getter(vr) if size == 1 else getter(vr, nValues=size)
-                normalised = [self._normalise_output(vtype, value) for value in list(values)]
-                outputs[var.name] = normalised[0] if size == 1 else normalised
-            except Exception:
-                logger.debug("Could not read %s (vr=%d)", var.name, var.valueReference)
+                values = getter(vr, nValues=size) if self._is_array(var) else getter(vr)
+            except Exception as exc:
+                logger.warning("Could not read FMU output %s (vr=%d)", var.name, var.valueReference)
+                raise RuntimeError(f"Could not read FMU output '{var.name}'") from exc
+            normalised = [self._normalise_output(vtype, value) for value in list(values)]
+            outputs[var.name] = normalised if self._is_array(var) else normalised[0]
         return outputs
 
     @staticmethod
@@ -438,43 +752,124 @@ class FmuSession:
         variable_type = str(getattr(var, "type", ""))
         return "Integer" if variable_type == "Enumeration" else variable_type
 
+    def _variable_type(self, var: Any) -> str:
+        variable_type = str(getattr(var, "type", ""))
+        if variable_type == "Enumeration" and self._fmi_major() == "3":
+            return "Int64"
+        return self._normalise_type(var)
+
     @staticmethod
     def _variable_size(var: Any) -> int:
         shape = getattr(var, "shape", None)
         if isinstance(shape, (list, tuple)) and shape:
-            return int(reduce(mul, (int(extent) for extent in shape), 1))
+            extents = []
+            for extent in shape:
+                try:
+                    normalised_extent = int(extent)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise ValueError(f"FMU array '{getattr(var, 'name', '')}' has an unresolved dimension") from exc
+                if normalised_extent <= 0 or normalised_extent != extent:
+                    raise ValueError(f"FMU array '{getattr(var, 'name', '')}' has an invalid dimension")
+                extents.append(normalised_extent)
+            return int(reduce(mul, extents, 1))
         dimensions = getattr(var, "dimensions", None)
         if isinstance(dimensions, (list, tuple)) and dimensions:
             extents: list[int] = []
             for dimension in dimensions:
                 start = getattr(dimension, "start", None)
                 if start is None:
-                    return 1
+                    raise ValueError(f"FMU array '{getattr(var, 'name', '')}' has an unresolved dimension")
+                if int(start) <= 0:
+                    raise ValueError(f"FMU array '{getattr(var, 'name', '')}' has an invalid dimension")
                 extents.append(int(start))
             return int(reduce(mul, extents, 1))
         return 1
 
-    @classmethod
-    def _coerce_values(cls, var: Any, value: Any) -> list[Any]:
-        vtype = cls._normalise_type(var)
-        size = cls._variable_size(var)
-        raw_values = value if size > 1 else [value]
-        if size > 1 and (not isinstance(value, (list, tuple)) or len(value) != size):
-            raise ValueError(f"Array input '{var.name}' expects {size} values")
+    @staticmethod
+    def _is_array(var: Any) -> bool:
+        shape = getattr(var, "shape", None)
+        if isinstance(shape, (list, tuple)) and shape:
+            return True
+        dimensions = getattr(var, "dimensions", None)
+        return isinstance(dimensions, (list, tuple)) and bool(dimensions)
+
+    def _coerce_values(self, var: Any, value: Any) -> list[Any]:
+        vtype = self._variable_type(var)
+        size = self._variable_size(var)
+        is_array = self._is_array(var)
+        if is_array and (not isinstance(value, (list, tuple)) or len(value) != size):
+            raise ValueError(f"Array input '{var.name}' expects exactly {size} values")
+        if not is_array and isinstance(value, (list, tuple, dict)):
+            raise ValueError(f"Scalar input '{var.name}' requires a scalar value")
+        raw_values = value if is_array else [value]
         if vtype in ("Real", "Float32", "Float64"):
-            return [float(item) for item in raw_values]
+            converted = []
+            for item in raw_values:
+                if isinstance(item, bool) or not isinstance(item, (int, float)):
+                    raise ValueError(f"Input '{var.name}' requires a numeric value")
+                try:
+                    number = float(item)
+                except OverflowError as exc:
+                    raise ValueError(f"Input '{var.name}' is outside the numeric range") from exc
+                if not math.isfinite(number):
+                    raise ValueError(f"Input '{var.name}' must be finite")
+                if vtype == "Float32" and abs(number) > 3.4028234663852886e38:
+                    raise ValueError(f"Input '{var.name}' is outside the Float32 range")
+                self._validate_numeric_range(var, number)
+                converted.append(number)
+            return converted
         if vtype in ("Integer", "Int8", "UInt8", "Int16", "UInt16", "Int32", "UInt32", "Int64", "UInt64"):
-            return [int(item) for item in raw_values]
+            converted = []
+            limits = {
+                "Integer": (-(2**31), 2**31 - 1),
+                "Int8": (-(2**7), 2**7 - 1),
+                "UInt8": (0, 2**8 - 1),
+                "Int16": (-(2**15), 2**15 - 1),
+                "UInt16": (0, 2**16 - 1),
+                "Int32": (-(2**31), 2**31 - 1),
+                "UInt32": (0, 2**32 - 1),
+                "Int64": (-(2**63), 2**63 - 1),
+                "UInt64": (0, 2**64 - 1),
+            }
+            minimum, maximum = limits[vtype]
+            for item in raw_values:
+                if isinstance(item, bool) or not isinstance(item, int):
+                    raise ValueError(f"Input '{var.name}' requires an integer value")
+                self._validate_numeric_range(var, item)
+                if item < minimum or item > maximum:
+                    raise ValueError(f"Input '{var.name}' is outside the {vtype} range")
+                converted.append(item)
+            return converted
         if vtype in ("Boolean", "Clock"):
-            return [bool(item) for item in raw_values]
+            if not all(type(item) is bool for item in raw_values):
+                raise ValueError(f"Input '{var.name}' requires Boolean values")
+            return list(raw_values)
         if vtype == "String":
-            return [item.decode("utf-8") if isinstance(item, bytes) else str(item) for item in raw_values]
+            if not all(isinstance(item, str) for item in raw_values):
+                raise ValueError(f"Input '{var.name}' requires String values")
+            return list(raw_values)
         if vtype == "Binary":
+            if not all(isinstance(item, str) for item in raw_values):
+                raise ValueError("Binary inputs must be valid base64 strings")
             try:
-                return [item if isinstance(item, (bytes, bytearray)) else base64.b64decode(str(item), validate=True) for item in raw_values]
-            except Exception as exc:
+                return [base64.b64decode(item, validate=True) for item in raw_values]
+            except (binascii.Error, ValueError) as exc:
                 raise ValueError("Binary inputs must be valid base64 strings") from exc
         raise ValueError(f"FMU variable type {vtype} is not supported")
+
+    @staticmethod
+    def _validate_numeric_range(var: Any, value: float | int) -> None:
+        minimum = getattr(var, "min", None)
+        maximum = getattr(var, "max", None)
+        declared_type = getattr(var, "declaredType", None)
+        if minimum is None and declared_type is not None:
+            minimum = getattr(declared_type, "min", None)
+        if maximum is None and declared_type is not None:
+            maximum = getattr(declared_type, "max", None)
+        if minimum is not None and value < minimum:
+            raise ValueError(f"Input '{var.name}' is below its declared minimum")
+        if maximum is not None and value > maximum:
+            raise ValueError(f"Input '{var.name}' is above its declared maximum")
 
     @staticmethod
     def _normalise_output(vtype: str, value: Any) -> Any:

@@ -79,6 +79,14 @@ the Gateway environment expected for station mode:
 | `FMU_EXECUTOR_TEMP` | `<FMU_ROOT>/.tmp` | Temp dir for FMU extraction |
 | `FMU_EXECUTION_MODE` | `process` | One-shot/stream execution boundary: `process` (recommended) or `in-process` (diagnostics) |
 | `FMU_EXECUTION_TIMEOUT_SECONDS` | `3600` | Deadline for an isolated one-shot/stream worker |
+| `FMU_MAX_INPUT_UPDATE_BYTES` | `65536` | Maximum JSON size for one `sim.setInputs` update |
+| `FMU_MAX_INPUT_UPDATES_PER_DAY` | `10000` | Daily runtime input update limit per reservation and FMU |
+| `FMU_MAX_INPUT_UPDATE_BYTES_PER_DAY` | `67108864` | Daily input payload limit per reservation and FMU |
+| `FMU_MAX_INPUT_UPDATES_PER_WINDOW` | `30` | Short-window input update burst limit |
+| `FMU_INPUT_UPDATE_WINDOW_SECONDS` | `10` | Window for the input update burst limit |
+| `FMU_MAX_OUTPUT_SUBSCRIPTION_HZ` | `60` | Maximum requested output subscription rate |
+| `FMU_MAX_OUTPUT_SUBSCRIPTION_BATCH` | `256` | Maximum retained samples in a subscription batch |
+| `FMU_PROGRESS_INTERVAL_MS` | `50` | Minimum interval between automatic progress messages |
 | `FMU_OMSIMULATOR_ENABLED` | `false` | Enables OMSimulator discovery for the future composition backend; does not switch current execution automatically |
 | `FMU_OMSIMULATOR_COMMAND` | `OMSimulator` | OMSimulator executable or command name |
 | `FMU_OMSIMULATOR_TIMEOUT_SECONDS` | `3600` | Reserved timeout for the future OMSimulator adapter |
@@ -150,7 +158,33 @@ native FMU isolation is managed elsewhere.
 
 The realtime session advertises `start`, `pause`, `resume`, `reset`, `step`,
 input/output and reconnect capabilities. `reset` recreates the FMU instance
-with the original initialization options and inputs.
+with the original initialization options and inputs. Initialization inputs are
+read from `options.inputs` (the legacy top-level `parameters` object is also
+accepted); runtime writes accept only declared input variables and validate all
+names, types, ranges and array lengths before calling the FMU.
+The FMI proxy uses `sim.reset` with `deferInitialization: true` so a subsequent
+`sim.initialize` can apply the caller's updated experiment and initial inputs.
+
+`sim.initialize.options.timeMode` selects the session clock:
+
+- `simtime` runs automatic sessions as fast as the FMU can advance;
+- `realtime` paces simulated seconds against wall-clock seconds, scaled by
+  `playbackSpeed` (default `1`, allowed range `0.1` through `100`);
+- `external` disables automatic start/resume and `runUntil`; clients advance it
+  with `sim.step` and must send the current `currentCommunicationPoint`.
+
+FMI 3 event mode is negotiated with the FMU and resolved inside the isolated
+Executor before returning a step. Step responses include the last successful
+simulation time, early-return/termination flags, and whether an event occurred.
+Automatic progress messages are throttled independently of `stepSize`; output
+subscriptions have their own `periodMs`, `maxHz` and batch-size limits.
+
+Simulation scenarios and runtime input updates use separate budgets. The
+existing scenario limit remains 100 per reservation per UTC day by default.
+Input quotas are tracked by reservation and FMU: 10,000 updates and 64 MiB per
+day, 30 updates per 10-second window, and 64 KiB per update by default. These
+limits are globally configurable with the environment variables above; a
+`sim.setInputs` call no longer spends a simulation scenario.
 
 ### FMI conformance baseline
 

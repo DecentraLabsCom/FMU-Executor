@@ -23,6 +23,15 @@ class QuotaExceededError(RuntimeError):
     """A reservation has exhausted its daily simulation budget."""
 
 
+class InputUpdateQuotaExceededError(RuntimeError):
+    """Input update rate or size budget has been exhausted."""
+
+    def __init__(self, code: str, remaining: int):
+        super().__init__(code)
+        self.code = code
+        self.remaining = remaining
+
+
 def reservation_scope(context: dict[str, Any] | None) -> tuple[str, dict[str, str]]:
     """Return a stable key for one Gateway/lab/reservation authorization scope."""
     if not isinstance(context, dict):
@@ -99,6 +108,21 @@ class SimulationStore:
                     scenarios INTEGER NOT NULL,
                     PRIMARY KEY(scope_key, usage_day)
                 );
+                CREATE TABLE IF NOT EXISTS input_update_usage (
+                    scope_key TEXT NOT NULL,
+                    model_key TEXT NOT NULL,
+                    usage_day TEXT NOT NULL,
+                    updates INTEGER NOT NULL,
+                    payload_bytes INTEGER NOT NULL,
+                    PRIMARY KEY(scope_key, model_key, usage_day)
+                );
+                CREATE TABLE IF NOT EXISTS input_update_events (
+                    scope_key TEXT NOT NULL,
+                    model_key TEXT NOT NULL,
+                    created_at REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_input_update_events_window
+                    ON input_update_events(scope_key, model_key, created_at);
                 """
             )
             # Native FMU workers cannot be resumed after a process restart.
@@ -132,6 +156,63 @@ class SimulationStore:
                 (scope_key, usage_day, used + count),
             )
             return used + count
+
+    def reserve_input_update(self, scope_key: str, access_key: str, payload_bytes: int) -> dict[str, int]:
+        """Debit input update budgets independently from simulation scenarios."""
+        if payload_bytes < 0:
+            raise ValueError("Input payload size must not be negative")
+        if payload_bytes > config.MAX_INPUT_UPDATE_BYTES:
+            raise InputUpdateQuotaExceededError("INPUT_UPDATE_TOO_LARGE", config.MAX_INPUT_UPDATE_BYTES)
+        model_key = hashlib.sha256(access_key.encode("utf-8")).hexdigest()
+        usage_day = datetime.now(timezone.utc).date().isoformat()
+        now = time.time()
+        window_start = now - config.INPUT_UPDATE_WINDOW_SECONDS
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("DELETE FROM input_update_events WHERE created_at<?", (now - 3600,))
+            db.execute(
+                "DELETE FROM input_update_events WHERE scope_key=? AND model_key=? AND created_at<?",
+                (scope_key, model_key, window_start),
+            )
+            recent = int(db.execute(
+                "SELECT COUNT(*) AS count FROM input_update_events "
+                "WHERE scope_key=? AND model_key=? AND created_at>=?",
+                (scope_key, model_key, window_start),
+            ).fetchone()["count"])
+            if recent >= config.MAX_INPUT_UPDATES_PER_WINDOW:
+                raise InputUpdateQuotaExceededError(
+                    "INPUT_UPDATE_RATE_LIMIT", max(0, config.MAX_INPUT_UPDATES_PER_WINDOW - recent)
+                )
+            row = db.execute(
+                "SELECT updates,payload_bytes FROM input_update_usage "
+                "WHERE scope_key=? AND model_key=? AND usage_day=?",
+                (scope_key, model_key, usage_day),
+            ).fetchone()
+            used_updates = int(row["updates"]) if row else 0
+            used_bytes = int(row["payload_bytes"]) if row else 0
+            if used_updates + 1 > config.MAX_INPUT_UPDATES_PER_DAY:
+                raise InputUpdateQuotaExceededError(
+                    "INPUT_UPDATE_DAILY_LIMIT", max(0, config.MAX_INPUT_UPDATES_PER_DAY - used_updates)
+                )
+            if used_bytes + payload_bytes > config.MAX_INPUT_UPDATE_BYTES_PER_DAY:
+                raise InputUpdateQuotaExceededError(
+                    "INPUT_UPDATE_DAILY_BYTES_LIMIT",
+                    max(0, config.MAX_INPUT_UPDATE_BYTES_PER_DAY - used_bytes),
+                )
+            db.execute(
+                "INSERT INTO input_update_usage(scope_key,model_key,usage_day,updates,payload_bytes) "
+                "VALUES(?,?,?,?,?) ON CONFLICT(scope_key,model_key,usage_day) DO UPDATE SET "
+                "updates=excluded.updates,payload_bytes=excluded.payload_bytes",
+                (scope_key, model_key, usage_day, used_updates + 1, used_bytes + payload_bytes),
+            )
+            db.execute(
+                "INSERT INTO input_update_events(scope_key,model_key,created_at) VALUES(?,?,?)",
+                (scope_key, model_key, now),
+            )
+            return {
+                "updatesRemaining": config.MAX_INPUT_UPDATES_PER_DAY - used_updates - 1,
+                "bytesRemaining": config.MAX_INPUT_UPDATE_BYTES_PER_DAY - used_bytes - payload_bytes,
+            }
 
     def create_job(
         self,
@@ -273,6 +354,8 @@ class SimulationStore:
                 (cutoff,),
             )
             db.execute("DELETE FROM simulation_usage WHERE usage_day<date('now','-2 day')")
+            db.execute("DELETE FROM input_update_usage WHERE usage_day<date('now','-2 day')")
+            db.execute("DELETE FROM input_update_events WHERE created_at<?", (time.time() - 3600,))
             db.execute(
                 "DELETE FROM simulation_jobs WHERE id IN ("
                 "SELECT id FROM simulation_jobs WHERE status NOT IN ('queued','running','cancelling') "

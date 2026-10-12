@@ -32,8 +32,10 @@ class ProcessExecutionError(RuntimeError):
 _REALTIME_METHODS = {
     "load",
     "initialize",
+    "validate_initial_values",
     "step",
     "run_until",
+    "validate_inputs",
     "set_inputs",
     "get_outputs",
     "pause",
@@ -44,6 +46,7 @@ _REALTIME_METHODS = {
 
 def _realtime_snapshot(session: Any) -> dict[str, Any]:
     model = getattr(session, "_md", None)
+    default_experiment = getattr(model, "defaultExperiment", None)
     variables = []
     for variable in getattr(model, "modelVariables", ()) or ():
         variables.append({
@@ -58,9 +61,15 @@ def _realtime_snapshot(session: Any) -> dict[str, Any]:
         "startTime": float(session._start_time),
         "stopTime": float(session._stop_time),
         "stepSize": float(session._step_size),
+        "timeMode": str(getattr(session, "_time_mode", "simtime")),
+        "playbackSpeed": float(getattr(session, "_playback_speed", 1.0)),
+        "finishedReason": getattr(session, "_finished_reason", None),
         "initialised": bool(session._initialised),
         "terminated": bool(session._terminated),
         "modelVariables": variables,
+        "defaultExperiment": {
+            "stepSize": getattr(default_experiment, "stepSize", None),
+        } if default_experiment is not None else None,
     }
 
 
@@ -158,6 +167,9 @@ class RealtimeSession:
         self._start_time = 0.0
         self._stop_time = 1.0
         self._step_size = 0.001
+        self._time_mode = "simtime"
+        self._playback_speed = 1.0
+        self._finished_reason = None
         self._initialised = False
         self._terminated = False
         self._md = None
@@ -201,13 +213,19 @@ class RealtimeSession:
         self._start_time = float(snapshot.get("startTime", self._start_time))
         self._stop_time = float(snapshot.get("stopTime", self._stop_time))
         self._step_size = float(snapshot.get("stepSize", self._step_size))
+        self._time_mode = str(snapshot.get("timeMode", self._time_mode))
+        self._playback_speed = float(snapshot.get("playbackSpeed", self._playback_speed))
+        self._finished_reason = snapshot.get("finishedReason", self._finished_reason)
         self._initialised = bool(snapshot.get("initialised", self._initialised))
         self._terminated = bool(snapshot.get("terminated", self._terminated))
         variables = snapshot.get("modelVariables", [])
+        default_experiment = snapshot.get("defaultExperiment")
         if isinstance(variables, list):
             self._md = SimpleNamespace(modelVariables=[
                 SimpleNamespace(**item) for item in variables if isinstance(item, dict)
-            ])
+            ], defaultExperiment=(
+                SimpleNamespace(**default_experiment) if isinstance(default_experiment, dict) else None
+            ))
 
     def _rpc(self, method: str, *args: Any, timeout: float | None = None, **kwargs: Any) -> Any:
         with self._lock:
@@ -276,6 +294,10 @@ class RealtimeSession:
     def initialize(self, **kwargs: Any) -> dict[str, Any]:
         return self._rpc("initialize", **kwargs)
 
+    def validate_initial_values(self, values: dict[str, Any]) -> dict[str, Any]:
+        result = self._rpc("validate_initial_values", values)
+        return result if isinstance(result, dict) else {}
+
     def step(self, step_size: float | None = None) -> dict[str, Any]:
         args = () if step_size is None else (step_size,)
         return self._rpc("step", *args)
@@ -288,6 +310,10 @@ class RealtimeSession:
     def set_inputs(self, values: dict[str, Any]) -> None:
         self._rpc("set_inputs", values)
 
+    def validate_inputs(self, values: dict[str, Any]) -> dict[str, Any]:
+        result = self._rpc("validate_inputs", values)
+        return result if isinstance(result, dict) else {}
+
     def get_outputs(self, refs: list[int] | None = None) -> dict[str, Any]:
         return self._rpc("get_outputs", refs)
 
@@ -297,8 +323,14 @@ class RealtimeSession:
     def resume(self) -> dict[str, Any]:
         return self._rpc("resume")
 
-    def reset(self) -> dict[str, Any]:
-        return self._rpc("reset")
+    def reset(self, defer_initialization: bool = False) -> dict[str, Any]:
+        result = self._rpc("reset", defer_initialization=defer_initialization)
+        self._pending_samples.clear()
+        self._pending_queue_drops = 0
+        if self.subscription is not None:
+            self.subscription.last_emit_monotonic = 0.0
+            self.subscription.rate_dropped = 0
+        return result if isinstance(result, dict) else {}
 
     def sample_subscription(self) -> dict[str, Any] | None:
         if not self.subscription or not self._initialised or self._terminated:
@@ -421,6 +453,7 @@ def _execute_worker(
             stop_time=stop,
             step_size=step_value,
             parameters=parameters or None,
+            early_return_allowed=options.get("earlyReturnAllowed", True),
         )
         if streaming:
             result_bytes = 0

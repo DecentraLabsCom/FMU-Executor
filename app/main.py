@@ -10,6 +10,7 @@ import asyncio
 import base64
 import json
 import logging
+import math
 import secrets
 import time
 from typing import Any
@@ -29,7 +30,12 @@ from pydantic import BaseModel, Field
 
 from . import auth, backends, config, engine, fmu_storage, process_runner
 from .simulation_jobs import SimulationJobManager
-from .simulation_store import QuotaExceededError, SimulationStore, reservation_scope
+from .simulation_store import (
+    InputUpdateQuotaExceededError,
+    QuotaExceededError,
+    SimulationStore,
+    reservation_scope,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -278,6 +284,30 @@ def _reserve_simulation_scenario(
         ) from exc
 
 
+def _reserve_input_update(context: dict[str, Any] | None, access_key: str, values: dict[str, Any]) -> None:
+    if not isinstance(context, dict):
+        return
+    claims = context.get("claims") or {}
+    if not isinstance(claims, dict):
+        claims = {}
+    lab_id = context.get("labId") or claims.get("labId")
+    reservation_key = context.get("reservationKey") or claims.get("reservationKey")
+    if not lab_id or not reservation_key:
+        return
+    try:
+        payload_bytes = len(
+            json.dumps(values, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
+        )
+        _simulation_store.reserve_input_update(_scope_key(context, access_key), access_key, payload_bytes)
+    except InputUpdateQuotaExceededError as exc:
+        raise HTTPException(
+            status_code=429,
+            detail={"code": exc.code, "remaining": exc.remaining},
+        ) from exc
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="INVALID_INPUT_PAYLOAD") from exc
+
+
 def _validate_backend_options(options: dict[str, Any]) -> None:
     try:
         backends.validate_requested_backend(options)
@@ -285,6 +315,18 @@ def _validate_backend_options(options: dict[str, Any]) -> None:
         raise HTTPException(status_code=501, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _strict_number(value: Any, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a JSON number")
+    try:
+        number = float(value)
+    except OverflowError as exc:
+        raise ValueError(f"{name} is outside the numeric range") from exc
+    if not math.isfinite(number):
+        raise ValueError(f"{name} must be finite")
+    return number
 
 
 @app.post("/internal/fmu/simulations/run", dependencies=[Depends(_check_token)])
@@ -503,23 +545,44 @@ async def ws_sessions(ws: WebSocket):
 
     async def _run_session() -> None:
         try:
+            simulated_origin = session._time if session else 0.0
+            wall_origin = time.monotonic()
+            last_progress = wall_origin
+            progress_interval = config.FMU_PROGRESS_INTERVAL_MS / 1000.0
             while session and session.state == "running" and not session._terminated:
-                await asyncio.to_thread(session.step)
-                await ws.send_text(json.dumps({
-                    "type": "sim.progress",
-                    "sessionId": session.session_id,
-                    "simTime": session._time,
-                }))
-                if session._time >= session._stop_time - 1e-12:
-                    session._state = "stopped"
+                result = await asyncio.to_thread(session.step)
+                now = time.monotonic()
+                finished = bool(result.get("finished")) or session.state == "stopped"
+                if finished or now - last_progress >= progress_interval:
+                    await ws.send_text(json.dumps({
+                        "type": "sim.progress",
+                        "sessionId": session.session_id,
+                        "simTime": session._time,
+                        "timeAdvanced": result.get("timeAdvanced", 0.0),
+                        "earlyReturn": result.get("earlyReturn", False),
+                        "eventOccurred": result.get("eventOccurred", False),
+                        "eventHandlingNeeded": result.get("eventHandlingNeeded", False),
+                        "terminateSimulation": result.get("terminateSimulation", False),
+                    }))
+                    last_progress = now
+                if finished:
                     await ws.send_text(json.dumps({
                         "type": "sim.state",
                         "sessionId": session.session_id,
                         "state": "stopped",
                         "simTime": session._time,
+                        "reason": session._finished_reason,
                     }))
                     return
-                await asyncio.sleep(min(max(session._step_size, 0.01), 1.0))
+                if session._time_mode == "realtime":
+                    target_wall_time = wall_origin + (session._time - simulated_origin) / session._playback_speed
+                    delay = target_wall_time - time.monotonic()
+                    if delay > 0:
+                        await asyncio.sleep(delay)
+                else:
+                    # Keep the event loop responsive while simulating as fast as
+                    # the FMU permits; output subscriptions have their own rate cap.
+                    await asyncio.sleep(0)
         except asyncio.CancelledError:
             return
         except Exception:
@@ -574,7 +637,7 @@ async def ws_sessions(ws: WebSocket):
                     payload = await asyncio.to_thread(session.sample_subscription)
                     if payload:
                         await ws.send_text(json.dumps(payload, default=str))
-                await asyncio.sleep(0.01)  # 10 ms polling resolution
+                await asyncio.sleep(0.01)  # Output sampling is independent of the FMI step size.
         except WebSocketDisconnect:
             logger.debug("Output emitter stopped after WebSocket disconnect")
         except asyncio.CancelledError:
@@ -627,9 +690,16 @@ async def ws_sessions(ws: WebSocket):
 
             except HTTPException as exc:
                 detail = exc.detail or ""
-                # Extract short code from detail strings like "INVALID_COMMAND – ..."
-                code = detail.split(" \u2013 ")[0].split(" - ")[0].strip() if detail else "ERROR"
-                err = {"type": "error", "code": code, "message": detail, "retryable": False}
+                if isinstance(detail, dict):
+                    code = str(detail.get("code") or "ERROR")
+                    message = code
+                    err = {"type": "error", "code": code, "message": message, "retryable": False}
+                    if "remaining" in detail:
+                        err["remaining"] = detail["remaining"]
+                else:
+                    # Extract short code from detail strings like "INVALID_COMMAND – ..."
+                    code = detail.split(" \u2013 ")[0].split(" - ")[0].strip() if detail else "ERROR"
+                    err = {"type": "error", "code": code, "message": detail, "retryable": False}
                 if request_id:
                     err["requestId"] = request_id
                 await ws.send_text(json.dumps(err))
@@ -669,7 +739,11 @@ async def ws_sessions(ws: WebSocket):
             )
 
 
-def _sim_outputs_payload(session: engine.FmuSession, outputs: dict[str, Any]) -> dict[str, Any]:
+def _sim_outputs_payload(
+    session: engine.FmuSession,
+    outputs: dict[str, Any],
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     next_sequence = getattr(session, "next_sequence", None)
     sequence = next_sequence() if callable(next_sequence) else session.seq
     payload = {
@@ -682,6 +756,13 @@ def _sim_outputs_payload(session: engine.FmuSession, outputs: dict[str, Any]) ->
     }
     if not callable(next_sequence):
         session.seq += 1
+    if metadata:
+        for key in (
+            "requestedTime", "timeAdvanced", "earlyReturn", "eventOccurred", "eventHandlingNeeded",
+            "terminateSimulation", "finished", "finishReason", "steps",
+        ):
+            if key in metadata:
+                payload[key] = metadata[key]
     return payload
 
 
@@ -750,7 +831,7 @@ async def _handle_ws_message(
                 "step": True,
                 "setInputs": True,
                 "streamOutputs": True,
-                "timeMode": ["simtime"],
+                "timeMode": ["simtime", "realtime", "external"],
             },
             "_session": new_session,
         }
@@ -822,27 +903,73 @@ async def _handle_ws_message(
 
     if msg_type == "sim.initialize":
         options = msg.get("options", {})
-        params = msg.get("parameters", {})
-        if not isinstance(options, dict) or not isinstance(params, dict):
+        root_params = msg.get("parameters", {})
+        if not isinstance(options, dict) or not isinstance(root_params, dict):
             raise HTTPException(status_code=422, detail="INVALID_SIMULATION_REQUEST")
+        option_params = options.get("inputs", root_params)
+        if not isinstance(option_params, dict) or (root_params and option_params != root_params):
+            raise HTTPException(status_code=422, detail="INVALID_SIMULATION_REQUEST - conflicting inputs")
+        params = option_params
+        time_mode = options.get("timeMode", "simtime")
+        if not isinstance(time_mode, str) or time_mode not in {"simtime", "realtime", "external"}:
+            raise HTTPException(status_code=400, detail="INVALID_TIME_MODE")
+        try:
+            start_time = _strict_number(options.get("startTime", 0.0), "startTime")
+            stop_time = _strict_number(options.get("stopTime", 1.0), "stopTime")
+            step_value = _strict_number(options["stepSize"], "stepSize") if options.get("stepSize") is not None else None
+            playback_speed = _strict_number(options.get("playbackSpeed", 1.0), "playbackSpeed")
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="INVALID_SIMULATION_OPTIONS") from exc
+        effective_step = step_value if step_value is not None else (
+            float(session._md.defaultExperiment.stepSize)
+            if session._md and session._md.defaultExperiment and session._md.defaultExperiment.stepSize
+            else 0.001
+        )
+        if (
+            not all(math.isfinite(value) for value in (start_time, stop_time, effective_step, playback_speed))
+            or stop_time <= start_time
+            or not math.isfinite(stop_time - start_time)
+            or effective_step <= 0
+            or not 0.1 <= playback_speed <= 100.0
+        ):
+            raise HTTPException(status_code=400, detail="INVALID_SIMULATION_OPTIONS")
+        early_return_allowed = options.get("earlyReturnAllowed", False)
+        if type(early_return_allowed) is not bool:
+            raise HTTPException(status_code=400, detail="INVALID_SIMULATION_OPTIONS")
+        try:
+            await asyncio.to_thread(session.validate_initial_values, params)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f"INVALID_INPUT - {exc}") from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=f"INVALID_SESSION_STATE - {exc}") from exc
         await asyncio.to_thread(_reserve_simulation_scenario, session.gateway_context, access_key)
         if stop_runner is not None:
             await stop_runner()
-        await asyncio.to_thread(
-            session.initialize,
-            start_time=float(options.get("startTime", 0.0)),
-            stop_time=float(options.get("stopTime", 1.0)),
-            step_size=float(options.get("stepSize")) if options.get("stepSize") is not None else None,
-            parameters=params or None,
-        )
+        try:
+            await asyncio.to_thread(
+                session.initialize,
+                start_time=start_time,
+                stop_time=stop_time,
+                step_size=step_value,
+                parameters=params or None,
+                time_mode=time_mode,
+                playback_speed=playback_speed,
+                early_return_allowed=early_return_allowed,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f"INVALID_SIMULATION_OPTIONS - {exc}") from exc
         return {
             "type": "sim.state",
             "sessionId": session.session_id,
             "state": session.state,
             "simTime": session._time,
+            "timeMode": session._time_mode,
+            "playbackSpeed": session._playback_speed,
         }
 
     if msg_type == "sim.start":
+        if session._time_mode == "external":
+            raise HTTPException(409, "EXTERNAL_STEP_MODE")
         if session.state not in ("initialized", "paused"):
             raise HTTPException(409, f"Cannot start from state {session.state}")
         await asyncio.to_thread(session.resume)
@@ -867,6 +994,8 @@ async def _handle_ws_message(
         }
 
     if msg_type == "sim.resume":
+        if session._time_mode == "external":
+            raise HTTPException(409, "EXTERNAL_STEP_MODE")
         await asyncio.to_thread(session.resume)
         if start_runner is not None:
             start_runner()
@@ -878,10 +1007,19 @@ async def _handle_ws_message(
         }
 
     if msg_type == "sim.reset":
-        await asyncio.to_thread(_reserve_simulation_scenario, session.gateway_context, access_key)
+        defer_initialization = msg.get("deferInitialization", False)
+        if type(defer_initialization) is not bool:
+            raise HTTPException(400, "INVALID_RESET_OPTIONS")
+        if not defer_initialization:
+            await asyncio.to_thread(_reserve_simulation_scenario, session.gateway_context, access_key)
         if stop_runner is not None:
             await stop_runner()
-        await asyncio.to_thread(session.reset)
+        try:
+            await asyncio.to_thread(session.reset, defer_initialization=defer_initialization)
+        except RuntimeError as exc:
+            raise HTTPException(409, f"INVALID_SESSION_STATE - {exc}") from exc
+        except ValueError as exc:
+            raise HTTPException(400, f"INVALID_RESET_OPTIONS - {exc}") from exc
         return {
             "type": "sim.state",
             "sessionId": session.session_id,
@@ -891,30 +1029,62 @@ async def _handle_ws_message(
 
     if msg_type == "sim.step":
         step_size = msg.get("deltaT", msg.get("stepSize"))
-        await asyncio.to_thread(session.step, float(step_size) if step_size is not None else None)
+        try:
+            current_point = msg.get("currentCommunicationPoint", msg.get("currentTime"))
+            if session._time_mode == "external" and current_point is None:
+                raise ValueError("currentCommunicationPoint is required in external-step mode")
+            if current_point is not None:
+                requested_current_time = _strict_number(current_point, "currentCommunicationPoint")
+                tolerance = max(1e-12, abs(session._time) * 1e-12)
+                if abs(requested_current_time - session._time) > tolerance:
+                    raise ValueError("currentCommunicationPoint does not match the session time")
+            delta = _strict_number(step_size, "deltaT") if step_size is not None else None
+            step_result = await asyncio.to_thread(session.step, delta)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(400, f"INVALID_STEP - {exc}") from exc
+        except RuntimeError as exc:
+            raise HTTPException(409, f"INVALID_SESSION_STATE - {exc}") from exc
         outputs = await asyncio.to_thread(session.get_outputs)
-        return _sim_outputs_payload(session, outputs["outputs"])
+        return _sim_outputs_payload(session, outputs["outputs"], step_result)
 
     if msg_type == "sim.runUntil":
         target = msg.get("time", msg.get("targetTime"))
         if target is None:
             raise HTTPException(400, "INVALID_COMMAND – missing targetTime")
+        if session._time_mode == "external":
+            raise HTTPException(409, "EXTERNAL_STEP_MODE")
         step_size = msg.get("stepSize", msg.get("deltaT"))
-        await asyncio.to_thread(
-            session.run_until,
-            float(target),
-            step_size=float(step_size) if step_size is not None else None,
-        )
+        try:
+            run_result = await asyncio.to_thread(
+                session.run_until,
+                _strict_number(target, "targetTime"),
+                step_size=_strict_number(step_size, "stepSize") if step_size is not None else None,
+            )
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(400, f"INVALID_RUN_UNTIL - {exc}") from exc
+        except RuntimeError as exc:
+            raise HTTPException(409, f"INVALID_SESSION_STATE - {exc}") from exc
         outputs = await asyncio.to_thread(session.get_outputs)
-        return _sim_outputs_payload(session, outputs["outputs"])
+        return _sim_outputs_payload(session, outputs["outputs"], run_result)
 
     if msg_type == "sim.setInputs":
         values = msg.get("values", {})
         if not isinstance(values, dict):
             raise HTTPException(400, "sim.setInputs requires an object 'values'")
         if values:
-            await asyncio.to_thread(_reserve_simulation_scenario, session.gateway_context, access_key)
-        await asyncio.to_thread(session.set_inputs, values)
+            try:
+                await asyncio.to_thread(session.validate_inputs, values)
+            except ValueError as exc:
+                raise HTTPException(400, f"INVALID_INPUT - {exc}") from exc
+            except RuntimeError as exc:
+                raise HTTPException(409, f"INVALID_SESSION_STATE - {exc}") from exc
+            await asyncio.to_thread(_reserve_input_update, session.gateway_context, access_key, values)
+        try:
+            await asyncio.to_thread(session.set_inputs, values)
+        except ValueError as exc:
+            raise HTTPException(400, f"INVALID_INPUT - {exc}") from exc
+        except RuntimeError as exc:
+            raise HTTPException(409, f"INVALID_SESSION_STATE - {exc}") from exc
         return {
             "type": "sim.inputs.updated",
             "sessionId": session.session_id,
@@ -929,14 +1099,25 @@ async def _handle_ws_message(
             model_description = session._md
             if model_description is None:
                 raise HTTPException(409, "MODEL_DESCRIPTION_NOT_LOADED")
+            output_names = {
+                variable.name for variable in model_description.modelVariables
+                if variable.causality == "output"
+            }
+            if any(not isinstance(name, str) for name in variables) or set(variables) - output_names:
+                raise HTTPException(400, "UNKNOWN_OUTPUT_VARIABLE")
             selected = set(variables)
             refs = [
                 int(variable.valueReference)
                 for variable in model_description.modelVariables
-                if variable.name in selected
+                if variable.name in selected and variable.causality == "output"
             ]
         else:
             refs = msg.get("valueReferences")
+            if refs is not None and (
+                not isinstance(refs, list)
+                or any(isinstance(ref, bool) or not isinstance(ref, int) for ref in refs)
+            ):
+                raise HTTPException(400, "INVALID_VALUE_REFERENCES")
         result = await asyncio.to_thread(session.get_outputs, refs)
         return _sim_outputs_payload(session, result["outputs"])
 
@@ -944,11 +1125,36 @@ async def _handle_ws_message(
         variables = msg.get("variables")
         if variables is not None and not isinstance(variables, list):
             raise HTTPException(400, "sim.subscribeOutputs requires 'variables' as array")
+        if variables is not None:
+            output_names = {
+                variable.name for variable in (session._md.modelVariables if session._md else [])
+                if variable.causality == "output"
+            }
+            if any(not isinstance(name, str) for name in variables) or set(variables) - output_names:
+                raise HTTPException(400, "UNKNOWN_OUTPUT_VARIABLE")
+        try:
+            period_value = msg.get("periodMs", 100)
+            batch_value = msg.get("maxBatchSize", 64)
+            if isinstance(period_value, bool) or not isinstance(period_value, int):
+                raise ValueError("periodMs must be an integer")
+            if isinstance(batch_value, bool) or not isinstance(batch_value, int):
+                raise ValueError("maxBatchSize must be an integer")
+            period_ms = period_value
+            max_batch_size = batch_value
+            max_hz = _strict_number(msg["maxHz"], "maxHz") if msg.get("maxHz") is not None else None
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(400, "INVALID_OUTPUT_SUBSCRIPTION") from exc
+        if (
+            not 1 <= period_ms <= 60000
+            or not 1 <= max_batch_size <= config.MAX_OUTPUT_SUBSCRIPTION_BATCH
+            or (max_hz is not None and (not math.isfinite(max_hz) or not 0 < max_hz <= config.MAX_OUTPUT_SUBSCRIPTION_HZ))
+        ):
+            raise HTTPException(400, "INVALID_OUTPUT_SUBSCRIPTION")
         subscription = engine.OutputSubscription(
             variables=variables,
-            period_ms=max(1, int(msg.get("periodMs", 100))),
-            max_batch_size=max(1, int(msg.get("maxBatchSize", 64))),
-            max_hz=float(msg["maxHz"]) if msg.get("maxHz") is not None else None,
+            period_ms=period_ms,
+            max_batch_size=max_batch_size,
+            max_hz=max_hz,
         )
         session.subscription = subscription
         return {
