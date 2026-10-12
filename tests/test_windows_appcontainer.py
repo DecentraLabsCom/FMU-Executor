@@ -31,6 +31,11 @@ class NativeFunction:
         return self.result
 
 
+def set_appcontainer_platform(monkeypatch, name: str) -> None:
+    """Select the platform for this module without changing the host process."""
+    monkeypatch.setattr(appcontainer, "os", SimpleNamespace(name=name, environ=os.environ))
+
+
 def profile_apis(*, profile_result=0, convert_result=1, delete_result=0):
     sid_buffer = ctypes.create_unicode_buffer("S-1-15-2-987")
 
@@ -97,7 +102,7 @@ def test_appcontainer_creates_profile_grants_access_and_closes(monkeypatch, tmp_
     worker_directory = tmp_path / "worker_test-1"
     worker_directory.mkdir()
     apis = profile_apis()
-    monkeypatch.setattr(appcontainer.os, "name", "nt")
+    set_appcontainer_platform(monkeypatch, "nt")
     monkeypatch.setattr(appcontainer.ctypes, "WinDLL", lambda name, **_kwargs: apis[name], raising=False)
     runtime_grant = Mock()
     icacls = Mock()
@@ -117,11 +122,11 @@ def test_appcontainer_creates_profile_grants_access_and_closes(monkeypatch, tmp_
 
 
 def test_appcontainer_rejects_unsupported_host_names_and_profile_errors(monkeypatch, tmp_path):
-    monkeypatch.setattr(appcontainer.os, "name", "posix")
+    set_appcontainer_platform(monkeypatch, "posix")
     with pytest.raises(WorkerIsolationError, match="only available"):
         appcontainer.WindowsAppContainer(tmp_path)
 
-    monkeypatch.setattr(appcontainer.os, "name", "nt")
+    set_appcontainer_platform(monkeypatch, "nt")
     invalid_name = tmp_path / ("x" * 60)
     invalid_name.mkdir()
     with pytest.raises(WorkerIsolationError, match="cannot identify"):
@@ -138,7 +143,7 @@ def test_appcontainer_rejects_unsupported_host_names_and_profile_errors(monkeypa
 def test_appcontainer_cleans_up_if_sid_conversion_or_acl_setup_fails(monkeypatch, tmp_path):
     worker_directory = tmp_path / "worker_failure"
     worker_directory.mkdir()
-    monkeypatch.setattr(appcontainer.os, "name", "nt")
+    set_appcontainer_platform(monkeypatch, "nt")
     apis = profile_apis(convert_result=0)
     monkeypatch.setattr(appcontainer.ctypes, "WinDLL", lambda name, **_kwargs: apis[name], raising=False)
     with pytest.raises(WorkerIsolationError, match="read the Windows FMU"):
@@ -189,6 +194,20 @@ def test_create_process_uses_explicit_appcontainer_and_handle_lists(monkeypatch,
 
 
 def test_create_process_rejects_missing_security_and_bootstrap_state(monkeypatch, tmp_path):
+    def initialize_attribute_list(attribute_list, _count, _flags, size_pointer):
+        if attribute_list is None:
+            ctypes.cast(size_pointer, ctypes.POINTER(ctypes.c_size_t)).contents.value = 128
+            return 0
+        return 1
+
+    kernel = SimpleNamespace(
+        InitializeProcThreadAttributeList=NativeFunction(initialize_attribute_list),
+        UpdateProcThreadAttribute=NativeFunction(1),
+        DeleteProcThreadAttributeList=NativeFunction(None),
+        SetHandleInformation=NativeFunction(1),
+        CreateProcessW=NativeFunction(1),
+    )
+    monkeypatch.setattr(appcontainer.ctypes, "WinDLL", lambda *_args, **_kwargs: kernel, raising=False)
     container = appcontainer.WindowsAppContainer.__new__(appcontainer.WindowsAppContainer)
     container.worker_directory = tmp_path
     container._sid = ctypes.c_void_p(1234)
@@ -215,6 +234,7 @@ def test_create_process_fails_closed_for_missing_pipe_and_winapi_errors(monkeypa
     )
     monkeypatch.setattr(appcontainer.ctypes, "WinDLL", lambda *_args, **_kwargs: kernel, raising=False)
     monkeypatch.setattr(appcontainer.ctypes, "WinError", lambda *_args: OSError("winapi error"), raising=False)
+    monkeypatch.setattr(appcontainer.ctypes, "get_last_error", lambda: 5, raising=False)
     container = appcontainer.WindowsAppContainer.__new__(appcontainer.WindowsAppContainer)
     container.worker_directory = tmp_path
     container._sid = ctypes.c_void_p(1234)
@@ -228,9 +248,9 @@ def test_create_process_fails_closed_for_missing_pipe_and_winapi_errors(monkeypa
 
 
 def test_delete_worker_profile_validates_platform_name_and_logs_failure(monkeypatch):
-    monkeypatch.setattr(appcontainer.os, "name", "posix")
+    set_appcontainer_platform(monkeypatch, "posix")
     appcontainer.delete_worker_appcontainer_profile("worker_123")
-    monkeypatch.setattr(appcontainer.os, "name", "nt")
+    set_appcontainer_platform(monkeypatch, "nt")
     appcontainer.delete_worker_appcontainer_profile("unrelated")
     appcontainer.delete_worker_appcontainer_profile("worker_" + "x" * 70)
 

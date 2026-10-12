@@ -211,7 +211,7 @@ def test_windows_fmu_staging_copies_and_checks_content_hash(monkeypatch, tmp_pat
     source.write_bytes(b"archive bytes")
     worker = tmp_path / "worker"
     worker.mkdir()
-    monkeypatch.setattr(process_runner.os, "name", "nt")
+    monkeypatch.setattr(process_runner, "os", SimpleNamespace(name="nt"))
     staged = process_runner._stage_windows_fmu(source, worker)
     assert staged.read_bytes() == b"archive bytes"
 
@@ -312,6 +312,7 @@ def test_execute_worker_returns_result_and_always_terminates(monkeypatch, tmp_pa
 
     engine = SimpleNamespace(FmuSession=Session)
     monkeypatch.setitem(sys.modules, "app.engine", engine)
+    monkeypatch.setattr(process_runner, "apply_worker_limits", lambda *_args, **_kwargs: None)
     output = FakeQueue()
 
     process_runner._execute_worker(str(tmp_path / "demo.fmu"), "demo.fmu", {"x": 2}, {"stopTime": 3, "stepSize": 0.25}, output, False)
@@ -336,6 +337,7 @@ def test_execute_worker_streams_snapshots_and_completion(monkeypatch, tmp_path):
         def terminate(self): self.terminated = True
 
     monkeypatch.setitem(sys.modules, "app.engine", SimpleNamespace(FmuSession=Session))
+    monkeypatch.setattr(process_runner, "apply_worker_limits", lambda *_args, **_kwargs: None)
     output = FakeQueue()
 
     process_runner._execute_worker(str(tmp_path / "demo.fmu"), "demo.fmu", {}, {}, output, True)
@@ -355,6 +357,7 @@ def test_execute_worker_masks_native_error_details_and_terminates(monkeypatch, t
         def terminate(self): self.terminated = True
 
     monkeypatch.setitem(sys.modules, "app.engine", SimpleNamespace(FmuSession=Session))
+    monkeypatch.setattr(process_runner, "apply_worker_limits", lambda *_args, **_kwargs: None)
     output = FakeQueue()
 
     process_runner._execute_worker(str(tmp_path / "demo.fmu"), "demo.fmu", {}, {}, output, False)
@@ -823,6 +826,7 @@ def test_realtime_worker_dispatches_only_allowlisted_session_methods(monkeypatch
         def close(self):
             pass
 
+    monkeypatch.setattr(process_runner, "apply_worker_limits", lambda *_args, **_kwargs: None)
     connection = Connection()
     process_runner._realtime_session_worker(connection, "session", tmp_path / "demo.fmu", "demo.fmu", Session)
 
