@@ -7,9 +7,14 @@ not take the Station HTTP/WebSocket control plane down with it.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import math
+import os
 import multiprocessing as mp
 import queue
+import shutil
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -18,6 +23,15 @@ from typing import Any, Iterator
 from uuid import uuid4
 
 from . import config
+from .isolation import (
+    WindowsWorkerJob,
+    WorkerIsolationError,
+    apply_worker_limits,
+    attach_worker_limits,
+    bind_worker_to_parent,
+    terminate_worker,
+    worker_process_is_alive,
+)
 
 
 class ProcessExecutionError(RuntimeError):
@@ -42,6 +56,88 @@ _REALTIME_METHODS = {
     "resume",
     "reset",
 }
+
+_SECRET_ENV_MARKERS = (
+    "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "PRIVATE_KEY", "API_KEY",
+    "AWS_", "AZURE_", "GOOGLE_APPLICATION_CREDENTIALS",
+)
+_WORKER_OWNER_MARKER = ".worker-pid"
+
+
+def _worker_owner_marker_path(directory: Path) -> Path:
+    return directory.parent / f".{directory.name}{_WORKER_OWNER_MARKER}"
+
+
+def _cleanup_worker_directory(directory: Path) -> None:
+    shutil.rmtree(directory, ignore_errors=True)
+    try:
+        _worker_owner_marker_path(directory).unlink()
+    except OSError:
+        pass
+
+
+def cleanup_abandoned_worker_directories() -> int:
+    """Remove private worker folders whose spawned process no longer exists."""
+    root = config.TEMP_DIR
+    if not root.is_dir():
+        return 0
+    resolved_root = root.resolve()
+    removed = 0
+    for directory in root.iterdir():
+        if not directory.name.startswith(("worker_", "realtime_")) or directory.is_symlink() or not directory.is_dir():
+            continue
+        try:
+            if directory.resolve(strict=True).parent != resolved_root:
+                continue
+            pid = int(_worker_owner_marker_path(directory).read_text(encoding="ascii").strip())
+        except (OSError, ValueError):
+            pid = None
+        if pid is not None and worker_process_is_alive(pid):
+            continue
+        _cleanup_worker_directory(directory)
+        if not directory.exists():
+            removed += 1
+    return removed
+
+
+def _mark_worker_directory(directory: Path, pid: int) -> None:
+    _worker_owner_marker_path(directory).write_text(str(pid), encoding="ascii")
+
+
+def _sanitize_worker_environment() -> None:
+    for name in list(os.environ):
+        upper_name = name.upper()
+        if any(marker in upper_name for marker in _SECRET_ENV_MARKERS):
+            os.environ.pop(name, None)
+
+
+def _stage_windows_fmu(source: Path, worker_directory: Path) -> Path:
+    """Give each Windows worker its own verified copy of the pinned archive."""
+    if os.name != "nt":
+        return source
+    target = worker_directory / "model.fmu"
+    digest = hashlib.sha256()
+    copied_bytes = 0
+    try:
+        if source.stat().st_size > config.MAX_FMU_ARCHIVE_BYTES:
+            raise ProcessExecutionError("FMU snapshot exceeds the archive size limit", code="FMU_ARCHIVE_SIZE_LIMIT_EXCEEDED")
+        with source.open("rb") as incoming, target.open("xb") as outgoing:
+            for chunk in iter(lambda: incoming.read(1024 * 1024), b""):
+                copied_bytes += len(chunk)
+                if copied_bytes > config.MAX_FMU_ARCHIVE_BYTES:
+                    raise ProcessExecutionError("FMU snapshot exceeds the archive size limit", code="FMU_ARCHIVE_SIZE_LIMIT_EXCEEDED")
+                digest.update(chunk)
+                outgoing.write(chunk)
+        expected = source.stem.lower()
+        if len(expected) == 64 and all(char in "0123456789abcdef" for char in expected) and digest.hexdigest() != expected:
+            raise ProcessExecutionError("FMU snapshot hash changed before execution", code="FMU_SNAPSHOT_HASH_MISMATCH")
+        return target
+    except Exception:
+        try:
+            target.unlink()
+        except OSError:
+            pass
+        raise
 
 
 def _realtime_snapshot(session: Any) -> dict[str, Any]:
@@ -79,14 +175,36 @@ def _realtime_session_worker(
     fmu_path: Path,
     access_key: str,
     session_factory: Any = None,
+    start_gate: Any = None,
+    worker_directory: str | None = None,
+    resource_policy: dict[str, Any] | None = None,
+    expected_parent_pid: int | None = None,
 ) -> None:
     """Own one realtime FmuSession and service a narrow IPC command set."""
     session = None
     try:
+        if expected_parent_pid is not None:
+            bind_worker_to_parent(expected_parent_pid)
+        if start_gate is not None:
+            start_gate.wait()
+        apply_worker_limits(resource_policy, worker_directory, str(fmu_path))
+        _sanitize_worker_environment()
+        if worker_directory:
+            os.chdir(worker_directory)
+            os.environ["TMP"] = worker_directory
+            os.environ["TEMP"] = worker_directory
+            os.environ["TMPDIR"] = worker_directory
+            config.TEMP_DIR = Path(worker_directory)
         if session_factory is None:
             from .engine import FmuSession
             session_factory = FmuSession
         session = session_factory(session_id, fmu_path, access_key=access_key)
+        if resource_policy is not None:
+            session._max_simulation_steps = min(
+                config.MAX_SIMULATION_STEPS,
+                int(resource_policy.get("maxSteps", config.MAX_SIMULATION_STEPS)),
+            )
+        connection.send({"type": "ready"})
         while True:
             request = connection.recv()
             request_id = request.get("requestId") if isinstance(request, dict) else None
@@ -135,6 +253,16 @@ def _realtime_session_worker(
                 })
     except (EOFError, OSError):
         pass
+    except WorkerIsolationError:
+        try:
+            connection.send({"type": "startup_error", "code": "FMU_WORKER_ISOLATION_UNAVAILABLE"})
+        except (EOFError, OSError):
+            pass
+    except Exception:
+        try:
+            connection.send({"type": "startup_error", "code": "FMU_WORKER_START_FAILED"})
+        except (EOFError, OSError):
+            pass
     finally:
         if session is not None and not session._terminated:
             session.terminate()
@@ -155,6 +283,7 @@ class RealtimeSession:
         access_key: str | None = None,
         expires_at: float | int | str | None = None,
         gateway_context: dict[str, Any] | None = None,
+        resource_policy: dict[str, Any] | None = None,
         _worker_session_factory: Any = None,
     ):
         self.session_id = session_id
@@ -186,18 +315,71 @@ class RealtimeSession:
 
         context = mp.get_context("spawn")
         self._connection, child_connection = context.Pipe(duplex=True)
+        config.TEMP_DIR.mkdir(parents=True, exist_ok=True)
+        self._worker_directory = Path(tempfile.mkdtemp(prefix="realtime_", dir=str(config.TEMP_DIR)))
+        if os.name != "nt":
+            os.chmod(self._worker_directory, 0o700)
+        try:
+            worker_fmu_path = _stage_windows_fmu(self.fmu_path, self._worker_directory)
+        except Exception:
+            _cleanup_worker_directory(self._worker_directory)
+            self._connection.close()
+            child_connection.close()
+            raise
+        self._job: WindowsWorkerJob | None = None
+        start_gate = context.Event()
         self._process = context.Process(
             target=_realtime_session_worker,
-            args=(child_connection, self.session_id, self.fmu_path, self.access_key, _worker_session_factory),
+            args=(
+                child_connection, self.session_id, worker_fmu_path, self.access_key,
+                _worker_session_factory, start_gate, str(self._worker_directory), resource_policy,
+                os.getpid(),
+            ),
             name="LabStation-FMU-Realtime",
         )
         try:
             self._process.start()
-        except Exception as exc:
+            worker_pid = self._process.pid
+            if worker_pid is None:
+                raise ProcessExecutionError(
+                    "FMU realtime worker did not receive a process ID",
+                    code="FMU_WORKER_START_FAILED",
+                    retryable=False,
+                )
+            self._job = attach_worker_limits(self._process, resource_policy)
+            _mark_worker_directory(self._worker_directory, worker_pid)
+            start_gate.set()
+            if not self._connection.poll(min(15.0, config.execution_timeout_seconds())):
+                raise ProcessExecutionError("FMU realtime worker did not become ready", code="FMU_WORKER_START_FAILED", retryable=True)
+            startup = self._connection.recv()
+            if not isinstance(startup, dict) or startup.get("type") != "ready":
+                code = startup.get("code") if isinstance(startup, dict) else None
+                if code not in {"FMU_WORKER_ISOLATION_UNAVAILABLE", "FMU_WORKER_START_FAILED"}:
+                    code = "FMU_WORKER_START_FAILED"
+                raise ProcessExecutionError(
+                    "FMU realtime worker could not be isolated or initialized",
+                    code=code,
+                    retryable=code != "FMU_WORKER_ISOLATION_UNAVAILABLE",
+                )
+        except ProcessExecutionError:
+            start_gate.set()
             self._connection.close()
             child_connection.close()
+            terminate_worker(self._process, self._job)
+            self._job = None
+            _cleanup_worker_directory(self._worker_directory)
             self._closed = True
-            raise ProcessExecutionError("FMU realtime worker could not be started", retryable=True) from exc
+            raise
+        except Exception as exc:
+            start_gate.set()
+            self._connection.close()
+            child_connection.close()
+            terminate_worker(self._process, self._job)
+            self._job = None
+            _cleanup_worker_directory(self._worker_directory)
+            self._closed = True
+            code = "FMU_WORKER_ISOLATION_UNAVAILABLE" if isinstance(exc, WorkerIsolationError) else "FMU_WORKER_START_FAILED"
+            raise ProcessExecutionError("FMU realtime worker could not be started or isolated", code=code, retryable=False) from exc
         child_connection.close()
         self.subscription = None
 
@@ -231,6 +413,15 @@ class RealtimeSession:
         with self._lock:
             if self._closed and method != "terminate":
                 raise ProcessExecutionError("FMU realtime worker is closed", retryable=True)
+            expired_code = self._expired_deadline_code()
+            if expired_code and method != "terminate":
+                self._stop_process()
+                self._terminated = True
+                raise ProcessExecutionError(
+                    "FMU realtime authorization or reservation ended",
+                    code=expired_code,
+                    retryable=False,
+                )
             if not self._process.is_alive() and method != "terminate":
                 self._terminated = True
                 raise ProcessExecutionError("FMU realtime worker exited unexpectedly", retryable=True)
@@ -246,6 +437,15 @@ class RealtimeSession:
                 deadline = time.monotonic() + (timeout or config.execution_timeout_seconds())
                 response = None
                 while time.monotonic() < deadline:
+                    expired_code = self._expired_deadline_code()
+                    if expired_code and method != "terminate":
+                        self._stop_process()
+                        self._terminated = True
+                        raise ProcessExecutionError(
+                            "FMU realtime authorization or reservation ended",
+                            code=expired_code,
+                            retryable=False,
+                        )
                     if self._connection.poll(min(0.5, max(0.0, deadline - time.monotonic()))):
                         response = self._connection.recv()
                         break
@@ -265,6 +465,15 @@ class RealtimeSession:
                         code="FMU_EXECUTION_TIMEOUT",
                         retryable=True,
                     )
+                expired_code = self._expired_deadline_code()
+                if expired_code and method != "terminate":
+                    self._stop_process()
+                    self._terminated = True
+                    raise ProcessExecutionError(
+                        "FMU realtime authorization or reservation ended",
+                        code=expired_code,
+                        retryable=False,
+                    )
                 if not isinstance(response, dict) or response.get("requestId") != request_id:
                     self._stop_process()
                     self._terminated = True
@@ -279,14 +488,32 @@ class RealtimeSession:
                 raise ProcessExecutionError("FMU realtime worker exited unexpectedly", retryable=True) from exc
 
     def _stop_process(self) -> None:
-        if self._process.is_alive():
-            self._process.terminate()
-        self._process.join(timeout=2)
-        if self._process.is_alive():
-            kill = getattr(self._process, "kill", None)
-            if kill:
-                kill()
-            self._process.join(timeout=2)
+        if self._process.pid is not None:
+            terminate_worker(self._process, self._job)
+            self._job = None
+        _cleanup_worker_directory(self._worker_directory)
+
+    def _expired_deadline_code(self, now: float | None = None) -> str | None:
+        now = time.time() if now is None else now
+        if self.expires_at is not None:
+            try:
+                expires_at = float(self.expires_at)
+                if not math.isfinite(expires_at) or expires_at <= now:
+                    return "EXECUTION_AUTHORIZATION_EXPIRED"
+            except (TypeError, ValueError, OverflowError):
+                return "EXECUTION_AUTHORIZATION_EXPIRED"
+        claims = self.gateway_context.get("claims") or {}
+        reservation_end = self.gateway_context.get("reservationEndsAt")
+        if reservation_end is None and isinstance(claims, dict):
+            reservation_end = claims.get("reservationEndsAt")
+        if reservation_end is not None:
+            try:
+                reservation_ends_at = float(reservation_end)
+                if not math.isfinite(reservation_ends_at) or reservation_ends_at <= now:
+                    return "RESERVATION_ENDED"
+            except (TypeError, ValueError, OverflowError):
+                return "RESERVATION_ENDED"
+        return None
 
     def load(self) -> dict[str, Any]:
         return self._rpc("load")
@@ -388,6 +615,10 @@ class RealtimeSession:
             self._process.join(timeout=2)
             if self._process.is_alive():
                 self._stop_process()
+            elif self._job is not None:
+                self._job.close()
+                self._job = None
+            _cleanup_worker_directory(self._worker_directory)
             try:
                 self._connection.close()
             except Exception:
@@ -416,12 +647,8 @@ class RealtimeSession:
         if self._terminated or (not self._attached and self._attach_deadline is None):
             return False
         now = time.time() if now is None else now
-        if self.expires_at is not None:
-            try:
-                if float(self.expires_at) <= now:
-                    return False
-            except (TypeError, ValueError):
-                return False
+        if self._expired_deadline_code(now) is not None:
+            return False
         return self._attach_deadline is None or now < self._attach_deadline
 
 
@@ -433,21 +660,49 @@ def _execute_worker(
     output_queue: Any,
     streaming: bool,
     capture_series: bool = False,
+    start_gate: Any = None,
+    worker_directory: str | None = None,
+    probe_only: bool = False,
+    resource_policy: dict[str, Any] | None = None,
+    expected_parent_pid: int | None = None,
 ) -> None:
-    """Worker entry point; imports the engine only inside the child process."""
-    from .engine import FmuSession
-
-    session = FmuSession(
-        f"worker_{mp.current_process().pid}",
-        Path(fmu_path),
-        access_key=access_key,
-    )
+    """Worker entry point; imports native FMU code only after OS limits apply."""
+    session = None
     try:
+        if expected_parent_pid is not None:
+            bind_worker_to_parent(expected_parent_pid)
+        if start_gate is not None:
+            start_gate.wait()
+        apply_worker_limits(resource_policy, worker_directory, fmu_path)
+        _sanitize_worker_environment()
+        if worker_directory:
+            os.chdir(worker_directory)
+            os.environ["TMP"] = worker_directory
+            os.environ["TEMP"] = worker_directory
+            os.environ["TMPDIR"] = worker_directory
+            config.TEMP_DIR = Path(worker_directory)
+
+        from .engine import FmuSession
+
+        session = FmuSession(
+            f"worker_{mp.current_process().pid}",
+            Path(fmu_path),
+            access_key=access_key,
+        )
+        if resource_policy is not None:
+            session._max_simulation_steps = min(
+                config.MAX_SIMULATION_STEPS,
+                int(resource_policy.get("maxSteps", config.MAX_SIMULATION_STEPS)),
+            )
         session.load()
         start = float(options.get("startTime", 0.0))
         stop = float(options.get("stopTime", 1.0))
         step = options.get("stepSize")
         step_value = float(step) if step is not None else None
+        if probe_only:
+            session.initialize(start_time=start, stop_time=stop, step_size=step_value)
+            output_queue.put({"kind": "result", "payload": {"type": "fmu.probe", "success": True}})
+            return
         session.initialize(
             start_time=start,
             stop_time=stop,
@@ -455,36 +710,77 @@ def _execute_worker(
             parameters=parameters or None,
             early_return_allowed=options.get("earlyReturnAllowed", True),
         )
+        requested_outputs = options.get("outputVariables")
+        result_size_limit = config.MAX_STORED_RESULT_BYTES
+        if resource_policy is not None:
+            result_size_limit = min(result_size_limit, int(resource_policy.get("maxResultBytes", result_size_limit)))
+
+        def select_outputs(values: dict[str, Any]) -> dict[str, Any]:
+            if requested_outputs is None:
+                return values
+            return {name: values[name] for name in requested_outputs}
+
+        def result_too_large(payload: Any) -> bool:
+            encoded_size = len(json.dumps(payload, separators=(",", ":"), allow_nan=False).encode("utf-8"))
+            return encoded_size > result_size_limit
+
         if streaming:
             result_bytes = 0
+            sample_every = max(1, int(options.get("outputSampleEverySteps", 1)))
+            step_index = 0
             for snapshot in session.run_until_streaming(stop, step_size=step_value):
+                step_index += 1
+                is_final = session._finished_reason is not None or snapshot["time"] >= stop
+                if step_index % sample_every != 0 and not is_final:
+                    continue
+                snapshot = {**snapshot, "outputs": select_outputs(snapshot["outputs"])}
                 result_bytes += len(json.dumps(snapshot, separators=(",", ":"), allow_nan=False).encode("utf-8"))
-                if result_bytes > config.MAX_STORED_RESULT_BYTES:
+                if result_bytes > result_size_limit:
                     output_queue.put({"kind": "error", "code": "RESULT_SIZE_LIMIT_EXCEEDED"})
                     return
                 output_queue.put({"kind": "message", "payload": snapshot})
             output_queue.put({
                 "kind": "message",
-                "payload": {"type": "sim.done", "time": session._time},
+                "payload": {
+                    "type": "sim.done",
+                    "time": session._time,
+                    "finishReason": session._finished_reason,
+                },
             })
         elif capture_series:
             initial = session.get_outputs()
+            initial_outputs = select_outputs(initial["outputs"])
             time_values = [initial["time"]]
-            output_series = {name: [value] for name, value in initial["outputs"].items()}
-            result_bytes = len(json.dumps(initial, separators=(",", ":"), allow_nan=False).encode("utf-8"))
+            output_series = {name: [value] for name, value in initial_outputs.items()}
+            result_bytes = len(json.dumps(
+                {"time": initial["time"], "outputs": initial_outputs},
+                separators=(",", ":"), allow_nan=False,
+            ).encode("utf-8"))
+            if result_bytes > result_size_limit:
+                output_queue.put({"kind": "error", "code": "RESULT_SIZE_LIMIT_EXCEEDED"})
+                return
+            sample_every = max(1, int(options.get("outputSampleEverySteps", 1)))
+            step_index = 0
+            last_sample_time = initial["time"]
             for snapshot in session.run_until_streaming(stop, step_size=step_value):
-                result_bytes += len(
-                    json.dumps(
-                        {"time": snapshot["time"], "outputs": snapshot["outputs"]},
-                        separators=(",", ":"),
-                        allow_nan=False,
-                    ).encode("utf-8")
-                )
-                if result_bytes > config.MAX_STORED_RESULT_BYTES:
+                step_index += 1
+                is_final = session._finished_reason is not None or snapshot["time"] >= stop
+                if step_index % sample_every != 0 and not is_final:
+                    continue
+                snapshot_outputs = select_outputs(snapshot["outputs"])
+                sample = {"time": snapshot["time"], "outputs": snapshot_outputs}
+                result_bytes += len(json.dumps(sample, separators=(",", ":"), allow_nan=False).encode("utf-8"))
+                if result_bytes > result_size_limit:
                     output_queue.put({"kind": "error", "code": "RESULT_SIZE_LIMIT_EXCEEDED"})
                     return
                 time_values.append(snapshot["time"])
-                for name, value in snapshot["outputs"].items():
+                last_sample_time = snapshot["time"]
+                for name, value in snapshot_outputs.items():
+                    output_series.setdefault(name, []).append(value)
+            if time_values[-1] != last_sample_time:
+                final_outputs = select_outputs(session.get_outputs()["outputs"])
+                time_values.append(last_sample_time)
+                for name, value in final_outputs.items():
                     output_series.setdefault(name, []).append(value)
             output_queue.put({
                 "kind": "result",
@@ -494,20 +790,36 @@ def _execute_worker(
                     "state": "terminated",
                     "outputs": output_series,
                     "outputVariables": list(output_series),
+                    "sampleEverySteps": sample_every,
+                    "finishReason": session._finished_reason,
                 },
             })
         else:
             result = session.run_until(stop, step_size=step_value)
             outputs = session.get_outputs()
-            output_queue.put({
+            selected_outputs = select_outputs(outputs.get("outputs", {}))
+            payload = {
                 "kind": "result",
                 "payload": {
                     "type": "sim.result",
                     "time": result["time"],
                     "state": "terminated",
-                    "outputs": outputs.get("outputs", {}),
+                    "outputs": selected_outputs,
+                    "outputVariables": list(selected_outputs),
+                    "finishReason": result.get("finishReason"),
                 },
-            })
+            }
+            if result_too_large(payload["payload"]):
+                output_queue.put({"kind": "error", "code": "RESULT_SIZE_LIMIT_EXCEEDED"})
+                return
+            output_queue.put(payload)
+    except WorkerIsolationError:
+        output_queue.put({
+            "kind": "error",
+            "code": "FMU_WORKER_ISOLATION_UNAVAILABLE",
+            "message": "FMU worker isolation could not be applied",
+            "retryable": False,
+        })
     except Exception:
         output_queue.put({
             "kind": "error",
@@ -516,7 +828,8 @@ def _execute_worker(
             "retryable": False,
         })
     finally:
-        session.terminate()
+        if session is not None:
+            session.terminate()
 
 
 def _new_process(
@@ -527,18 +840,49 @@ def _new_process(
     output_queue: Any,
     streaming: bool,
     capture_series: bool = False,
-) -> tuple[Any, Any]:
+    probe_only: bool = False,
+    resource_policy: dict[str, Any] | None = None,
+) -> tuple[Any, Any, WindowsWorkerJob | None, Path]:
     context = mp.get_context("spawn")
-    worker_args = (str(fmu_path), access_key, parameters, options, output_queue, streaming)
-    if capture_series:
-        worker_args += (True,)
+    config.TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    worker_directory = Path(tempfile.mkdtemp(prefix="worker_", dir=str(config.TEMP_DIR)))
+    if os.name != "nt":
+        os.chmod(worker_directory, 0o700)
+    try:
+        worker_fmu_path = _stage_windows_fmu(fmu_path, worker_directory)
+    except Exception:
+        _cleanup_worker_directory(worker_directory)
+        raise
+    start_gate = context.Event()
+    worker_args = (
+        str(worker_fmu_path), access_key, parameters, options, output_queue,
+        streaming, capture_series, start_gate, str(worker_directory),
+        probe_only, resource_policy, os.getpid(),
+    )
     process = context.Process(
         target=_execute_worker,
         args=worker_args,
         name="LabStation-FMU-Worker",
     )
-    process.start()
-    return process, context
+    try:
+        process.start()
+        worker_pid = process.pid
+        if worker_pid is None:
+            raise RuntimeError("FMU worker did not receive a process ID")
+        job = attach_worker_limits(process, resource_policy)
+        _mark_worker_directory(worker_directory, worker_pid)
+        start_gate.set()
+        return process, context, job, worker_directory
+    except Exception as exc:
+        start_gate.set()
+        terminate_worker(process)
+        _cleanup_worker_directory(worker_directory)
+        code = "FMU_WORKER_ISOLATION_UNAVAILABLE" if isinstance(exc, WorkerIsolationError) else "FMU_WORKER_START_FAILED"
+        raise ProcessExecutionError(
+            "FMU worker isolation could not be applied" if isinstance(exc, WorkerIsolationError) else "FMU worker could not be started",
+            code=code,
+            retryable=not isinstance(exc, WorkerIsolationError),
+        ) from exc
 
 
 def run(
@@ -549,25 +893,54 @@ def run(
     options: dict[str, Any],
     cancel_event: threading.Event | None = None,
     capture_series: bool = False,
+    authorization_expires_at: float | None = None,
+    reservation_ends_at: float | None = None,
+    probe_only: bool = False,
+    resource_policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run a one-shot simulation in a spawned process."""
     context = mp.get_context("spawn")
     output_queue = context.Queue(maxsize=1)
-    process, _ = _new_process(fmu_path, access_key, parameters, options, output_queue, False, capture_series)
+    try:
+        process, _, job, worker_directory = _new_process(
+            fmu_path, access_key, parameters, options, output_queue,
+            False, capture_series, probe_only, resource_policy,
+        )
+    except Exception:
+        output_queue.close()
+        output_queue.join_thread()
+        raise
     deadline = time.monotonic() + config.execution_timeout_seconds()
     try:
         while True:
             if cancel_event is not None and cancel_event.is_set():
-                if process.is_alive():
-                    process.terminate()
+                terminate_worker(process, job)
+                job = None
                 raise ProcessExecutionError(
                     "FMU simulation was cancelled",
                     code="FMU_EXECUTION_CANCELLED",
                     retryable=False,
                 )
+            if authorization_expires_at is not None and time.time() >= authorization_expires_at:
+                terminate_worker(process, job)
+                job = None
+                raise ProcessExecutionError(
+                    "Execution authorization expired while the FMU worker was running",
+                    code="EXECUTION_AUTHORIZATION_EXPIRED",
+                    retryable=False,
+                )
+            if reservation_ends_at is not None and time.time() >= reservation_ends_at:
+                terminate_worker(process, job)
+                job = None
+                raise ProcessExecutionError(
+                    "Reservation ended while the FMU worker was running",
+                    code="RESERVATION_ENDED",
+                    retryable=False,
+                )
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                process.terminate()
+                terminate_worker(process, job)
+                job = None
                 raise ProcessExecutionError(
                     "FMU worker exceeded its execution deadline",
                     code="FMU_EXECUTION_TIMEOUT",
@@ -591,12 +964,14 @@ def run(
             )
         return message["payload"]
     finally:
-        process.join(timeout=2)
         if process.is_alive():
-            process.terminate()
-            process.join(timeout=2)
+            terminate_worker(process, job)
+            job = None
+        elif job is not None:
+            job.close()
         output_queue.close()
         output_queue.join_thread()
+        _cleanup_worker_directory(worker_directory)
 
 
 def stream(
@@ -606,15 +981,28 @@ def stream(
     parameters: dict[str, Any],
     options: dict[str, Any],
     cancel_event: threading.Event | None = None,
+    authorization_expires_at: float | None = None,
+    reservation_ends_at: float | None = None,
+    resource_policy: dict[str, Any] | None = None,
 ) -> Iterator[dict[str, Any]]:
     """Yield NDJSON payloads from an isolated streaming worker."""
     context = mp.get_context("spawn")
     output_queue = context.Queue(maxsize=64)
-    process, _ = _new_process(fmu_path, access_key, parameters, options, output_queue, True)
+    try:
+        process, _, job, worker_directory = _new_process(
+            fmu_path, access_key, parameters, options, output_queue, True,
+            resource_policy=resource_policy,
+        )
+    except Exception:
+        output_queue.close()
+        output_queue.join_thread()
+        raise
     deadline = time.monotonic() + config.execution_timeout_seconds()
     try:
         while True:
             if cancel_event is not None and cancel_event.is_set():
+                terminate_worker(process, job)
+                job = None
                 yield {
                     "type": "error",
                     "code": "FMU_EXECUTION_CANCELLED",
@@ -622,8 +1010,30 @@ def stream(
                     "retryable": False,
                 }
                 break
+            if authorization_expires_at is not None and time.time() >= authorization_expires_at:
+                terminate_worker(process, job)
+                job = None
+                yield {
+                    "type": "error",
+                    "code": "EXECUTION_AUTHORIZATION_EXPIRED",
+                    "message": "Execution authorization expired while the FMU worker was running",
+                    "retryable": False,
+                }
+                break
+            if reservation_ends_at is not None and time.time() >= reservation_ends_at:
+                terminate_worker(process, job)
+                job = None
+                yield {
+                    "type": "error",
+                    "code": "RESERVATION_ENDED",
+                    "message": "Reservation ended while the FMU worker was running",
+                    "retryable": False,
+                }
+                break
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                terminate_worker(process, job)
+                job = None
                 yield {
                     "type": "error",
                     "code": "FMU_EXECUTION_TIMEOUT",
@@ -659,7 +1069,10 @@ def stream(
                 break
     finally:
         if process.is_alive():
-            process.terminate()
-        process.join(timeout=2)
+            terminate_worker(process, job)
+            job = None
+        elif job is not None:
+            job.close()
         output_queue.close()
         output_queue.join_thread()
+        _cleanup_worker_directory(worker_directory)

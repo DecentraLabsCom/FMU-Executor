@@ -46,9 +46,8 @@ def internal_token() -> str | None:
 # Temp directory for FMU extraction during execution
 TEMP_DIR: Path = Path(_env("FMU_EXECUTOR_TEMP", str(FMU_ROOT / ".tmp")) or "")
 
-# One-shot executions and cancellable jobs run in child processes so a native
-# FMU crash cannot bring down the Station API. Realtime websocket sessions
-# still use the service process because they need a long-lived state machine.
+# All execution modes use spawned workers by default; in-process is a diagnostic
+# escape hatch for environments that provide their own isolation.
 def execution_mode() -> str:
     mode = (_env("FMU_EXECUTION_MODE", "process") or "process").strip().lower()
     return mode if mode in {"process", "in-process"} else "process"
@@ -81,10 +80,20 @@ MAX_OUTPUT_SUBSCRIPTION_HZ: int = _bounded_int("FMU_MAX_OUTPUT_SUBSCRIPTION_HZ",
 MAX_OUTPUT_SUBSCRIPTION_BATCH: int = _bounded_int("FMU_MAX_OUTPUT_SUBSCRIPTION_BATCH", 256, 1, 4096)
 FMU_PROGRESS_INTERVAL_MS: int = _bounded_int("FMU_PROGRESS_INTERVAL_MS", 50, 10, 5000)
 MAX_SIMULATION_STEPS: int = _bounded_int("FMU_MAX_SIMULATION_STEPS", 10000, 100, 100000)
+MAX_OUTPUT_SAMPLE_EVERY_STEPS: int = _bounded_int("FMU_MAX_OUTPUT_SAMPLE_EVERY_STEPS", 10000, 1, 100000)
 HISTORY_RETENTION_DAYS: int = _bounded_int("FMU_HISTORY_RETENTION_DAYS", 7, 1, 30)
 MAX_STORED_HISTORY_RECORDS: int = _bounded_int("FMU_MAX_HISTORY_RECORDS", 10000, 100, 100000)
 MAX_STORED_RESULT_BYTES: int = _bounded_int("FMU_MAX_RESULT_BYTES", 8 * 1024 * 1024, 65536, 32 * 1024 * 1024)
 MAX_TOTAL_HISTORY_BYTES: int = _bounded_int("FMU_MAX_HISTORY_BYTES", 256 * 1024 * 1024, 16 * 1024 * 1024, 2 * 1024 * 1024 * 1024)
+MAX_FMU_ARCHIVE_BYTES: int = _bounded_int("FMU_MAX_ARCHIVE_BYTES", 512 * 1024 * 1024, 1024, 4 * 1024 * 1024 * 1024)
+MAX_FMU_EXPANDED_BYTES: int = _bounded_int("FMU_MAX_EXPANDED_BYTES", 2 * 1024 * 1024 * 1024, 1024, 16 * 1024 * 1024 * 1024)
+MAX_FMU_ARCHIVE_ENTRIES: int = _bounded_int("FMU_MAX_ARCHIVE_ENTRIES", 20000, 1, 200000)
+MAX_FMU_MODEL_DESCRIPTION_BYTES: int = _bounded_int(
+    "FMU_MAX_MODEL_DESCRIPTION_BYTES", 8 * 1024 * 1024, 1024, 128 * 1024 * 1024
+)
+WORKER_CPU_SECONDS: int = _bounded_int("FMU_WORKER_CPU_SECONDS", 300, 1, 86400)
+WORKER_MEMORY_BYTES: int = _bounded_int("FMU_WORKER_MEMORY_MIB", 1024, 128, 16384) * 1024 * 1024
+WORKER_FILE_BYTES: int = _bounded_int("FMU_WORKER_FILE_MIB", 128, 1, 4096) * 1024 * 1024
 
 
 # OMSimulator is an optional future composition backend. It is deliberately

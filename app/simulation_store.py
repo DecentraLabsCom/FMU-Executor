@@ -16,7 +16,7 @@ from . import config
 
 
 _ACTIVE_STATUSES = ("queued", "running", "cancelling")
-_TERMINAL_STATUSES = ("completed", "cancelled", "failed", "interrupted")
+_TERMINAL_STATUSES = ("completed", "cancelled", "failed", "expired", "interrupted")
 
 
 class QuotaExceededError(RuntimeError):
@@ -98,7 +98,14 @@ class SimulationStore:
                     parameters_json TEXT NOT NULL DEFAULT '{}',
                     options_json TEXT NOT NULL DEFAULT '{}',
                     result_json TEXT,
-                    error_code TEXT
+                    error_code TEXT,
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    fmu_sha256 TEXT,
+                    authorization_expires_at REAL,
+                    reservation_ends_at REAL,
+                    finish_reason TEXT,
+                    warnings_json TEXT NOT NULL DEFAULT '[]',
+                    result_sha256 TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_simulation_jobs_scope_created
                     ON simulation_jobs(scope_key, created_at DESC);
@@ -107,6 +114,13 @@ class SimulationStore:
                     usage_day TEXT NOT NULL,
                     scenarios INTEGER NOT NULL,
                     PRIMARY KEY(scope_key, usage_day)
+                );
+                CREATE TABLE IF NOT EXISTS simulation_model_usage (
+                    scope_key TEXT NOT NULL,
+                    model_sha256 TEXT NOT NULL,
+                    usage_day TEXT NOT NULL,
+                    scenarios INTEGER NOT NULL,
+                    PRIMARY KEY(scope_key, model_sha256, usage_day)
                 );
                 CREATE TABLE IF NOT EXISTS input_update_usage (
                     scope_key TEXT NOT NULL,
@@ -125,6 +139,26 @@ class SimulationStore:
                     ON input_update_events(scope_key, model_key, created_at);
                 """
             )
+            existing_columns = {
+                row["name"] for row in db.execute("PRAGMA table_info(simulation_jobs)").fetchall()
+            }
+            for column, definition in (
+                ("metadata_json", "TEXT NOT NULL DEFAULT '{}'"),
+                ("fmu_sha256", "TEXT"),
+                ("authorization_expires_at", "REAL"),
+                ("reservation_ends_at", "REAL"),
+                ("finish_reason", "TEXT"),
+                ("warnings_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("result_sha256", "TEXT"),
+            ):
+                if column not in existing_columns:
+                    db.execute(f"ALTER TABLE simulation_jobs ADD COLUMN {column} {definition}")
+            # Preserve previously debited reservation-wide usage in a wildcard
+            # bucket while new executions are counted per immutable model hash.
+            db.execute(
+                "INSERT OR IGNORE INTO simulation_model_usage(scope_key,model_sha256,usage_day,scenarios) "
+                "SELECT scope_key,'*',usage_day,scenarios FROM simulation_usage"
+            )
             # Native FMU workers cannot be resumed after a process restart.
             now = time.time()
             db.execute(
@@ -135,25 +169,38 @@ class SimulationStore:
             )
         self.prune()
 
-    def reserve_scenarios(self, scope_key: str, count: int) -> int:
-        """Atomically debit realtime/streaming usage for one reservation."""
+    def reserve_scenarios(
+        self,
+        scope_key: str,
+        count: int,
+        *,
+        model_sha256: str = "*",
+        maximum: int | None = None,
+    ) -> int:
+        """Atomically debit a reservation's daily budget for one model hash."""
         if count < 1:
             raise ValueError("Scenario count must be positive")
         usage_day = datetime.now(timezone.utc).date().isoformat()
-        maximum = config.MAX_SCENARIOS_PER_RESERVATION_PER_DAY
+        maximum = maximum or config.MAX_SCENARIOS_PER_RESERVATION_PER_DAY
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute(
-                "SELECT scenarios FROM simulation_usage WHERE scope_key=? AND usage_day=?",
-                (scope_key, usage_day),
+                "SELECT scenarios FROM simulation_model_usage WHERE scope_key=? AND model_sha256=? AND usage_day=?",
+                (scope_key, model_sha256, usage_day),
             ).fetchone()
             used = int(row["scenarios"]) if row else 0
+            if model_sha256 != "*":
+                legacy = db.execute(
+                    "SELECT scenarios FROM simulation_model_usage WHERE scope_key=? AND model_sha256='*' AND usage_day=?",
+                    (scope_key, usage_day),
+                ).fetchone()
+                used += int(legacy["scenarios"]) if legacy else 0
             if used + count > maximum:
                 raise QuotaExceededError(maximum - used)
             db.execute(
-                "INSERT INTO simulation_usage(scope_key,usage_day,scenarios) VALUES(?,?,?) "
-                "ON CONFLICT(scope_key,usage_day) DO UPDATE SET scenarios=excluded.scenarios",
-                (scope_key, usage_day, used + count),
+                "INSERT INTO simulation_model_usage(scope_key,model_sha256,usage_day,scenarios) VALUES(?,?,?,?) "
+                "ON CONFLICT(scope_key,model_sha256,usage_day) DO UPDATE SET scenarios=simulation_model_usage.scenarios+excluded.scenarios",
+                (scope_key, model_sha256, usage_day, count),
             )
             return used + count
 
@@ -225,6 +272,10 @@ class SimulationStore:
         total_cases: int,
         parameters: dict[str, Any],
         options: dict[str, Any],
+        metadata: dict[str, Any],
+        authorization_expires_at: float,
+        reservation_ends_at: float | None,
+        maximum_scenarios: int,
     ) -> None:
         """Create the audit row and charge its scenarios in one transaction."""
         self.prune()
@@ -232,29 +283,37 @@ class SimulationStore:
         now = time.time()
         parameters_json = json.dumps(parameters, separators=(",", ":"), allow_nan=False)
         options_json = json.dumps(options, separators=(",", ":"), allow_nan=False)
+        metadata_json = json.dumps(metadata, separators=(",", ":"), allow_nan=False)
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            model_sha256 = str(metadata.get("fmuSha256") or "*")
             row = db.execute(
-                "SELECT scenarios FROM simulation_usage WHERE scope_key=? AND usage_day=?",
-                (scope_key, usage_day),
+                "SELECT scenarios FROM simulation_model_usage WHERE scope_key=? AND model_sha256=? AND usage_day=?",
+                (scope_key, model_sha256, usage_day),
             ).fetchone()
             used = int(row["scenarios"]) if row else 0
-            maximum = config.MAX_SCENARIOS_PER_RESERVATION_PER_DAY
+            legacy = db.execute(
+                "SELECT scenarios FROM simulation_model_usage WHERE scope_key=? AND model_sha256='*' AND usage_day=?",
+                (scope_key, usage_day),
+            ).fetchone()
+            used += int(legacy["scenarios"]) if legacy and model_sha256 != "*" else 0
+            maximum = maximum_scenarios
             if used + total_cases > maximum:
                 raise QuotaExceededError(maximum - used)
             db.execute(
                 "INSERT INTO simulation_jobs "
-                "(id,scope_key,lab_id,reservation_key,fmu_filename,kind,status,created_at,updated_at,total_cases,parameters_json,options_json) "
-                "VALUES(?,?,?,?,?,?,'queued',?,?,?,?,?)",
+                "(id,scope_key,lab_id,reservation_key,fmu_filename,kind,status,created_at,updated_at,total_cases,parameters_json,options_json,metadata_json,fmu_sha256,authorization_expires_at,reservation_ends_at) "
+                "VALUES(?,?,?,?,?,?,'queued',?,?,?,?,?,?,?,?,?)",
                 (
                     job_id, scope_key, scope["labId"], scope["reservationKey"], fmu_filename,
-                    kind, now, now, total_cases, parameters_json, options_json,
+                    kind, now, now, total_cases, parameters_json, options_json, metadata_json,
+                    metadata.get("fmuSha256"), authorization_expires_at, reservation_ends_at,
                 ),
             )
             db.execute(
-                "INSERT INTO simulation_usage(scope_key,usage_day,scenarios) VALUES(?,?,?) "
-                "ON CONFLICT(scope_key,usage_day) DO UPDATE SET scenarios=excluded.scenarios",
-                (scope_key, usage_day, used + total_cases),
+                "INSERT INTO simulation_model_usage(scope_key,model_sha256,usage_day,scenarios) VALUES(?,?,?,?) "
+                "ON CONFLICT(scope_key,model_sha256,usage_day) DO UPDATE SET scenarios=simulation_model_usage.scenarios+excluded.scenarios",
+                (scope_key, model_sha256, usage_day, total_cases),
             )
 
     def update_job(
@@ -265,10 +324,22 @@ class SimulationStore:
         completed_cases: int | None = None,
         result: Any = None,
         error_code: str | None = None,
+        finish_reason: str | None = None,
+        warnings: list[str] | None = None,
+        result_sha256: str | None = None,
     ) -> None:
         now = time.time()
         fields = ["status=?", "updated_at=?", "error_code=?"]
         values: list[Any] = [status, now, error_code]
+        if finish_reason is not None:
+            fields.append("finish_reason=?")
+            values.append(finish_reason)
+        if warnings is not None:
+            fields.append("warnings_json=?")
+            values.append(json.dumps(warnings, separators=(",", ":"), allow_nan=False))
+        if result_sha256 is not None:
+            fields.append("result_sha256=?")
+            values.append(result_sha256)
         if status == "running":
             fields.append("started_at=COALESCE(started_at,?)")
             values.append(now)
@@ -303,7 +374,8 @@ class SimulationStore:
         with self._connect() as db:
             row = db.execute(
                 "SELECT id,lab_id,reservation_key,fmu_filename,kind,status,created_at,updated_at,started_at,"
-                "elapsed_seconds,completed_cases,total_cases,error_code,result_json "
+                "elapsed_seconds,completed_cases,total_cases,error_code,result_json,metadata_json,"
+                "fmu_sha256,authorization_expires_at,reservation_ends_at,finish_reason,warnings_json,result_sha256 "
                 "FROM simulation_jobs WHERE id=? AND scope_key=?",
                 (job_id, scope_key),
             ).fetchone()
@@ -314,7 +386,8 @@ class SimulationStore:
         with self._connect() as db:
             row = db.execute(
                 "SELECT id,lab_id,reservation_key,fmu_filename,kind,status,created_at,updated_at,started_at,"
-                "elapsed_seconds,completed_cases,total_cases,error_code,parameters_json,options_json,result_json "
+                "elapsed_seconds,completed_cases,total_cases,error_code,parameters_json,options_json,result_json,"
+                "metadata_json,fmu_sha256,authorization_expires_at,reservation_ends_at,finish_reason,warnings_json,result_sha256 "
                 "FROM simulation_jobs WHERE id=? AND scope_key=?",
                 (job_id, scope_key),
             ).fetchone()
@@ -324,6 +397,11 @@ class SimulationStore:
         item["parameters"] = json.loads(row["parameters_json"])
         item["options"] = json.loads(row["options_json"])
         item["result"] = json.loads(row["result_json"]) if row["result_json"] else None
+        item["evidence"] = json.loads(row["metadata_json"])
+        if item["evidence"]:
+            item["evidence"]["finishReason"] = row["finish_reason"] or "unknown"
+            item["evidence"]["warnings"] = json.loads(row["warnings_json"] or "[]")
+            item["evidence"]["resultSha256"] = row["result_sha256"]
         return item
 
     def list_history(self, scope_key: str, *, limit: int, offset: int) -> dict[str, Any]:
@@ -335,7 +413,8 @@ class SimulationStore:
             ).fetchone()["total"])
             rows = db.execute(
                 "SELECT id,lab_id,reservation_key,fmu_filename,kind,status,created_at,updated_at,started_at,"
-                "elapsed_seconds,completed_cases,total_cases,error_code,result_json "
+                "elapsed_seconds,completed_cases,total_cases,error_code,result_json,metadata_json,"
+                "fmu_sha256,authorization_expires_at,reservation_ends_at,finish_reason,warnings_json,result_sha256 "
                 "FROM simulation_jobs WHERE scope_key=? ORDER BY created_at DESC LIMIT ? OFFSET ?",
                 (scope_key, limit, offset),
             ).fetchall()
@@ -354,6 +433,7 @@ class SimulationStore:
                 (cutoff,),
             )
             db.execute("DELETE FROM simulation_usage WHERE usage_day<date('now','-2 day')")
+            db.execute("DELETE FROM simulation_model_usage WHERE usage_day<date('now','-2 day')")
             db.execute("DELETE FROM input_update_usage WHERE usage_day<date('now','-2 day')")
             db.execute("DELETE FROM input_update_events WHERE created_at<?", (time.time() - 3600,))
             db.execute(
@@ -377,6 +457,13 @@ class SimulationStore:
     @staticmethod
     def _serialize(row: sqlite3.Row) -> dict[str, Any]:
         item = {key: row[key] for key in row.keys() if key != "result_json"}
+        metadata_json = item.pop("metadata_json", "{}")
+        warnings_json = item.pop("warnings_json", "[]")
+        fmu_sha256 = item.pop("fmu_sha256", None)
+        authorization_expires_at = item.pop("authorization_expires_at", None)
+        reservation_ends_at = item.pop("reservation_ends_at", None)
+        finish_reason = item.pop("finish_reason", None)
+        result_sha256 = item.pop("result_sha256", None)
         item["createdAt"] = item.pop("created_at")
         item["updatedAt"] = item.pop("updated_at")
         started_at = item.pop("started_at")
@@ -392,4 +479,14 @@ class SimulationStore:
         item["totalCases"] = item.pop("total_cases")
         item["errorCode"] = item.pop("error_code")
         item["resultAvailable"] = row["result_json"] is not None
+        item["fmuSha256"] = fmu_sha256
+        item["authorizationExpiresAt"] = authorization_expires_at
+        item["reservationEndsAt"] = reservation_ends_at
+        item["finishReason"] = finish_reason
+        item["warnings"] = json.loads(warnings_json or "[]")
+        item["resultSha256"] = result_sha256
+        item["evidence"] = json.loads(metadata_json or "{}")
+        item["evidence"]["finishReason"] = finish_reason or "unknown"
+        item["evidence"]["warnings"] = item["warnings"]
+        item["evidence"]["resultSha256"] = result_sha256
         return item

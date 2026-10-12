@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import logging
+import os
+import platform
 import re
 import shutil
+import stat
+import tempfile
 import time as _time
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -190,24 +196,245 @@ def list_quarantined() -> list[dict[str, Any]]:
 # ── validation ───────────────────────────────────────────────────
 
 def validate_fmu(access_key: str) -> tuple[bool, str]:
-    """Validate an FMU is a parseable Co-Simulation archive.
+    """Validate an FMU archive, engine capability, and host binary availability.
 
     Returns ``(True, "")`` on success or ``(False, reason)`` on failure.
     Does NOT auto-quarantine — the caller decides.
     """
-    path = _resolve_fmu_path(access_key)
-    if path is None:
-        return False, "FMU file not found"
+    report = inspect_fmu(access_key)
+    if report["archiveValid"] and report["stationCompatible"]:
+        return True, ""
+    return False, "; ".join(report["issues"][:5]) or "FMU is not executable on this Station"
+
+
+def _host_binary_directories() -> list[str]:
+    system = platform.system().lower()
+    machine = platform.machine().lower()
+    if system == "windows":
+        if machine in {"amd64", "x86_64", "x64"}:
+            return ["win64", "x86_64-windows"]
+        if machine in {"arm64", "aarch64"}:
+            return ["aarch64-windows"]
+        if machine in {"i386", "i686", "x86"}:
+            return ["win32", "x86-windows"]
+    elif system == "linux":
+        if machine in {"x86_64", "amd64"}:
+            return ["linux64", "x86_64-linux"]
+        if machine in {"aarch64", "arm64"}:
+            return ["aarch64-linux"]
+    elif system == "darwin":
+        if machine in {"x86_64", "amd64"}:
+            return ["darwin64", "x86_64-darwin"]
+        if machine in {"arm64", "aarch64"}:
+            return ["darwinarm64", "aarch64-darwin"]
+    return []
+
+
+def _archive_report(path: Path) -> tuple[bool, list[str], str | None, int | None, int | None, int | None]:
+    issues: list[str] = []
+    digest = hashlib.sha256()
+    compressed_size = expanded_size = entry_count = None
     try:
-        md = fmpy.read_model_description(str(path))
+        compressed_size = path.stat().st_size
+        if compressed_size > config.MAX_FMU_ARCHIVE_BYTES:
+            return False, ["FMU archive exceeds the compressed size limit"], None, compressed_size, None, None
+        with path.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+        with zipfile.ZipFile(path) as archive:
+            entries = archive.infolist()
+            entry_count = len(entries)
+            if entry_count > config.MAX_FMU_ARCHIVE_ENTRIES:
+                return False, ["FMU archive contains too many entries"], digest.hexdigest(), compressed_size, 0, entry_count
+            expanded_size = 0
+            seen_names: set[str] = set()
+            for entry in entries:
+                name = entry.filename.replace("\\", "/")
+                if name.startswith("/") or re.match(r"^[A-Za-z]:", name) or ".." in name.split("/"):
+                    issues.append("FMU archive contains a path outside its extraction root")
+                    break
+                normalized_name = name.rstrip("/")
+                if os.name == "nt":
+                    normalized_name = normalized_name.casefold()
+                if normalized_name in seen_names:
+                    issues.append("FMU archive contains duplicate paths")
+                    break
+                seen_names.add(normalized_name)
+                if entry.flag_bits & 0x1:
+                    issues.append("FMU archive contains encrypted entries")
+                    break
+                expanded_size += entry.file_size
+                if expanded_size > config.MAX_FMU_EXPANDED_BYTES:
+                    issues.append("FMU archive exceeds the expanded size limit")
+                    break
+    except (OSError, zipfile.BadZipFile, RuntimeError):
+        return False, ["FMU is not a readable ZIP archive"], None, compressed_size, expanded_size, entry_count
+    return not issues, issues, digest.hexdigest(), compressed_size, expanded_size, entry_count
+
+
+def inspect_fmu(access_key: str, *, include_hash: bool = True) -> dict[str, Any]:
+    """Report archive validity separately from host compatibility and probing."""
+    path = _resolve_fmu_path(access_key)
+    return inspect_fmu_path(path, access_key=access_key, include_hash=include_hash)
+
+
+def inspect_fmu_path(path: Path | None, *, access_key: str, include_hash: bool = True) -> dict[str, Any]:
+    """Inspect a specific FMU file, including immutable execution snapshots."""
+    host_dirs = _host_binary_directories()
+    report: dict[str, Any] = {
+        "accessKey": access_key,
+        "archiveValid": False,
+        "modelDescriptionValid": False,
+        "stationCompatible": False,
+        "executionChecked": False,
+        "platform": {"system": platform.system(), "machine": platform.machine()},
+        "compatibleBinaryDirectories": host_dirs,
+        "nativeBinaryPresent": False,
+        "dependenciesChecked": False,
+        "limits": {
+            "maxCompressedBytes": config.MAX_FMU_ARCHIVE_BYTES,
+            "maxExpandedBytes": config.MAX_FMU_EXPANDED_BYTES,
+            "maxEntries": config.MAX_FMU_ARCHIVE_ENTRIES,
+            "maxModelDescriptionBytes": config.MAX_FMU_MODEL_DESCRIPTION_BYTES,
+        },
+        "issues": [],
+    }
+    if path is None:
+        report["issues"] = ["FMU file not found"]
+        return report
+
+    archive_valid, archive_issues, digest, compressed_size, expanded_size, entry_count = _archive_report(path)
+    report["archiveValid"] = archive_valid
+    report["issues"].extend(archive_issues)
+    report["compressedSizeBytes"] = compressed_size
+    report["expandedSizeBytes"] = expanded_size
+    report["archiveEntryCount"] = entry_count
+    if include_hash and digest:
+        report["sha256"] = digest
+    if not archive_valid:
+        return report
+
+    try:
+        with zipfile.ZipFile(path) as archive:
+            model_description = archive.getinfo("modelDescription.xml")
+            report["modelDescriptionSizeBytes"] = model_description.file_size
+            if model_description.file_size > config.MAX_FMU_MODEL_DESCRIPTION_BYTES:
+                report["issues"].append("FMU model description exceeds the size limit")
+                return report
+    except KeyError:
+        report["issues"].append("FMU has no modelDescription.xml")
+        return report
+    except (OSError, zipfile.BadZipFile):
+        report["issues"].append("FMU model description is not readable")
+        return report
+
+    try:
+        description = fmpy.read_model_description(str(path))
     except Exception:
         logger.exception("Cannot parse FMU model description for %s", access_key)
-        return False, "Cannot parse model description"
-    if md.coSimulation is None:
-        return False, "FMU does not support Co-Simulation"
-    if not md.guid:
-        return False, "FMU has no GUID"
-    return True, ""
+        report["issues"].append("Cannot parse model description")
+        return report
+
+    fmi_version = str(description.fmiVersion or "")
+    report["fmiVersion"] = fmi_version
+    report["guid"] = str(description.guid or "")
+    report["modelDescriptionValid"] = True
+    report["capabilities"] = {
+        "coSimulation": description.coSimulation is not None,
+        "modelExchange": description.modelExchange is not None,
+        "scheduledExecution": getattr(description, "scheduledExecution", None) is not None,
+    }
+    if fmi_version.split(".", 1)[0] not in {"2", "3"}:
+        report["issues"].append("Executor supports FMI 2.0 and FMI 3.0 only")
+    if description.coSimulation is None:
+        report["issues"].append("FMU does not provide Co-Simulation")
+    if not description.guid:
+        report["issues"].append("FMU has no GUID")
+
+    model_identifier = str(getattr(description.coSimulation, "modelIdentifier", "") or "")
+    report["modelIdentifier"] = model_identifier
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", model_identifier):
+        report["issues"].append("FMU Co-Simulation modelIdentifier is missing or invalid")
+
+    extensions = {
+        "windows": (".dll",),
+        "linux": (".so",),
+        "darwin": (".dylib", ".so"),
+    }.get(platform.system().lower(), ())
+    expected_binary_names = {
+        f"binaries/{directory}/{model_identifier}{extension}"
+        for directory in host_dirs
+        for extension in extensions
+    } if model_identifier else set()
+    try:
+        with zipfile.ZipFile(path) as archive:
+            names = {entry.filename.replace("\\", "/") for entry in archive.infolist()}
+        matched = expected_binary_names.intersection(names)
+        if os.name == "nt" and not matched:
+            lower_names = {name.lower(): name for name in names}
+            matched = {lower_names[name.lower()] for name in expected_binary_names if name.lower() in lower_names}
+        found_binaries = sorted(matched)
+        present = bool(found_binaries)
+    except (OSError, zipfile.BadZipFile):
+        present = False
+        found_binaries = []
+    report["nativeBinaryPresent"] = present
+    report["nativeBinaryEntries"] = found_binaries
+    if description.coSimulation is not None and host_dirs and not present:
+        report["issues"].append("FMU has no Co-Simulation binary for this Station platform")
+    if not host_dirs:
+        report["issues"].append("Station operating system or architecture is unsupported")
+    report["stationCompatible"] = not report["issues"]
+    return report
+
+
+def snapshot_fmu(path: Path) -> tuple[Path, str]:
+    """Copy an FMU into immutable, content-addressed state for a whole job."""
+    path = Path(path).resolve(strict=True)
+    if not path.is_file():
+        raise ValueError("FMU snapshot source must be a file")
+    if path.stat().st_size > config.MAX_FMU_ARCHIVE_BYTES:
+        raise ValueError("FMU archive exceeds the compressed size limit")
+    snapshot_dir = config.STATE_DIR / "fmu-snapshots"
+    snapshot_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if os.name != "nt":
+        os.chmod(snapshot_dir, 0o700)
+    fd, temporary_name = tempfile.mkstemp(prefix=".snapshot-", suffix=".tmp", dir=snapshot_dir)
+    digest = hashlib.sha256()
+    try:
+        with os.fdopen(fd, "wb") as destination, path.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                if destination.tell() + len(chunk) > config.MAX_FMU_ARCHIVE_BYTES:
+                    raise ValueError("FMU archive exceeds the compressed size limit")
+                digest.update(chunk)
+                destination.write(chunk)
+            destination.flush()
+            os.fsync(destination.fileno())
+        sha256 = digest.hexdigest()
+        snapshot_path = snapshot_dir / f"{sha256}.fmu"
+        if snapshot_path.exists():
+            existing_digest = hashlib.sha256()
+            with snapshot_path.open("rb") as existing:
+                for chunk in iter(lambda: existing.read(1024 * 1024), b""):
+                    existing_digest.update(chunk)
+            if existing_digest.hexdigest() == sha256:
+                os.unlink(temporary_name)
+            else:
+                try:
+                    snapshot_path.chmod(stat.S_IWUSR | stat.S_IRUSR)
+                except OSError:
+                    pass
+                os.replace(temporary_name, snapshot_path)
+        else:
+            os.replace(temporary_name, snapshot_path)
+        try:
+            snapshot_path.chmod(stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
+        except OSError:
+            logger.warning("Could not mark FMU snapshot read-only: %s", snapshot_path)
+        return snapshot_path, sha256
+    finally:
+        if os.path.exists(temporary_name):
+            os.unlink(temporary_name)
 
 
 def _resolve_fmu_path(access_key: str) -> Path | None:
@@ -260,7 +487,12 @@ def get_fmu_path(access_key: str) -> Path:
 
 def describe(access_key: str) -> dict[str, Any]:
     """Parse the model description and return a normalised dict compatible with the Gateway contract."""
-    fmu_path = str(get_fmu_path(access_key))
+    return describe_path(get_fmu_path(access_key))
+
+
+def describe_path(path: Path) -> dict[str, Any]:
+    """Describe a specific immutable FMU file."""
+    fmu_path = str(path)
     md = fmpy.read_model_description(fmu_path)
 
     variables: list[dict[str, Any]] = []

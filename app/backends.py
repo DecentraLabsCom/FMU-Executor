@@ -16,14 +16,24 @@ from . import config
 
 def omsimulator_status() -> dict[str, Any]:
     command = config.omsimulator_command()
-    available = bool(config.omsimulator_enabled() and shutil.which(command))
+    installed = bool(shutil.which(command))
+    enabled = config.omsimulator_enabled()
+    # Discovery alone does not mean the API has an OMSimulator execution
+    # adapter. Keep the backend unavailable until requests can really run.
     return {
         "id": "omsimulator",
-        "enabled": config.omsimulator_enabled(),
-        "available": available,
+        "enabled": enabled,
+        "installed": installed,
+        "executable": False,
+        "available": False,
+        "adapterImplemented": False,
         "commandConfigured": bool(command),
-        "supports": ["SSP", "multi-fmu", "CoSimulation"] if available else [],
-        "state": "available" if available else "planned",
+        "supports": [],
+        "state": (
+            "disabled" if not enabled
+            else "installed_not_executable" if installed
+            else "planned"
+        ),
     }
 
 

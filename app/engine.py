@@ -93,6 +93,7 @@ class FmuSession:
         self._pending_samples: list[dict[str, Any]] = []
         self._pending_queue_drops: int = 0
         self._step_count: int = 0
+        self._max_simulation_steps = config.MAX_SIMULATION_STEPS
 
     # ── lifecycle ────────────────────────────────────────────────
 
@@ -242,7 +243,7 @@ class FmuSession:
         if not math.isfinite(h) or h <= 0:
             raise ValueError("stepSize must be positive")
         expected_steps = max(0.0, target_time - self._time) / h
-        if not math.isfinite(expected_steps) or expected_steps > config.MAX_SIMULATION_STEPS:
+        if not math.isfinite(expected_steps) or expected_steps > self._max_simulation_steps:
             raise ValueError("MAX_SIMULATION_STEPS_EXCEEDED")
         self._ensure_step_budget(math.ceil(expected_steps))
         self._state = "running"
@@ -312,7 +313,7 @@ class FmuSession:
         if not math.isfinite(h) or h <= 0:
             raise ValueError("stepSize must be positive")
         expected_steps = max(0.0, target_time - self._time) / h
-        if not math.isfinite(expected_steps) or expected_steps > config.MAX_SIMULATION_STEPS:
+        if not math.isfinite(expected_steps) or expected_steps > self._max_simulation_steps:
             raise ValueError("MAX_SIMULATION_STEPS_EXCEEDED")
         self._ensure_step_budget(math.ceil(expected_steps))
         self._state = "running"
@@ -360,7 +361,7 @@ class FmuSession:
             self._state = "initialized"
 
     def _ensure_step_budget(self, additional_steps: int) -> None:
-        if self._step_count + additional_steps > config.MAX_SIMULATION_STEPS:
+        if self._step_count + additional_steps > self._max_simulation_steps:
             raise ValueError("MAX_SIMULATION_STEPS_EXCEEDED")
 
     def set_inputs(self, values: dict[str, Any]) -> None:
@@ -529,9 +530,21 @@ class FmuSession:
         now = _time.time() if now is None else now
         if self.expires_at is not None:
             try:
-                if float(self.expires_at) <= now:
+                expires_at = float(self.expires_at)
+                if not math.isfinite(expires_at) or expires_at <= now:
                     return False
             except (TypeError, ValueError):
+                return False
+        claims = self.gateway_context.get("claims") or {}
+        reservation_end = self.gateway_context.get("reservationEndsAt")
+        if reservation_end is None and isinstance(claims, dict):
+            reservation_end = claims.get("reservationEndsAt")
+        if reservation_end is not None:
+            try:
+                reservation_ends_at = float(reservation_end)
+                if not math.isfinite(reservation_ends_at) or reservation_ends_at <= now:
+                    return False
+            except (TypeError, ValueError, OverflowError):
                 return False
         return self._attach_deadline is None or now < self._attach_deadline
 
@@ -849,10 +862,13 @@ class FmuSession:
                 raise ValueError(f"Input '{var.name}' requires String values")
             return list(raw_values)
         if vtype == "Binary":
-            if not all(isinstance(item, str) for item in raw_values):
-                raise ValueError("Binary inputs must be valid base64 strings")
+            binary_values: list[str] = []
+            for item in raw_values:
+                if not isinstance(item, str):
+                    raise ValueError("Binary inputs must be valid base64 strings")
+                binary_values.append(item)
             try:
-                return [base64.b64decode(item, validate=True) for item in raw_values]
+                return [base64.b64decode(item, validate=True) for item in binary_values]
             except (binascii.Error, ValueError) as exc:
                 raise ValueError("Binary inputs must be valid base64 strings") from exc
         raise ValueError(f"FMU variable type {vtype} is not supported")
@@ -920,6 +936,7 @@ class FmuSession:
 
 _sessions: dict[str, Any] = {}
 _sessions_lock = threading.RLock()
+_capacity_reservations: set[str] = set()
 
 
 class CapacityExceededError(RuntimeError):
@@ -933,24 +950,52 @@ def create_session(
     expires_at: float | int | str | None = None,
     gateway_context: dict[str, Any] | None = None,
     session_factory: Any = None,
+    resource_policy: dict[str, Any] | None = None,
 ) -> Any:
     cleanup_expired_sessions()
     with _sessions_lock:
-        if len(_sessions) >= config.MAX_CONCURRENT_SESSIONS:
+        if len(_sessions) + len(_capacity_reservations) >= config.MAX_CONCURRENT_SESSIONS:
             raise CapacityExceededError(
                 f"Max concurrent sessions ({config.MAX_CONCURRENT_SESSIONS}) reached"
             )
         session_id = f"sess_{uuid.uuid4().hex[:12]}"
         factory = session_factory or FmuSession
-        session = factory(
-            session_id,
-            fmu_path,
-            access_key=access_key,
-            expires_at=expires_at,
-            gateway_context=gateway_context,
-        )
+        session_arguments = (session_id, fmu_path)
+        session_options = {
+            "access_key": access_key,
+            "expires_at": expires_at,
+            "gateway_context": gateway_context,
+        }
+        if resource_policy is not None:
+            session_options["resource_policy"] = resource_policy
+        session = factory(*session_arguments, **session_options)
+        # A newly created WebSocket session is actively being established.
+        # Do not let periodic cleanup reap it while its initial worker load RPC
+        # is still in flight; the owning connection is attached immediately
+        # after the create response is assembled.
+        session.mark_attached()
         _sessions[session_id] = session
         return session
+
+
+def reserve_capacity() -> str:
+    """Reserve one shared execution slot before charging a simulation job."""
+    cleanup_expired_sessions()
+    with _sessions_lock:
+        if len(_sessions) + len(_capacity_reservations) >= config.MAX_CONCURRENT_SESSIONS:
+            raise CapacityExceededError(
+                f"Max concurrent executions ({config.MAX_CONCURRENT_SESSIONS}) reached"
+            )
+        token = uuid.uuid4().hex
+        _capacity_reservations.add(token)
+        return token
+
+
+def release_capacity(token: str | None) -> None:
+    if not token:
+        return
+    with _sessions_lock:
+        _capacity_reservations.discard(token)
 
 
 def get_session(session_id: str) -> Any | None:
@@ -1002,7 +1047,7 @@ def remove_session(session_id: str) -> None:
 def active_session_count() -> int:
     cleanup_expired_sessions()
     with _sessions_lock:
-        return len(_sessions)
+        return len(_sessions) + len(_capacity_reservations)
 
 
 def terminate_all() -> None:
@@ -1010,3 +1055,5 @@ def terminate_all() -> None:
         session_ids = list(_sessions)
     for sid in session_ids:
         remove_session(sid)
+    with _sessions_lock:
+        _capacity_reservations.clear()
