@@ -546,6 +546,15 @@ class TestOutputSubscription:
         # period_ms=10 → 0.01s, max_hz=2 → 0.5s, 0.5 wins
         assert sub.min_interval_seconds() == 0.5
 
+    def test_subscription_cannot_exceed_configured_rate_without_max_hz(self, monkeypatch):
+        from app import config
+        from app.engine import OutputSubscription
+
+        monkeypatch.setattr(config, "MAX_OUTPUT_SUBSCRIPTION_HZ", 20)
+        sub = OutputSubscription(period_ms=1)
+
+        assert sub.min_interval_seconds() == 0.05
+
 
 # ---------------------------------------------------------------------------
 # WebSocket – subscribe/unsubscribe

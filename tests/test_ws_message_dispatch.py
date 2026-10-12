@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 from fastapi import HTTPException
@@ -14,7 +15,12 @@ class Session:
     session_id = "dispatch-session"
     access_key = "demo.fmu"
     expires_at = None
-    gateway_context = {"accessKey": "demo.fmu", "claims": {}}
+    gateway_context = {
+        "accessKey": "demo.fmu",
+        "labId": "lab-1",
+        "reservationKey": "reservation-1",
+        "claims": {},
+    }
     state = "initialized"
     _time = 0.0
     _stop_time = 1.0
@@ -56,6 +62,8 @@ def dispatch(monkeypatch):
     monkeypatch.setattr(main.auth, "validate_gateway_context", lambda *_args: None)
     monkeypatch.setattr(main.auth, "extract_access_key_from_context", lambda context: context.get("accessKey") if context else None)
     monkeypatch.setattr(main.fmu_storage, "describe", lambda _key: {"modelName": "demo"})
+    monkeypatch.setattr(main, "_reserve_simulation_scenario", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(main._simulation_store, "reserve_input_update", Mock(return_value={}))
     session = Session()
 
     def call(message, gateway_context=None, selected_session=session, **kwargs):
@@ -213,7 +221,11 @@ def test_attach_requires_a_live_context_and_matching_session(dispatch, monkeypat
     with pytest.raises(HTTPException):
         call({"type": "session.attach", "sessionId": "route-session"}, {"accessKey": "demo.fmu"}, selected_session=None)
     monkeypatch.setattr(engine, "get_attachable_session", lambda _sid: session)
-    attached = call({"type": "session.attach", "sessionId": "route-session"}, {"accessKey": "demo.fmu"}, selected_session=None)
+    attached = call(
+        {"type": "session.attach", "sessionId": "route-session"},
+        {"accessKey": "demo.fmu", "labId": "lab-1", "reservationKey": "reservation-1"},
+        selected_session=None,
+    )
     assert attached["type"] == "session.attached"
     with pytest.raises(HTTPException) as exc:
         call({"type": "session.attach", "sessionId": "other"}, {"accessKey": "demo.fmu"})

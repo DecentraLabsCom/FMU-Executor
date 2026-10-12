@@ -590,6 +590,8 @@ def test_realtime_session_runs_in_a_real_spawned_process(monkeypatch, tmp_path):
 def bare_realtime_session():
     session = process_runner.RealtimeSession.__new__(process_runner.RealtimeSession)
     session.gateway_context = {}
+    session._output_read_lock = threading.Lock()
+    session._last_output_read_monotonic = None
     session._terminated = False
     session._attached = False
     session._attach_deadline = None
@@ -663,6 +665,54 @@ def test_realtime_rpc_methods_update_state_and_batch_subscriptions(monkeypatch, 
     session.terminate()
     assert session._closed and session.state == "terminated"
     assert connection.closed
+
+
+def test_realtime_output_reads_share_a_rate_limit(monkeypatch, tmp_path):
+    from app.engine import OutputSubscription
+
+    connection = FakeRealtimeConnection()
+    session = rpc_realtime_session(tmp_path, connection)
+    now = [50.0]
+    monkeypatch.setattr(process_runner.time, "monotonic", lambda: now[0])
+
+    assert session.output_read_wait_seconds(now=now[0]) == 0.0
+    first = session.get_outputs_limited([2])
+    assert first == {"outputs": {"y": 0.5}}
+    assert session.output_read_wait_seconds(now=now[0] + 0.001) > 0
+
+    with pytest.raises(process_runner.OutputReadRateLimitError) as limited:
+        session.get_outputs_limited([2])
+    assert limited.value.retry_after_ms > 0
+
+    session.subscription = OutputSubscription(variables=["y"], period_ms=1)
+    session._output_read_lock.acquire()
+    try:
+        assert session.output_read_wait_seconds(now=now[0]) >= 0.05
+        assert session.sample_subscription() is None
+    finally:
+        session._output_read_lock.release()
+
+    now[0] += 0.02
+    assert session.get_outputs_limited([2]) == {"outputs": {"y": 0.5}}
+
+
+def test_realtime_step_and_run_until_include_rate_limited_outputs(monkeypatch, tmp_path):
+    connection = FakeRealtimeConnection()
+    session = rpc_realtime_session(tmp_path, connection)
+    now = [80.0]
+    monkeypatch.setattr(process_runner.time, "monotonic", lambda: now[0])
+
+    step_result, step_outputs = session.step_with_outputs(0.25)
+    assert step_result["time"] == 0.5
+    assert step_outputs == {"outputs": {"y": 0.5}}
+
+    now[0] += 0.02
+    run_result, run_outputs = session.run_until_with_outputs(1.0, 0.1)
+    assert run_result["time"] == 0.5
+    assert run_outputs == {"outputs": {"y": 0.5}}
+    assert [request["method"] for request in connection.requests] == [
+        "step", "get_outputs", "run_until", "get_outputs",
+    ]
 
 
 def test_realtime_rpc_rejects_closed_dead_expired_and_malformed_workers(monkeypatch, tmp_path):
