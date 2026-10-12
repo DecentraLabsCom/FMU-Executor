@@ -47,6 +47,14 @@ class ProcessExecutionError(RuntimeError):
         self.retryable = retryable
 
 
+class OutputReadRateLimitError(Exception):
+    """A realtime session attempted an output read before its interval elapsed."""
+
+    def __init__(self, retry_after_ms: int):
+        super().__init__("Realtime output reads exceeded the per-session rate limit")
+        self.retry_after_ms = retry_after_ms
+
+
 _REALTIME_METHODS = {
     "load",
     "initialize",
@@ -334,6 +342,8 @@ class RealtimeSession:
         self._pending_samples: list[dict[str, Any]] = []
         self._pending_queue_drops = 0
         self._lock = threading.RLock()
+        self._output_read_lock = threading.Lock()
+        self._last_output_read_monotonic: float | None = None
         self._sequence_lock = threading.Lock()
         self._closed = False
         self._request_counter = 0
@@ -571,6 +581,68 @@ class RealtimeSession:
     def get_outputs(self, refs: list[int] | None = None) -> dict[str, Any]:
         return self._rpc("get_outputs", refs)
 
+    def _begin_output_read(self, *, blocking: bool) -> tuple[bool, int | None]:
+        if not self._output_read_lock.acquire(blocking=blocking):
+            return False, None
+        min_interval = 1.0 / config.MAX_OUTPUT_SUBSCRIPTION_HZ
+        if self._last_output_read_monotonic is not None:
+            remaining = min_interval - (time.monotonic() - self._last_output_read_monotonic)
+            if remaining > 0:
+                self._output_read_lock.release()
+                return False, max(1, math.ceil(remaining * 1000))
+        return True, None
+
+    def _finish_output_read(self) -> None:
+        self._last_output_read_monotonic = time.monotonic()
+        self._output_read_lock.release()
+
+    def output_read_wait_seconds(self, now: float | None = None) -> float:
+        now = time.monotonic() if now is None else now
+        min_interval = 1.0 / config.MAX_OUTPUT_SUBSCRIPTION_HZ
+        if not self._output_read_lock.acquire(blocking=False):
+            return max(0.05, min_interval)
+        try:
+            if self._last_output_read_monotonic is None:
+                return 0.0
+            elapsed = now - self._last_output_read_monotonic
+            return max(0.0, min_interval - elapsed)
+        finally:
+            self._output_read_lock.release()
+
+    def _acquire_output_read_or_raise(self) -> None:
+        acquired, retry_after_ms = self._begin_output_read(blocking=True)
+        if not acquired:
+            raise OutputReadRateLimitError(retry_after_ms or 1)
+
+    def get_outputs_limited(self, refs: list[int] | None = None) -> dict[str, Any]:
+        self._acquire_output_read_or_raise()
+        try:
+            return self.get_outputs(refs)
+        finally:
+            self._finish_output_read()
+
+    def step_with_outputs(self, step_size: float | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
+        self._acquire_output_read_or_raise()
+        try:
+            step_result = self.step(step_size)
+            outputs = self.get_outputs()
+            return step_result, outputs
+        finally:
+            self._finish_output_read()
+
+    def run_until_with_outputs(
+        self,
+        target_time: float,
+        step_size: float | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        self._acquire_output_read_or_raise()
+        try:
+            run_result = self.run_until(target_time, step_size=step_size)
+            outputs = self.get_outputs()
+            return run_result, outputs
+        finally:
+            self._finish_output_read()
+
     def pause(self) -> dict[str, Any]:
         return self._rpc("pause")
 
@@ -592,14 +664,20 @@ class RealtimeSession:
             return None
         if subscription.seconds_until_due() > 0:
             return None
-        variable_refs = None
-        if subscription.variables is not None and self._md:
-            names = set(subscription.variables)
-            variable_refs = [
-                variable.valueReference for variable in self._md.modelVariables
-                if variable.name in names and variable.causality == "output"
-            ]
-        sample = self.get_outputs(variable_refs)["outputs"]
+        acquired, _ = self._begin_output_read(blocking=False)
+        if not acquired:
+            return None
+        try:
+            variable_refs = None
+            if subscription.variables is not None and self._md:
+                names = set(subscription.variables)
+                variable_refs = [
+                    variable.valueReference for variable in self._md.modelVariables
+                    if variable.name in names and variable.causality == "output"
+                ]
+            sample = self.get_outputs(variable_refs)["outputs"]
+        finally:
+            self._finish_output_read()
         if self.subscription is not subscription:
             return None
         self._pending_samples.append(sample)

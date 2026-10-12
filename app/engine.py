@@ -45,10 +45,13 @@ class OutputSubscription:
 
     def min_interval_seconds(self) -> float:
         period_interval = max(1, self.period_ms) / 1000.0
-        hz_interval = 0.0
-        if self.max_hz is not None and self.max_hz > 0:
-            hz_interval = 1.0 / self.max_hz
-        return max(period_interval, hz_interval)
+        requested_hz_interval = (
+            1.0 / self.max_hz
+            if self.max_hz is not None and self.max_hz > 0
+            else 0.0
+        )
+        configured_hz_interval = 1.0 / config.MAX_OUTPUT_SUBSCRIPTION_HZ
+        return max(period_interval, requested_hz_interval, configured_hz_interval)
 
     def seconds_until_due(self, now: float | None = None) -> float:
         now = _time.monotonic() if now is None else now

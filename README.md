@@ -88,11 +88,11 @@ the Gateway environment expected for station mode:
 | `FMU_WORKER_FILE_MIB` | `128` | Linux per-file write limit; Windows AppContainer workers have no per-file quota |
 | `FMU_EXECUTOR_COMMIT` | Build metadata | Source commit recorded in execution evidence |
 | `FMU_MAX_INPUT_UPDATE_BYTES` | `65536` | Maximum JSON size for one `sim.setInputs` update |
-| `FMU_MAX_INPUT_UPDATES_PER_DAY` | `10000` | Daily runtime input update limit per reservation and FMU |
+| `FMU_MAX_INPUT_UPDATES_PER_DAY` | `100000` | Daily runtime input update limit per reservation and FMU |
 | `FMU_MAX_INPUT_UPDATE_BYTES_PER_DAY` | `67108864` | Daily input payload limit per reservation and FMU |
 | `FMU_MAX_INPUT_UPDATES_PER_WINDOW` | `30` | Short-window input update burst limit |
 | `FMU_INPUT_UPDATE_WINDOW_SECONDS` | `10` | Window for the input update burst limit |
-| `FMU_MAX_OUTPUT_SUBSCRIPTION_HZ` | `60` | Maximum requested output subscription rate |
+| `FMU_MAX_OUTPUT_SUBSCRIPTION_HZ` | `60` | Per-session cap for realtime output reads and samples |
 | `FMU_MAX_OUTPUT_SUBSCRIPTION_BATCH` | `256` | Maximum retained samples in a subscription batch |
 | `FMU_PROGRESS_INTERVAL_MS` | `50` | Minimum interval between automatic progress messages |
 | `FMU_OMSIMULATOR_ENABLED` | `false` | Enables OMSimulator discovery for the future composition backend; does not switch current execution automatically |
@@ -184,15 +184,24 @@ The FMI proxy uses `sim.reset` with `deferInitialization: true` so a subsequent
 FMI 3 event mode is negotiated with the FMU and resolved inside the isolated
 Executor before returning a step. Step responses include the last successful
 simulation time, early-return/termination flags, and whether an event occurred.
-Automatic progress messages are throttled independently of `stepSize`; output
-subscriptions have their own `periodMs`, `maxHz` and batch-size limits.
+Automatic progress messages are throttled independently of `stepSize`. Realtime
+output reads share the `FMU_MAX_OUTPUT_SUBSCRIPTION_HZ` cap per session across
+subscriptions, direct `sim.getOutputs` calls, and the output responses from
+`sim.step` and `sim.runUntil`. Subscription `periodMs` and `maxHz` can request a
+lower rate but cannot exceed the configured cap. A direct read, step or
+`runUntil` request that arrives too soon returns a retryable
+`OUTPUT_READ_RATE_LIMITED` error with `retryAfterMs`.
+After that delay, retry through Lab Gateway with a new `requestId`; the Gateway
+replays responses for request IDs it has already seen.
 
 Simulation scenarios and runtime input updates use separate budgets. The
 existing scenario limit remains 100 per reservation per UTC day by default.
-Input quotas are tracked by reservation and FMU: 10,000 updates and 64 MiB per
+Input quotas are tracked by reservation and FMU: 100,000 updates and 64 MiB per
 day, 30 updates per 10-second window, and 64 KiB per update by default. These
 limits are globally configurable with the environment variables above; a
-`sim.setInputs` call no longer spends a simulation scenario.
+`sim.setInputs` call no longer spends a simulation scenario. Runtime input
+updates require a valid reservation scope (`labId` and `reservationKey`); the
+Executor rejects non-empty `sim.setInputs` requests when that scope is missing.
 
 ### Admission, expiry, isolation, and execution evidence
 

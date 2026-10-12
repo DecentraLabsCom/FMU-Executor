@@ -381,19 +381,13 @@ def _reserve_simulation_scenario(
 
 def _reserve_input_update(context: dict[str, Any] | None, access_key: str, values: dict[str, Any]) -> None:
     if not isinstance(context, dict):
-        return
-    claims = context.get("claims") or {}
-    if not isinstance(claims, dict):
-        claims = {}
-    lab_id = context.get("labId") or claims.get("labId")
-    reservation_key = context.get("reservationKey") or claims.get("reservationKey")
-    if not lab_id or not reservation_key:
-        return
+        raise HTTPException(status_code=403, detail="RESERVATION_SCOPE_REQUIRED")
+    scope_key = _scope_key(context, access_key)
     try:
         payload_bytes = len(
             json.dumps(values, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
         )
-        _simulation_store.reserve_input_update(_scope_key(context, access_key), access_key, payload_bytes)
+        _simulation_store.reserve_input_update(scope_key, access_key, payload_bytes)
     except InputUpdateQuotaExceededError as exc:
         raise HTTPException(
             status_code=429,
@@ -958,6 +952,9 @@ async def ws_sessions(ws: WebSocket):
                     continue
 
                 wait_seconds = subscription.seconds_until_due()
+                read_waiter = getattr(active_session, "output_read_wait_seconds", None)
+                if callable(read_waiter):
+                    wait_seconds = max(wait_seconds, read_waiter())
                 if wait_seconds > 0:
                     try:
                         await asyncio.wait_for(_output_sampler_changed.wait(), timeout=wait_seconds)
@@ -1041,11 +1038,12 @@ async def ws_sessions(ws: WebSocket):
                     err: dict[str, Any] = {
                         "type": "error",
                         "code": code,
-                        "message": message,
-                        "retryable": False,
+                        "message": detail.get("message") or message,
+                        "retryable": bool(detail.get("retryable", False)),
                     }
-                    if "remaining" in detail:
-                        err["remaining"] = detail.get("remaining")
+                    for field in ("remaining", "retryAfterMs"):
+                        if field in detail:
+                            err[field] = detail.get(field)
                 else:
                     # Extract short code from detail strings like "INVALID_COMMAND – ..."
                     code = detail.split(" \u2013 ")[0].split(" - ")[0].strip() if detail else "ERROR"
@@ -1114,6 +1112,18 @@ def _sim_outputs_payload(
             if key in metadata:
                 payload[key] = metadata[key]
     return payload
+
+
+def _output_read_rate_limit_exception(exc: process_runner.OutputReadRateLimitError) -> HTTPException:
+    return HTTPException(
+        status_code=429,
+        detail={
+            "code": "OUTPUT_READ_RATE_LIMITED",
+            "message": str(exc),
+            "retryable": True,
+            "retryAfterMs": exc.retry_after_ms,
+        },
+    )
 
 
 async def _handle_ws_message(
@@ -1412,12 +1422,18 @@ async def _handle_ws_message(
                 if abs(requested_current_time - session._time) > tolerance:
                     raise ValueError("currentCommunicationPoint does not match the session time")
             delta = _strict_number(step_size, "deltaT") if step_size is not None else None
-            step_result = await asyncio.to_thread(session.step, delta)
+            step_with_outputs = getattr(session, "step_with_outputs", None)
+            if callable(step_with_outputs):
+                step_result, outputs = await asyncio.to_thread(step_with_outputs, delta)
+            else:
+                step_result = await asyncio.to_thread(session.step, delta)
+                outputs = await asyncio.to_thread(session.get_outputs)
+        except process_runner.OutputReadRateLimitError as exc:
+            raise _output_read_rate_limit_exception(exc) from exc
         except (TypeError, ValueError) as exc:
             raise HTTPException(400, f"INVALID_STEP - {exc}") from exc
         except RuntimeError as exc:
             raise HTTPException(409, f"INVALID_SESSION_STATE - {exc}") from exc
-        outputs = await asyncio.to_thread(session.get_outputs)
         return _sim_outputs_payload(session, outputs["outputs"], step_result)
 
     if msg_type == "sim.runUntil":
@@ -1428,16 +1444,32 @@ async def _handle_ws_message(
             raise HTTPException(409, "EXTERNAL_STEP_MODE")
         step_size = msg.get("stepSize", msg.get("deltaT"))
         try:
-            run_result = await asyncio.to_thread(
-                session.run_until,
-                _strict_number(target, "targetTime"),
-                step_size=_strict_number(step_size, "stepSize") if step_size is not None else None,
+            target_time = _strict_number(target, "targetTime")
+            requested_step_size = (
+                _strict_number(step_size, "stepSize")
+                if step_size is not None
+                else None
             )
+            run_until_with_outputs = getattr(session, "run_until_with_outputs", None)
+            if callable(run_until_with_outputs):
+                run_result, outputs = await asyncio.to_thread(
+                    run_until_with_outputs,
+                    target_time,
+                    requested_step_size,
+                )
+            else:
+                run_result = await asyncio.to_thread(
+                    session.run_until,
+                    target_time,
+                    step_size=requested_step_size,
+                )
+                outputs = await asyncio.to_thread(session.get_outputs)
+        except process_runner.OutputReadRateLimitError as exc:
+            raise _output_read_rate_limit_exception(exc) from exc
         except (TypeError, ValueError) as exc:
             raise HTTPException(400, f"INVALID_RUN_UNTIL - {exc}") from exc
         except RuntimeError as exc:
             raise HTTPException(409, f"INVALID_SESSION_STATE - {exc}") from exc
-        outputs = await asyncio.to_thread(session.get_outputs)
         return _sim_outputs_payload(session, outputs["outputs"], run_result)
 
     if msg_type == "sim.setInputs":
@@ -1491,7 +1523,14 @@ async def _handle_ws_message(
                 or any(isinstance(ref, bool) or not isinstance(ref, int) for ref in refs)
             ):
                 raise HTTPException(400, "INVALID_VALUE_REFERENCES")
-        result = await asyncio.to_thread(session.get_outputs, refs)
+        limited_get_outputs = getattr(session, "get_outputs_limited", None)
+        try:
+            if callable(limited_get_outputs):
+                result = await asyncio.to_thread(limited_get_outputs, refs)
+            else:
+                result = await asyncio.to_thread(session.get_outputs, refs)
+        except process_runner.OutputReadRateLimitError as exc:
+            raise _output_read_rate_limit_exception(exc) from exc
         return _sim_outputs_payload(session, result["outputs"])
 
     if msg_type == "sim.subscribeOutputs":
@@ -1514,7 +1553,11 @@ async def _handle_ws_message(
                 raise ValueError("maxBatchSize must be an integer")
             period_ms = period_value
             max_batch_size = batch_value
-            max_hz = _strict_number(msg["maxHz"], "maxHz") if msg.get("maxHz") is not None else None
+            max_hz = (
+                _strict_number(msg["maxHz"], "maxHz")
+                if msg.get("maxHz") is not None
+                else float(config.MAX_OUTPUT_SUBSCRIPTION_HZ)
+            )
         except (TypeError, ValueError) as exc:
             raise HTTPException(400, "INVALID_OUTPUT_SUBSCRIPTION") from exc
         if (

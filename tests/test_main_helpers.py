@@ -87,7 +87,11 @@ def test_scenario_reservation_handles_optional_scope_success_and_quota(monkeypat
 
 def test_input_reservation_validates_payload_and_maps_quota(monkeypatch):
     context = {"labId": "lab-1", "reservationKey": "reservation-1"}
-    main._reserve_input_update(None, "model.fmu", {"input": 1})
+    with pytest.raises(HTTPException) as missing_scope:
+        main._reserve_input_update(None, "model.fmu", {"input": 1})
+    assert missing_scope.value.status_code == 403
+    assert missing_scope.value.detail == "RESERVATION_SCOPE_REQUIRED"
+
     monkeypatch.setattr(main, "_scope_key", lambda *_args: "scope-key")
     reserve = Mock(return_value={"remaining": 4})
     monkeypatch.setattr(main._simulation_store, "reserve_input_update", reserve)
