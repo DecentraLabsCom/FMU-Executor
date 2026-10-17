@@ -2,6 +2,8 @@ name: FMU Executor Tests
 
 on:
   push:
+    branches: [main]
+    tags: ["v*.*.*"]
   pull_request:
 
 concurrency:
