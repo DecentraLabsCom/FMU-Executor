@@ -60,7 +60,7 @@ The same integration is visible from the Lab Station **Connectors** panel,
 which reports the FMU endpoint, local model directory, port, token status, and
 the Gateway environment expected for station mode:
 
-![Lab Station FMI/FMU connector](../docs/images/labstation-connectors-fmi.png)
+![Lab Station FMI/FMU connector](docs/images/labstation-connectors-fmi.png)
 
 *FMI/FMU connector view from the Lab Station desktop UI.*
 
