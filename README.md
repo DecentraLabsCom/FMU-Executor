@@ -125,6 +125,7 @@ All endpoints require `X-Internal-Session-Token` header (except `/internal/healt
 | GET | `/internal/health` | Health & diagnostics |
 | GET | `/internal/fmu/catalog` | FMU inventory; `X-FMU-Access-Key` header |
 | GET | `/internal/fmu/describe` | Model description; `X-FMU-Access-Key` header |
+| GET | `/internal/fmu/companion-scene` | Same-stem `.glb` for an FMU; requires both internal and FMU access-key headers |
 | GET | `/internal/fmu/capacity` | Effective execution capacity; internal token required |
 | POST | `/internal/fmu/validate/{access_key}?auto_quarantine=false&probe=false` | Reports archive, station compatibility, and an optional isolated execution probe |
 | POST | `/internal/fmu/quarantine/{access_key}?reason=manual` | Explicitly quarantines an FMU |
@@ -142,6 +143,11 @@ All endpoints require `X-Internal-Session-Token` header (except `/internal/healt
 
 `catalog` and `describe` also require the `X-FMU-Access-Key` header. The
 `access_key` path segment is URL-encoded when it contains nested directories.
+`companion-scene` uses that same access key to resolve a sibling `.glb` inside
+`FMU_ROOT`, returns `model/gltf-binary`, and rejects missing, out-of-root, or
+over-50-MiB scenes. Lab Gateway uses the route when the configured FMU backend
+is a Lab Station; local Gateway mode reads its companion scene from local
+`fmu-data`.
 
 `GET /internal/fmu/backends` reports the active FMPy backend and the planned
 OMSimulator backend. The same information is included in `/internal/health`.
@@ -454,6 +460,23 @@ fmu-data/
   my-model/
     model.fmu          # accessKey = "my-model"
 ```
+
+The reproducible FMI 2.0 Smart Factory Cell demo is in
+[`examples/smart-factory-cell`](examples/smart-factory-cell/README.md). Build its
+Windows x64 FMU with the included PowerShell script or its Linux x64 FMU with
+the included Bash script. The Windows Lab Station release ships the reviewed
+artifact as `fmu-executor/fmu-data/SmartFactoryCell.fmu`; Gateway local
+development uses the Linux x64 artifact under the same access key. Lab Station
+packages the Windows build from this source.
+
+The previous Gateway FMI example models are now canonical in
+[`examples/reference-fmus`](examples/reference-fmus/README.md). Their FMU
+archives include Linux x64 binaries; FMI 2 uses `linux64` and FMI 3 uses
+`x86_64-linux`. `BinaryClockTest.fmu` now includes both Windows and Linux x64
+builds, generated from its included source. Gateway refreshes all development
+copies, including Smart Factory, with `Lab Gateway/scripts/sync_fmu_examples.py`.
+The example directories document their sources, licenses, builds and platform
+variants.
 
 ## Tests
 

@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<fmiModelDescription
+    fmiVersion="3.0"
+    modelName="BinaryClockTest"
+    instantiationToken="{bct-test-guid-0001}"
+    description="Minimal FMI 3 test model with Binary and Clock variable types"
+    generationTool="DecentraLabs test harness"
+    variableNamingConvention="flat">
+
+  <CoSimulation
+      modelIdentifier="BinaryClockTest"
+      canHandleVariableCommunicationStepSize="true"
+      canGetAndSetFMUState="false"
+      canSerializeFMUState="false"/>
+
+  <ModelVariables>
+    <!-- Independent variable: simulation time -->
+    <Float64 name="time"
+             valueReference="4"
+             causality="independent"
+             variability="continuous"/>
+
+    <!-- Binary input: raw byte payload written by the environment -->
+    <Binary name="dataIn"
+            valueReference="0"
+            causality="input"
+            variability="discrete">
+      <Start value="010203"/>
+    </Binary>
+
+    <!-- Binary output: echoes dataIn with a 1-byte length prefix -->
+    <Binary name="dataOut"
+            valueReference="1"
+            causality="output"
+            variability="discrete"/>
+
+    <!-- Clock output: periodic heartbeat, ticks every 10 doStep calls -->
+    <Clock name="heartbeat"
+           valueReference="2"
+           causality="output"
+           variability="discrete"
+           intervalVariability="constant"/>
+
+    <!-- Float64 output: step counter -->
+    <Float64 name="stepCount"
+             valueReference="3"
+             causality="output"
+             variability="discrete"
+             initial="exact"
+             start="0"/>
+  </ModelVariables>
+
+  <ModelStructure>
+    <Output valueReference="1"/>
+    <Output valueReference="2"/>
+    <Output valueReference="3"/>
+  </ModelStructure>
+
+</fmiModelDescription>

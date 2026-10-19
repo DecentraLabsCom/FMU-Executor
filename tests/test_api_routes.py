@@ -53,6 +53,80 @@ def install_fake_fmu(monkeypatch, tmp_path):
     return path
 
 
+def test_companion_scene_requires_the_internal_token_and_access_key(route_client):
+    client, headers = route_client
+
+    unauthorized = client.get(
+        "/internal/fmu/companion-scene",
+        headers={"X-FMU-Access-Key": "demo.fmu"},
+    )
+    missing_key = client.get("/internal/fmu/companion-scene", headers=headers)
+
+    assert unauthorized.status_code == 401
+    assert missing_key.status_code == 422
+
+
+def test_companion_scene_returns_the_sibling_glb(route_client):
+    client, headers = route_client
+    fmu_path = config.FMU_ROOT / "provider" / "SmartFactoryCell.fmu"
+    write_test_fmu(fmu_path)
+    scene_path = fmu_path.with_suffix(".glb")
+    scene_path.write_bytes(b"glTF demo scene")
+
+    response = client.get(
+        "/internal/fmu/companion-scene",
+        headers={**headers, "X-FMU-Access-Key": "provider/SmartFactoryCell.fmu"},
+    )
+
+    assert response.status_code == 200
+    assert response.content == b"glTF demo scene"
+    assert response.headers["content-type"] == "model/gltf-binary"
+    assert response.headers["cache-control"] == "private, no-store"
+
+
+def test_companion_scene_returns_not_found_when_fmu_or_scene_is_missing(route_client):
+    client, headers = route_client
+    request_headers = {**headers, "X-FMU-Access-Key": "SmartFactoryCell.fmu"}
+
+    assert client.get("/internal/fmu/companion-scene", headers=request_headers).status_code == 404
+
+    write_test_fmu(config.FMU_ROOT / "SmartFactoryCell.fmu")
+    assert client.get("/internal/fmu/companion-scene", headers=request_headers).status_code == 404
+
+
+def test_companion_scene_rejects_unsafe_keys_and_paths_outside_fmu_root(route_client, monkeypatch, tmp_path):
+    client, headers = route_client
+    invalid_key = client.get(
+        "/internal/fmu/companion-scene",
+        headers={**headers, "X-FMU-Access-Key": "../outside.fmu"},
+    )
+    outside_fmu = write_test_fmu(tmp_path / "outside.fmu")
+    outside_fmu.with_suffix(".glb").write_bytes(b"outside scene")
+    monkeypatch.setattr(fmu_storage, "get_fmu_path", lambda _key: outside_fmu)
+    outside_path = client.get(
+        "/internal/fmu/companion-scene",
+        headers={**headers, "X-FMU-Access-Key": "demo.fmu"},
+    )
+
+    assert invalid_key.status_code == 400
+    assert outside_path.status_code == 404
+
+
+def test_companion_scene_enforces_the_response_size_limit(route_client, monkeypatch):
+    client, headers = route_client
+    fmu_path = config.FMU_ROOT / "SmartFactoryCell.fmu"
+    write_test_fmu(fmu_path)
+    fmu_path.with_suffix(".glb").write_bytes(b"scene-too-large")
+    monkeypatch.setattr(main, "MAX_COMPANION_SCENE_BYTES", 8)
+
+    response = client.get(
+        "/internal/fmu/companion-scene",
+        headers={**headers, "X-FMU-Access-Key": "SmartFactoryCell.fmu"},
+    )
+
+    assert response.status_code == 413
+
+
 @pytest.mark.parametrize(("backend", "status"), [("unknown", 400), ("omsimulator", 501)])
 def test_simulation_routes_reject_unavailable_backends_before_allocating(route_client, monkeypatch, tmp_path, backend, status):
     client, headers = route_client

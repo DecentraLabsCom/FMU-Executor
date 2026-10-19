@@ -27,7 +27,7 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 
@@ -55,7 +55,8 @@ from .reproducibility import (
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="FMU Executor", version="0.2.1", docs_url=None, redoc_url=None)
+app = FastAPI(title="FMU Executor", version="0.3.0", docs_url=None, redoc_url=None)
+MAX_COMPANION_SCENE_BYTES = 50 * 1024 * 1024
 _session_cleanup_task: asyncio.Task | None = None
 _simulation_store = SimulationStore()
 _simulation_jobs = SimulationJobManager(_simulation_store)
@@ -180,6 +181,39 @@ async def catalog(access_key: str = Header(..., alias="X-FMU-Access-Key")):
         "fmus": [{"filename": access_key, "path": access_key, "source": "station"}],
         "describe": desc,
     }
+
+
+@app.get("/internal/fmu/companion-scene", dependencies=[Depends(_check_token)])
+async def companion_scene(access_key: str = Header(..., alias="X-FMU-Access-Key")):
+    """Return the same-stem GLB for an FMU to the authenticated Gateway."""
+    access_key = _validated_access_key(access_key)
+    try:
+        root = config.FMU_ROOT.resolve(strict=True)
+        fmu_path = fmu_storage.get_fmu_path(access_key).resolve(strict=True)
+        fmu_path.relative_to(root)
+        scene_path = fmu_path.with_suffix(".glb").resolve(strict=True)
+        scene_path.relative_to(root)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=404, detail="COMPANION_SCENE_NOT_FOUND") from exc
+
+    try:
+        if not scene_path.is_file():
+            raise HTTPException(status_code=404, detail="COMPANION_SCENE_NOT_FOUND")
+        with scene_path.open("rb") as scene_file:
+            content = scene_file.read(MAX_COMPANION_SCENE_BYTES + 1)
+    except HTTPException:
+        raise
+    except OSError as exc:
+        raise HTTPException(status_code=503, detail="COMPANION_SCENE_UNAVAILABLE") from exc
+
+    if len(content) > MAX_COMPANION_SCENE_BYTES:
+        raise HTTPException(status_code=413, detail="COMPANION_SCENE_TOO_LARGE")
+
+    return Response(
+        content=content,
+        media_type="model/gltf-binary",
+        headers={"Cache-Control": "private, no-store"},
+    )
 
 
 # ── Describe ─────────────────────────────────────────────────────
