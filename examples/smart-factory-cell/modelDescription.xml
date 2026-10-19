@@ -35,25 +35,25 @@
     <ScalarVariable name="rejectNext" valueReference="3" description="Route the next completed part to the reject bin." causality="input" variability="discrete" initial="exact">
       <Boolean start="false" />
     </ScalarVariable>
-    <ScalarVariable name="productPosition" valueReference="4" description="Position of the current part along the conveyor." causality="output" variability="continuous" initial="calculated">
+    <ScalarVariable name="productPosition" valueReference="4" description="Position of the current part along the conveyor." causality="output" variability="continuous" initial="exact">
       <Real start="0" min="0" max="3" unit="m" />
     </ScalarVariable>
-    <ScalarVariable name="robotAngle" valueReference="5" description="Robot shoulder angle during pick and place." causality="output" variability="continuous" initial="calculated">
+    <ScalarVariable name="robotAngle" valueReference="5" description="Robot shoulder angle during pick and place." causality="output" variability="continuous" initial="exact">
       <Real start="0" min="-1.2" max="0.2" unit="rad" />
     </ScalarVariable>
-    <ScalarVariable name="productPresent" valueReference="6" description="The tracked part is present in the cell." causality="output" variability="discrete" initial="calculated">
+    <ScalarVariable name="productPresent" valueReference="6" description="The tracked part is present in the cell." causality="output" variability="discrete" initial="exact">
       <Boolean start="true" />
     </ScalarVariable>
-    <ScalarVariable name="alarm" valueReference="7" description="Conveyor jam alarm for the stack light." causality="output" variability="discrete" initial="calculated">
+    <ScalarVariable name="alarm" valueReference="7" description="Conveyor jam alarm for the stack light." causality="output" variability="discrete" initial="exact">
       <Boolean start="false" />
     </ScalarVariable>
-    <ScalarVariable name="goodParts" valueReference="8" description="Number of accepted parts." causality="output" variability="discrete" initial="calculated">
+    <ScalarVariable name="goodParts" valueReference="8" description="Number of accepted parts." causality="output" variability="discrete" initial="exact">
       <Integer start="0" min="0" />
     </ScalarVariable>
-    <ScalarVariable name="rejectedParts" valueReference="9" description="Number of rejected parts." causality="output" variability="discrete" initial="calculated">
+    <ScalarVariable name="rejectedParts" valueReference="9" description="Number of rejected parts." causality="output" variability="discrete" initial="exact">
       <Integer start="0" min="0" />
     </ScalarVariable>
-    <ScalarVariable name="sortOffset" valueReference="10" description="Sorter gate angle: negative routes to reject, positive routes to accepted output." causality="output" variability="continuous" initial="calculated">
+    <ScalarVariable name="sortOffset" valueReference="10" description="Sorter gate angle: negative routes to reject, positive routes to accepted output." causality="output" variability="continuous" initial="exact">
       <Real start="0" min="-0.8" max="0.8" unit="rad" />
     </ScalarVariable>
   </ModelVariables>

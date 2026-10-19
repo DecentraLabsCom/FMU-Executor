@@ -55,7 +55,7 @@ from .reproducibility import (
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="FMU Executor", version="0.3.0", docs_url=None, redoc_url=None)
+app = FastAPI(title="FMU Executor", version="0.3.1", docs_url=None, redoc_url=None)
 MAX_COMPANION_SCENE_BYTES = 50 * 1024 * 1024
 _session_cleanup_task: asyncio.Task | None = None
 _simulation_store = SimulationStore()

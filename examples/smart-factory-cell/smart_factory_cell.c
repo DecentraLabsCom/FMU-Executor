@@ -8,9 +8,12 @@ typedef const char* fmi2String;
 typedef double fmi2Real;
 typedef int fmi2Integer;
 typedef int fmi2Boolean;
+typedef unsigned char fmi2Byte;
 typedef unsigned int fmi2ValueReference;
 typedef enum { fmi2OK = 0, fmi2Warning = 1, fmi2Discard = 2, fmi2Error = 3, fmi2Fatal = 4, fmi2Pending = 5 } fmi2Status;
 typedef enum { fmi2ModelExchange = 0, fmi2CoSimulation = 1 } fmi2Type;
+typedef enum { fmi2DoStepStatus = 0, fmi2PendingStatus = 1, fmi2LastSuccessfulTime = 2, fmi2Terminated = 3 } fmi2StatusKind;
+typedef void* fmi2FMUstate;
 typedef void (*fmi2CallbackLogger)(fmi2Component, fmi2String, fmi2Status, fmi2String, fmi2String, ...);
 typedef void* (*fmi2CallbackAllocateMemory)(size_t, size_t);
 typedef void (*fmi2CallbackFreeMemory)(void*);
@@ -170,4 +173,57 @@ EXPORT fmi2Status fmi2GetString(fmi2Component c, const fmi2ValueReference vr[], 
 }
 EXPORT fmi2Status fmi2SetString(fmi2Component c, const fmi2ValueReference vr[], size_t n, const fmi2String values[]) {
     (void)c; (void)vr; (void)n; (void)values; return fmi2Error;
+}
+
+/* FMI 2.0 requires these Co-Simulation symbols even when the corresponding
+   capabilities are declared unsupported in modelDescription.xml. */
+EXPORT fmi2Status fmi2CancelStep(fmi2Component c) {
+    (void)c; return fmi2Error;
+}
+EXPORT fmi2Status fmi2GetFMUstate(fmi2Component c, fmi2FMUstate* state) {
+    (void)c; (void)state; return fmi2Error;
+}
+EXPORT fmi2Status fmi2SetFMUstate(fmi2Component c, fmi2FMUstate state) {
+    (void)c; (void)state; return fmi2Error;
+}
+EXPORT fmi2Status fmi2FreeFMUstate(fmi2Component c, fmi2FMUstate* state) {
+    (void)c; (void)state; return fmi2Error;
+}
+EXPORT fmi2Status fmi2SerializedFMUstateSize(fmi2Component c, fmi2FMUstate state, size_t* size) {
+    (void)c; (void)state; (void)size; return fmi2Error;
+}
+EXPORT fmi2Status fmi2SerializeFMUstate(fmi2Component c, fmi2FMUstate state, fmi2Byte serializedState[], size_t size) {
+    (void)c; (void)state; (void)serializedState; (void)size; return fmi2Error;
+}
+EXPORT fmi2Status fmi2DeSerializeFMUstate(fmi2Component c, const fmi2Byte serializedState[], size_t size, fmi2FMUstate* state) {
+    (void)c; (void)serializedState; (void)size; (void)state; return fmi2Error;
+}
+EXPORT fmi2Status fmi2GetDirectionalDerivative(fmi2Component c, const fmi2ValueReference unknowns[], size_t unknownCount,
+                                                const fmi2ValueReference knowns[], size_t knownCount,
+                                                const fmi2Real knownDerivatives[], fmi2Real unknownDerivatives[]) {
+    (void)c; (void)unknowns; (void)unknownCount; (void)knowns; (void)knownCount;
+    (void)knownDerivatives; (void)unknownDerivatives; return fmi2Error;
+}
+EXPORT fmi2Status fmi2SetRealInputDerivatives(fmi2Component c, const fmi2ValueReference vr[], size_t n,
+                                              const fmi2Integer order[], const fmi2Real value[]) {
+    (void)c; (void)vr; (void)n; (void)order; (void)value; return fmi2Error;
+}
+EXPORT fmi2Status fmi2GetRealOutputDerivatives(fmi2Component c, const fmi2ValueReference vr[], size_t n,
+                                               const fmi2Integer order[], fmi2Real value[]) {
+    (void)c; (void)vr; (void)n; (void)order; (void)value; return fmi2Error;
+}
+EXPORT fmi2Status fmi2GetStatus(fmi2Component c, fmi2StatusKind kind, fmi2Status* value) {
+    (void)c; (void)kind; (void)value; return fmi2Error;
+}
+EXPORT fmi2Status fmi2GetRealStatus(fmi2Component c, fmi2StatusKind kind, fmi2Real* value) {
+    (void)c; (void)kind; (void)value; return fmi2Error;
+}
+EXPORT fmi2Status fmi2GetIntegerStatus(fmi2Component c, fmi2StatusKind kind, fmi2Integer* value) {
+    (void)c; (void)kind; (void)value; return fmi2Error;
+}
+EXPORT fmi2Status fmi2GetBooleanStatus(fmi2Component c, fmi2StatusKind kind, fmi2Boolean* value) {
+    (void)c; (void)kind; (void)value; return fmi2Error;
+}
+EXPORT fmi2Status fmi2GetStringStatus(fmi2Component c, fmi2StatusKind kind, fmi2String* value) {
+    (void)c; (void)kind; (void)value; return fmi2Error;
 }

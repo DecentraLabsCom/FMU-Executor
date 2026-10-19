@@ -890,6 +890,14 @@ class FmuSession:
             minimum = getattr(declared_type, "min", None)
         if maximum is None and declared_type is not None:
             maximum = getattr(declared_type, "max", None)
+        integer_value = isinstance(value, int) and not isinstance(value, bool)
+        try:
+            if minimum is not None:
+                minimum = int(minimum) if integer_value else float(minimum)
+            if maximum is not None:
+                maximum = int(maximum) if integer_value else float(maximum)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"Input '{var.name}' has an invalid declared numeric range") from exc
         if minimum is not None and value < minimum:
             raise ValueError(f"Input '{var.name}' is below its declared minimum")
         if maximum is not None and value > maximum:
