@@ -126,6 +126,7 @@ All endpoints require `X-Internal-Session-Token` header (except `/internal/healt
 | GET | `/internal/fmu/catalog` | FMU inventory; `X-FMU-Access-Key` header |
 | GET | `/internal/fmu/describe` | Model description; `X-FMU-Access-Key` header |
 | GET | `/internal/fmu/companion-asset?assetType=glb\|threejs-app` | Same-stem `.glb` or `.webapp.zip`; requires internal and FMU access-key headers |
+| GET | `/internal/fmu/companion-app/{asset_path}` | One safe file from the same-stem `.webapp.zip`; requires internal and FMU access-key headers |
 | GET | `/internal/fmu/capacity` | Effective execution capacity; internal token required |
 | POST | `/internal/fmu/validate/{access_key}?auto_quarantine=false&probe=false` | Reports archive, station compatibility, and an optional isolated execution probe |
 | POST | `/internal/fmu/quarantine/{access_key}?reason=manual` | Explicitly quarantines an FMU |
@@ -148,6 +149,11 @@ All endpoints require `X-Internal-Session-Token` header (except `/internal/healt
 rejects missing, out-of-root, or over-50-MiB assets. Lab Gateway uses the route
 when the configured FMU backend is a Lab Station; local Gateway mode reads the
 same companion files from local `fmu-data`.
+`companion-app` serves a bounded file directly from that ZIP without extracting
+it to disk. The local Smart Warehouse preview requests each Three.js asset
+through the Gateway and FMU Executor, so it does not need a separate static
+asset server. Production Three.js apps continue to use the Gateway's immutable
+`/digital-twin-apps/` storage.
 
 `GET /internal/fmu/backends` reports the active FMPy backend and the planned
 OMSimulator backend. The same information is included in `/internal/health`.

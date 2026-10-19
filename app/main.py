@@ -12,9 +12,13 @@ import hashlib
 import json
 import logging
 import math
+import re
 import secrets
 import threading
 import time
+import zipfile
+import zlib
+from pathlib import PurePosixPath
 from typing import Any, Callable, cast
 
 from fastapi import (
@@ -57,6 +61,28 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="FMU Executor", version="0.3.1", docs_url=None, redoc_url=None)
 MAX_COMPANION_ASSET_BYTES = 50 * 1024 * 1024
+MAX_COMPANION_APP_FILES = 332
+_COMPANION_APP_MEDIA_TYPES = {
+    ".bin": "application/octet-stream",
+    ".css": "text/css",
+    ".glb": "model/gltf-binary",
+    ".gltf": "model/gltf+json",
+    ".html": "text/html",
+    ".ico": "image/x-icon",
+    ".jpeg": "image/jpeg",
+    ".jpg": "image/jpeg",
+    ".js": "text/javascript",
+    ".json": "application/json",
+    ".mjs": "text/javascript",
+    ".png": "image/png",
+    ".svg": "image/svg+xml",
+    ".txt": "text/plain",
+    ".ttf": "font/ttf",
+    ".wasm": "application/wasm",
+    ".webp": "image/webp",
+    ".woff": "font/woff",
+    ".woff2": "font/woff2",
+}
 _session_cleanup_task: asyncio.Task | None = None
 _simulation_store = SimulationStore()
 _simulation_jobs = SimulationJobManager(_simulation_store)
@@ -225,6 +251,77 @@ async def companion_asset(
 
 
 # ── Describe ─────────────────────────────────────────────────────
+
+@app.get("/internal/fmu/companion-app/{asset_path:path}", dependencies=[Depends(_check_token)])
+async def companion_app_asset(
+    asset_path: str,
+    access_key: str = Header(..., alias="X-FMU-Access-Key"),
+):
+    """Serve one file from an FMU's sibling web application archive."""
+    access_key = _validated_access_key(access_key)
+    path_parts = asset_path.split("/")
+    if (
+        not asset_path
+        or "\\" in asset_path
+        or len(path_parts) > 8
+        or any(not part or part in {".", ".."} for part in path_parts)
+        or any(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", part) is None for part in path_parts)
+    ):
+        raise HTTPException(status_code=404, detail="COMPANION_APP_ASSET_NOT_FOUND")
+
+    normalized_path = PurePosixPath(asset_path).as_posix()
+    media_type = _COMPANION_APP_MEDIA_TYPES.get(PurePosixPath(normalized_path).suffix.lower())
+    if media_type is None:
+        raise HTTPException(status_code=404, detail="COMPANION_APP_ASSET_NOT_FOUND")
+
+    try:
+        root = config.FMU_ROOT.resolve(strict=True)
+        fmu_path = fmu_storage.get_fmu_path(access_key).resolve(strict=True)
+        fmu_path.relative_to(root)
+        archive_path = fmu_path.with_name(fmu_path.stem + ".webapp.zip").resolve(strict=True)
+        archive_path.relative_to(root)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=404, detail="COMPANION_APP_NOT_FOUND") from exc
+
+    try:
+        if not archive_path.is_file():
+            raise HTTPException(status_code=404, detail="COMPANION_APP_NOT_FOUND")
+        if archive_path.stat().st_size > MAX_COMPANION_ASSET_BYTES:
+            raise HTTPException(status_code=413, detail="COMPANION_APP_TOO_LARGE")
+        with zipfile.ZipFile(archive_path) as archive:
+            entries = archive.infolist()
+            if len(entries) > MAX_COMPANION_APP_FILES:
+                raise HTTPException(status_code=413, detail="COMPANION_APP_HAS_TOO_MANY_FILES")
+            matches = [
+                info for info in entries
+                if info.filename.casefold() == normalized_path.casefold()
+            ]
+            if len(matches) != 1 or matches[0].filename != normalized_path or matches[0].is_dir():
+                raise HTTPException(status_code=404, detail="COMPANION_APP_ASSET_NOT_FOUND")
+            info = matches[0]
+            file_mode = (info.external_attr >> 16) & 0o170000
+            if info.flag_bits & 0x1 or file_mode not in (0, 0o100000):
+                raise HTTPException(status_code=404, detail="COMPANION_APP_ASSET_NOT_FOUND")
+            if info.file_size > MAX_COMPANION_ASSET_BYTES:
+                raise HTTPException(status_code=413, detail="COMPANION_APP_ASSET_TOO_LARGE")
+            with archive.open(info) as source:
+                content = source.read(MAX_COMPANION_ASSET_BYTES + 1)
+    except HTTPException:
+        raise
+    except (OSError, zipfile.BadZipFile, RuntimeError, KeyError, EOFError, zlib.error) as exc:
+        raise HTTPException(status_code=400, detail="COMPANION_APP_ARCHIVE_INVALID") from exc
+
+    if len(content) > MAX_COMPANION_ASSET_BYTES:
+        raise HTTPException(status_code=413, detail="COMPANION_APP_ASSET_TOO_LARGE")
+    return Response(
+        content=content,
+        media_type=media_type,
+        headers={
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
 
 @app.get("/internal/fmu/describe", dependencies=[Depends(_check_token)])
 async def describe(access_key: str = Header(..., alias="X-FMU-Access-Key")):
