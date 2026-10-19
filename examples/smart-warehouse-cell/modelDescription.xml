@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<fmiModelDescription
+  fmiVersion="2.0"
+  modelName="DecentraLabs Smart Warehouse Cell"
+  guid="{3a923a08-a064-4c43-a4f5-4f297fa589de}"
+  description="Automated warehouse with an AGV, pick arm, conveyor, stock and safety alarm."
+  generationTool="DecentraLabs Smart Warehouse Cell example"
+  variableNamingConvention="flat"
+  numberOfEventIndicators="0">
+  <CoSimulation
+    modelIdentifier="SmartWarehouseCell"
+    needsExecutionTool="false"
+    canHandleVariableCommunicationStepSize="true"
+    canInterpolateInputs="false"
+    canGetAndSetFMUstate="false"
+    canSerializeFMUstate="false"
+    canNotUseMemoryManagementFunctions="true"
+    canRunAsynchronuously="false" />
+  <UnitDefinitions>
+    <Unit name="m"><BaseUnit m="1" /></Unit>
+    <Unit name="rad"><BaseUnit rad="1" /></Unit>
+    <Unit name="m_per_s"><BaseUnit m="1" s="-1" /></Unit>
+    <Unit name="percent"><BaseUnit /></Unit>
+  </UnitDefinitions>
+  <DefaultExperiment startTime="0" stopTime="45" stepSize="0.05" tolerance="1e-6" />
+  <ModelVariables>
+    <ScalarVariable name="conveyorSpeed" valueReference="0" description="Conveyor and AGV travel speed." causality="input" variability="continuous" initial="exact"><Real start="0.68" min="0" max="1.4" unit="m_per_s" /></ScalarVariable>
+    <ScalarVariable name="startStop" valueReference="1" description="Start or pause warehouse operations." causality="input" variability="discrete" initial="exact"><Boolean start="true" /></ScalarVariable>
+    <ScalarVariable name="jam" valueReference="2" description="Inject a safety stop and raise the warehouse alarm." causality="input" variability="discrete" initial="exact"><Boolean start="false" /></ScalarVariable>
+    <ScalarVariable name="rushOrder" valueReference="3" description="Prioritize the next order with a higher throughput setpoint." causality="input" variability="discrete" initial="exact"><Boolean start="false" /></ScalarVariable>
+    <ScalarVariable name="agvPosition" valueReference="4" description="Automated guided vehicle travel position." causality="output" variability="continuous" initial="exact"><Real start="0" min="0" max="7" unit="m" /></ScalarVariable>
+    <ScalarVariable name="robotAngle" valueReference="5" description="Pick arm rotation angle." causality="output" variability="continuous" initial="exact"><Real start="0.5" min="0.07" max="0.93" unit="rad" /></ScalarVariable>
+    <ScalarVariable name="packageOnAgv" valueReference="6" description="A package is loaded on the AGV." causality="output" variability="discrete" initial="exact"><Boolean start="true" /></ScalarVariable>
+    <ScalarVariable name="alarm" valueReference="7" description="Warehouse safety alarm." causality="output" variability="discrete" initial="exact"><Boolean start="false" /></ScalarVariable>
+    <ScalarVariable name="ordersPicked" valueReference="8" description="Number of orders picked by the warehouse cell." causality="output" variability="discrete" initial="exact"><Integer start="0" min="0" /></ScalarVariable>
+    <ScalarVariable name="forkHeight" valueReference="10" description="Fork lift height." causality="output" variability="continuous" initial="exact"><Real start="0.46" min="0.38" max="0.54" unit="m" /></ScalarVariable>
+    <ScalarVariable name="inventoryLevel" valueReference="11" description="Remaining inventory level as a percentage." causality="output" variability="discrete" initial="exact"><Real start="100" min="0" max="100" unit="percent" /></ScalarVariable>
+  </ModelVariables>
+  <ModelStructure>
+    <Outputs>
+      <Unknown index="5" dependencies="1 2 3 4" />
+      <Unknown index="6" dependencies="1 2 3 4" />
+      <Unknown index="7" dependencies="1 2 3 4" />
+      <Unknown index="8" dependencies="1 2 3 4" />
+      <Unknown index="9" dependencies="1 2 3 4" />
+      <Unknown index="10" dependencies="1 2 3 4" />
+      <Unknown index="11" dependencies="1 2 3 4" />
+    </Outputs>
+  </ModelStructure>
+</fmiModelDescription>

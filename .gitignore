@@ -11,4 +11,7 @@ state/
 *.sqlite3-wal
 fmu-data/*
 !fmu-data/.gitkeep
+examples/smart-warehouse-cell/.build*/
+examples/smart-warehouse-cell/webapp/vendor/
+examples/smart-warehouse-cell/webapp/warehouse.glb
 .coverage

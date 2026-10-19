@@ -30,7 +30,7 @@ parent `examples` directory as `--examples-root`. Lab Station's release
 packager copies the Windows x64 artifact directly from this canonical example.
 The Linux Lab Station amd64 release packages the Linux x64 artifact and its
 same-stem GLB; the shared FMU Executor serves that scene to Gateway through the
-authenticated companion-scene endpoint. The Linux arm64 release omits this
+authenticated companion-asset endpoint. The Linux arm64 release omits this
 x86_64-only example.
 
 The Gateway development package keeps the FMU and standalone GLB together in
@@ -44,11 +44,13 @@ For another provider FMU, either host its self-contained GLB at a public HTTPS
 URL or upload it in the provider Gateway's Lab Manager `Digital Twin
 Management` panel. The Gateway upload keeps the scene in the provider's own
 public, read-only asset store and returns its URL for the AAS sync; it does not
-write to Marketplace. The Marketplace deployment must allow the provider
-Gateway origin in `CSP_CONNECT_SRC`, and the Gateway must allow the Marketplace
-origin in `CORS_ALLOWED_ORIGINS`. Each GLB node that should respond to an FMU
-output must carry an `extras.fmiBindings` entry; the viewer does not infer scene
-geometry or signal-to-node mappings from the FMU.
+write to Marketplace. Marketplace resolves Gateway-managed scenes against the
+lab's on-chain Gateway and loads them through a same-origin API, so the managed
+scene does not require per-Gateway Marketplace CSP or browser CORS changes.
+Public external HTTPS GLB URLs still require their origin in
+`CSP_CONNECT_SRC` and browser CORS permission. Each GLB node that should
+respond to an FMU output must carry an `extras.fmiBindings` entry; the viewer
+does not infer scene geometry or signal-to-node mappings from the FMU.
 Use a public asset URL without credentials or access tokens.
 
 The binding lives in the glTF node's `extras` object and refers to an output
@@ -100,14 +102,14 @@ reference. Lab Manager imports the same-stem scene from the active FMU backend
 automatically for this demo. For another model, its **Import companion GLB from
 FMU backend** action copies the scene into the provider Gateway's public asset
 store. The returned root-relative path is then saved in AAS as
-`digitalTwinSceneUrl`. Direct API clients can use the same sequence:
+`digitalTwinAssetUrl`. Direct API clients can use the same sequence:
 
 ```text
-POST /lab-admin/digital-twin-scenes/<labId>/from-fmu
+POST /lab-admin/digital-twin-assets/<labId>/from-fmu
 Content-Type: application/json
-{"accessKey":"SmartFactoryCell.fmu"}
+{"accessKey":"SmartFactoryCell.fmu","assetType":"glb"}
 
-POST /fmu/aas-admin/fmu/SmartFactoryCell.fmu/sync?labId=<labId>&digitalTwinSceneUrl=<url-encoded-path-from-import>
+POST /fmu/aas-admin/fmu/SmartFactoryCell.fmu/sync?labId=<labId>&digitalTwinAssetUrl=<url-encoded-path-from-import>
 ```
 
 Marketplace resolves the root-relative AAS File path against the lab's Gateway

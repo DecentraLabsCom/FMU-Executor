@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Smart Warehouse Control Deck</title>
+  <link rel="stylesheet" href="./styles.css">
+  <script type="module" src="./app.js"></script>
+</head>
+<body>
+  <main class="deck">
+    <header class="topbar">
+      <div class="brand"><span class="brand-mark">DL</span><div><p>DECENTRALABS · FMI / THREE.JS</p><h1>Smart Warehouse</h1></div></div>
+      <div class="live"><span class="pulse"></span><span id="connection">WAITING FOR SIMULATION</span></div>
+    </header>
+    <section class="viewport"><div id="scene"></div><div id="load-error" class="load-error" hidden>Warehouse scene could not be loaded.</div><div class="view-hint">DRAG TO ORBIT&nbsp;&nbsp;·&nbsp;&nbsp;SCROLL TO ZOOM</div></section>
+    <section class="telemetry">
+      <article class="metric"><span>ORDERS PICKED</span><strong id="orders">—</strong><small>MODEL OUTPUT · ORDERS</small></article>
+      <article class="metric"><span>INVENTORY</span><strong><span id="inventory">—</span><i>%</i></strong><small>MODEL OUTPUT · STOCK</small></article>
+      <article class="metric"><span>AGV POSITION</span><strong><span id="position">—</span><i>m</i></strong><small>LIVE FMI STREAM</small></article>
+      <article class="metric alarm" id="alarm-card"><span>SAFETY SYSTEM</span><strong id="alarm">STANDBY</strong><small>JAM SENSOR · WAREHOUSE</small></article>
+    </section>
+    <footer><span>LIVE FMI OUTPUTS</span><span id="time">TIME —</span><span>SMART WAREHOUSE CELL · DEMO</span></footer>
+  </main>
+</body>
+</html>
