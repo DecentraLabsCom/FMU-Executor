@@ -151,8 +151,8 @@ def test_submit_single_executes_and_records_scoped_result(jobs):
     assert result["result"]["time"] == 1.0
     assert result["result"]["outputs"] == {"speed": 2.0}
     assert result["result"]["evidence"]["fmuSha256"] == "a" * 64
-    engine.release_capacity.assert_called_once()
-    process_runner.run.assert_called_once()
+    cast(Mock, engine.release_capacity).assert_called_once()
+    cast(Mock, process_runner.run).assert_called_once()
 
 
 def test_submit_batch_merges_options_and_records_labeled_results(jobs, monkeypatch):
@@ -290,7 +290,7 @@ def test_execution_maps_worker_failures_and_cleans_up(jobs, monkeypatch, failure
     result = asyncio.run(run())
     assert result["status"] == status
     assert result["errorCode"] == code
-    engine.release_capacity.assert_called_once()
+    cast(Mock, engine.release_capacity).assert_called_once()
 
 
 def test_capacity_failure_is_rejected_before_job_creation(jobs, monkeypatch):

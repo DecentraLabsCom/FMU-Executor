@@ -15,7 +15,7 @@ import math
 import secrets
 import threading
 import time
-from typing import Any
+from typing import Any, Callable, cast
 
 from fastapi import (
     Depends,
@@ -1466,7 +1466,11 @@ async def _handle_ws_message(
             delta = _strict_number(step_size, "deltaT") if step_size is not None else None
             step_with_outputs = getattr(session, "step_with_outputs", None)
             if callable(step_with_outputs):
-                step_result, outputs = await asyncio.to_thread(step_with_outputs, delta)
+                step_with_outputs_fn = cast(
+                    Callable[[float | None], tuple[dict[str, Any], dict[str, Any]]],
+                    step_with_outputs,
+                )
+                step_result, outputs = await asyncio.to_thread(step_with_outputs_fn, delta)
             else:
                 step_result = await asyncio.to_thread(session.step, delta)
                 outputs = await asyncio.to_thread(session.get_outputs)
@@ -1494,8 +1498,12 @@ async def _handle_ws_message(
             )
             run_until_with_outputs = getattr(session, "run_until_with_outputs", None)
             if callable(run_until_with_outputs):
-                run_result, outputs = await asyncio.to_thread(
+                run_until_with_outputs_fn = cast(
+                    Callable[[float, float | None], tuple[dict[str, Any], dict[str, Any]]],
                     run_until_with_outputs,
+                )
+                run_result, outputs = await asyncio.to_thread(
+                    run_until_with_outputs_fn,
                     target_time,
                     requested_step_size,
                 )
@@ -1568,7 +1576,11 @@ async def _handle_ws_message(
         limited_get_outputs = getattr(session, "get_outputs_limited", None)
         try:
             if callable(limited_get_outputs):
-                result = await asyncio.to_thread(limited_get_outputs, refs)
+                get_outputs_limited_fn = cast(
+                    Callable[[list[int] | None], dict[str, Any]],
+                    limited_get_outputs,
+                )
+                result = await asyncio.to_thread(get_outputs_limited_fn, refs)
             else:
                 result = await asyncio.to_thread(session.get_outputs, refs)
         except process_runner.OutputReadRateLimitError as exc:
