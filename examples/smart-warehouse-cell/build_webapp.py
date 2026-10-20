@@ -29,6 +29,7 @@ def build(three_root: Path) -> None:
         three_root / "build" / "three.core.js": vendor / "three.core.js",
         three_root / "examples" / "jsm" / "controls" / "OrbitControls.js": vendor / "OrbitControls.js",
         three_root / "examples" / "jsm" / "loaders" / "GLTFLoader.js": vendor / "GLTFLoader.js",
+        three_root / "examples" / "jsm" / "environments" / "RoomEnvironment.js": vendor / "RoomEnvironment.js",
         three_root / "examples" / "jsm" / "utils" / "BufferGeometryUtils.js": vendor / "utils" / "BufferGeometryUtils.js",
         three_root / "examples" / "jsm" / "utils" / "SkeletonUtils.js": vendor / "utils" / "SkeletonUtils.js",
         three_root / "LICENSE": vendor / "THREE-LICENSE.txt",
@@ -40,7 +41,7 @@ def build(three_root: Path) -> None:
 
     # These examples import the package specifier `three`. Rewrite only that
     # import to the vendored module so the ZIP runs without an import map/CDN.
-    for filename in ("OrbitControls.js", "GLTFLoader.js"):
+    for filename in ("OrbitControls.js", "GLTFLoader.js", "RoomEnvironment.js"):
         path = vendor / filename
         source = path.read_text(encoding="utf-8")
         source = source.replace("from 'three'", "from './three.module.js'")

@@ -467,20 +467,12 @@ fmu-data/
     model.fmu          # accessKey = "my-model"
 ```
 
-The reproducible FMI 2.0 Smart Factory Cell demo is in
-[`examples/smart-factory-cell`](examples/smart-factory-cell/README.md). Build its
-Windows x64 FMU with the included PowerShell script or its Linux x64 FMU with
-the included Bash script. The Windows Lab Station release ships the reviewed
-artifact as `fmu-executor/fmu-data/SmartFactoryCell.fmu`; Gateway local
-development uses the Linux x64 artifact under the same access key. Lab Station
-packages the Windows build from this source.
-
 The Smart Warehouse Cell example in
-[`examples/smart-warehouse-cell`](examples/smart-warehouse-cell/README.md) adds
-a second FMI 2.0 demo with a bound GLB scene and an optional self-contained
+[`examples/smart-warehouse-cell`](examples/smart-warehouse-cell/README.md) is
+the visual FMI 2.0 demo. It includes a bound GLB scene and a self-contained
 Three.js app ZIP. Gateway local development uses its Linux x64 FMU; Windows and
 Linux amd64 Lab Station distributions include the platform FMU and both visual
-assets. The Linux arm64 package omits these x86_64-only demos. Lab Manager can
+assets. The Linux arm64 package omits this x86_64-only demo. Lab Manager can
 link either the GLB or the app, and Marketplace selects the viewer from the AAS
 File MIME type.
 
@@ -489,7 +481,7 @@ The previous Gateway FMI example models are now canonical in
 archives include Linux x64 binaries; FMI 2 uses `linux64` and FMI 3 uses
 `x86_64-linux`. `BinaryClockTest.fmu` now includes both Windows and Linux x64
 builds, generated from its included source. Gateway refreshes all development
-copies, including Smart Factory and Smart Warehouse assets, with the
+copies, including Smart Warehouse assets, with the
 `Lab Gateway/scripts/sync_fmu_examples.py` script.
 The example directories document their sources, licenses, builds and platform
 variants.

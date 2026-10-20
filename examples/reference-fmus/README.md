@@ -1,13 +1,12 @@
 # FMI reference and test FMUs
 
 This directory is the canonical source for the FMI example FMUs bundled with
-Lab Gateway. The six reference models are unmodified FMU artifacts from
+Lab Gateway. The five upstream reference models are unmodified FMU artifacts from
 [Modelica Reference FMUs v0.0.39](https://github.com/modelica/Reference-FMUs/tree/v0.0.39):
 
 | FMU | FMI | Linux x86_64 archive platform |
 | --- | --- | --- |
 | `BouncingBall.fmu` | 2.0 | `linux64` |
-| `Dahlquist.fmu` | 2.0 | `linux64` |
 | `Feedthrough.fmu` | 2.0 | `linux64` |
 | `Stair.fmu` | 3.0 | `x86_64-linux` |
 | `StateSpace.fmu` | 3.0 | `x86_64-linux` |
@@ -40,8 +39,8 @@ docker run --rm --mount "type=bind,source=$sourceRoot,target=/workspace" `
   "apt-get update && apt-get install -y --no-install-recommends build-essential && bash ./build-linux.sh"
 ```
 
-To refresh Gateway's development examples, including the Linux Smart Factory
-build and its GLB, run from the workspace root:
+To refresh Gateway's development examples, including Smart Warehouse and the
+reference FMUs, run from the workspace root:
 
 ```powershell
 python "Lab Gateway/scripts/sync_fmu_examples.py" --examples-root "FMU-Executor/examples"

@@ -68,14 +68,14 @@ def test_companion_asset_requires_the_internal_token_and_access_key(route_client
 
 def test_companion_asset_returns_the_sibling_glb(route_client):
     client, headers = route_client
-    fmu_path = config.FMU_ROOT / "provider" / "SmartFactoryCell.fmu"
+    fmu_path = config.FMU_ROOT / "provider" / "ExampleCell.fmu"
     write_test_fmu(fmu_path)
     scene_path = fmu_path.with_suffix(".glb")
     scene_path.write_bytes(b"glTF demo scene")
 
     response = client.get(
         "/internal/fmu/companion-asset?assetType=glb",
-        headers={**headers, "X-FMU-Access-Key": "provider/SmartFactoryCell.fmu"},
+        headers={**headers, "X-FMU-Access-Key": "provider/ExampleCell.fmu"},
     )
 
     assert response.status_code == 200
@@ -104,11 +104,11 @@ def test_companion_asset_returns_the_sibling_threejs_app(route_client):
 
 def test_companion_asset_returns_not_found_when_fmu_or_asset_is_missing(route_client):
     client, headers = route_client
-    request_headers = {**headers, "X-FMU-Access-Key": "SmartFactoryCell.fmu"}
+    request_headers = {**headers, "X-FMU-Access-Key": "ExampleCell.fmu"}
 
     assert client.get("/internal/fmu/companion-asset?assetType=glb", headers=request_headers).status_code == 404
 
-    write_test_fmu(config.FMU_ROOT / "SmartFactoryCell.fmu")
+    write_test_fmu(config.FMU_ROOT / "ExampleCell.fmu")
     assert client.get("/internal/fmu/companion-asset?assetType=glb", headers=request_headers).status_code == 404
 
 
@@ -132,14 +132,14 @@ def test_companion_asset_rejects_unsafe_keys_and_paths_outside_fmu_root(route_cl
 
 def test_companion_asset_enforces_the_response_size_limit(route_client, monkeypatch):
     client, headers = route_client
-    fmu_path = config.FMU_ROOT / "SmartFactoryCell.fmu"
+    fmu_path = config.FMU_ROOT / "ExampleCell.fmu"
     write_test_fmu(fmu_path)
     fmu_path.with_suffix(".glb").write_bytes(b"scene-too-large")
     monkeypatch.setattr(main, "MAX_COMPANION_ASSET_BYTES", 8)
 
     response = client.get(
         "/internal/fmu/companion-asset?assetType=glb",
-        headers={**headers, "X-FMU-Access-Key": "SmartFactoryCell.fmu"},
+        headers={**headers, "X-FMU-Access-Key": "ExampleCell.fmu"},
     )
 
     assert response.status_code == 413

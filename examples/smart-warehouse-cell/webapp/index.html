@@ -3,24 +3,75 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Smart Warehouse Control Deck</title>
+  <meta name="theme-color" content="#07151b">
+  <title>Smart Warehouse | DecentraLabs Digital Twin</title>
   <link rel="stylesheet" href="./styles.css">
   <script type="module" src="./app.js"></script>
 </head>
 <body>
   <main class="deck">
-    <header class="topbar">
-      <div class="brand"><span class="brand-mark">DL</span><div><p>DECENTRALABS · FMI / THREE.JS</p><h1>Smart Warehouse</h1></div></div>
-      <div class="live"><span class="pulse"></span><span id="connection">WAITING FOR SIMULATION</span></div>
-    </header>
-    <section class="viewport"><div id="scene"></div><div id="load-error" class="load-error" hidden>Warehouse scene could not be loaded.</div><div class="view-hint">DRAG TO ORBIT&nbsp;&nbsp;·&nbsp;&nbsp;SCROLL TO ZOOM</div></section>
-    <section class="telemetry">
-      <article class="metric"><span>ORDERS PICKED</span><strong id="orders">—</strong><small>MODEL OUTPUT · ORDERS</small></article>
-      <article class="metric"><span>INVENTORY</span><strong><span id="inventory">—</span><i>%</i></strong><small>MODEL OUTPUT · STOCK</small></article>
-      <article class="metric"><span>AGV POSITION</span><strong><span id="position">—</span><i>m</i></strong><small>LIVE FMI STREAM</small></article>
-      <article class="metric alarm" id="alarm-card"><span>SAFETY SYSTEM</span><strong id="alarm">STANDBY</strong><small>JAM SENSOR · WAREHOUSE</small></article>
+    <section class="viewport" aria-label="Interactive smart warehouse scene">
+      <div id="scene"></div>
+      <div class="scene-vignette" aria-hidden="true"></div>
+
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-mark">DL</span>
+          <div>
+            <p>DECENTRALABS <span>&middot;</span> FMI / THREE.JS</p>
+            <strong>SMART WAREHOUSE</strong>
+          </div>
+        </div>
+        <div class="live-link">
+          <span class="pulse"></span>
+          <div><small>SIMULATION LINK</small><strong id="connection">WAITING FOR SIMULATION</strong></div>
+        </div>
+        <div class="view-actions" aria-label="Scene controls">
+          <button type="button" data-view="reset" title="Reset camera">RESET</button>
+          <button type="button" data-view="top" title="Top view">TOP VIEW</button>
+          <button type="button" id="theme-toggle" title="Switch lighting">DAY MODE</button>
+        </div>
+      </header>
+
+      <div class="scene-title">
+        <span class="eyebrow"><span class="status-square"></span> LOGISTICS CENTER <b>/</b> CELL 01</span>
+        <h1>Material flow,<br><em>in motion.</em></h1>
+        <p>Automated storage &amp; picking cell<br>Model-driven operations view</p>
+      </div>
+
+      <aside class="telemetry" aria-label="Live FMU outputs">
+        <div class="telemetry-head"><span>LIVE OUTPUTS</span><span>FMI 2.0</span></div>
+        <article class="metric-row">
+          <span class="metric-icon orders-icon">↗</span>
+          <div><small>ORDERS PICKED</small><strong id="orders">&mdash;</strong></div>
+          <span class="metric-unit">ORDERS</span>
+        </article>
+        <article class="metric-row inventory-row">
+          <span class="metric-icon orders-icon">BOX</span>
+          <div class="metric-main"><small>TRUCK LOAD</small><strong id="truck-load">&mdash; / 6</strong><div class="meter"><span id="truck-load-meter"></span></div></div>
+        </article>
+        <article class="metric-row inventory-row">
+          <span class="metric-icon inventory-icon">▦</span>
+          <div class="metric-main"><small>INVENTORY LEVEL</small><strong><span id="inventory">&mdash;</span><i>%</i></strong><div class="meter"><span id="inventory-meter"></span></div></div>
+        </article>
+        <article class="metric-row">
+          <span class="metric-icon agv-icon">⌖</span>
+          <div><small>AGV POSITION</small><strong><span id="position">&mdash;</span><i>m</i></strong></div>
+          <span class="metric-unit">ROUTE X</span>
+        </article>
+        <article class="metric-row detail-row">
+          <span class="metric-icon fork-icon">⌁</span>
+          <div><small>CART DECK / PICK ARM</small><strong><span id="fork-height">&mdash;</span><i>m</i><b>&middot;</b><span id="robot-angle">&mdash;</span><i>rad</i></strong></div>
+        </article>
+        <div class="package-state"><span class="package-dot"></span><span>FULFILLMENT</span><strong id="package-state">WAITING</strong></div>
+        <div class="alarm-state" id="alarm-card"><span class="alarm-dot"></span><div><small>SAFETY SYSTEM</small><strong id="alarm">STANDBY</strong></div></div>
+      </aside>
+
+      <div class="time-chip"><small>MODEL TIME</small><strong id="time">t &mdash; s</strong></div>
+      <div class="view-hint"><span class="mouse-icon"></span> DRAG TO ORBIT <b>&middot;</b> SCROLL TO ZOOM</div>
+      <footer class="scene-footer"><span>FMI OUTPUTS <i>&middot;</i> LIVE</span><span>GLB SCENE <i>&middot;</i> THREE.JS</span></footer>
+      <div id="load-error" class="load-error" hidden>Warehouse scene could not be loaded.</div>
     </section>
-    <footer><span>LIVE FMI OUTPUTS</span><span id="time">TIME —</span><span>SMART WAREHOUSE CELL · DEMO</span></footer>
   </main>
 </body>
 </html>
