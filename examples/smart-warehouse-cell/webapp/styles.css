@@ -75,6 +75,11 @@ button { font: inherit; }
 @keyframes alert-pulse { 50% { opacity: .45; } }
 .time-chip { position: absolute; z-index: 1; right: 228px; bottom: 22px; min-width: 102px; padding: 8px 11px; border: 1px solid rgba(151,198,191,.17); border-radius: 7px; background: rgba(7,23,29,.76); backdrop-filter: blur(9px); }
 .time-chip strong { display: block; color: #e6f7f1; font-family: 'DM Mono', monospace; font-size: 11px; font-weight: 500; }
+.playback-controls { position: absolute; z-index: 2; right: 340px; bottom: 22px; }
+.playback-controls button { display: flex; min-height: 38px; min-width: 84px; align-items: center; justify-content: center; gap: 8px; padding: 0 12px; border: 1px solid rgba(93,231,205,.52); border-radius: 7px; color: #c6fff2; background: linear-gradient(145deg, rgba(22,91,81,.9), rgba(11,45,48,.94)); box-shadow: 0 0 20px rgba(26,223,184,.1), inset 0 1px rgba(255,255,255,.06); font-family: 'DM Mono', monospace; font-size: 8px; font-weight: 700; letter-spacing: .1em; cursor: pointer; transition: border-color .18s ease, color .18s ease, background .18s ease, opacity .18s ease; }
+.playback-controls button:hover:not(:disabled), .playback-controls button:focus-visible { border-color: #8bffe4; color: #fff; background: linear-gradient(145deg, rgba(31,128,110,.98), rgba(16,67,68,.98)); outline: none; }
+.playback-controls button:disabled { cursor: not-allowed; opacity: .48; }
+.playback-icon { font-size: 9px; }
 .view-hint { position: absolute; z-index: 1; bottom: 22px; left: 22px; display: flex; align-items: center; gap: 6px; padding: 8px 10px; border: 1px solid rgba(151,198,191,.16); border-radius: 6px; color: #8aa8a3; background: rgba(7,23,29,.68); font-family: 'DM Mono', monospace; font-size: 6px; letter-spacing: .1em; backdrop-filter: blur(8px); }
 .view-hint b { color: #4f8980; font-weight: 400; }
 .mouse-icon { position: relative; width: 9px; height: 12px; border: 1px solid #7bbeb0; border-radius: 5px; }
@@ -112,6 +117,8 @@ body[data-theme='day'] .scene-title h1 { color: #f6fffc; }
   .package-state { min-height: 27px; padding: 0 9px; font-size: 5px; }
   .alarm-state { min-height: 36px; padding: 6px 9px; }
   .time-chip { right: 10px; bottom: 61px; min-width: 88px; padding: 6px 8px; }
+  .playback-controls { right: 111px; bottom: 61px; }
+  .playback-controls button { min-height: 31px; min-width: 76px; gap: 6px; padding: 0 8px; font-size: 7px; }
   .time-chip small { font-size: 6px; }
   .time-chip strong { font-size: 9px; }
   .view-hint { bottom: 16px; left: 10px; font-size: 5px; }

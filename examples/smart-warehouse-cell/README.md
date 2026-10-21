@@ -42,13 +42,23 @@ catching the rail ends. The near-dock rack is narrowed to keep both truck
 entrances clear. The FMU drives the overhead trolley, gripper motion, package
 paths, AGV, loading arm, belt rollers, inventory, order status and safety lamp.
 The Three.js app offers orbit, zoom, top-view and lighting controls while
-showing the same order progress and live FMI values.
+showing the same order progress and FMI values. Its play/pause button replays
+the FMU output timeline in the scene at an accelerated rate; the surrounding
+Marketplace simulation controls still start the FMU run.
 
 The FMU describes its own inputs and outputs in `modelDescription.xml`. The
 visual bindings live with the scene nodes in the GLB. A static Three.js app
-receives the current FMI outputs from Marketplace through the public
-`decentralabs:fmi-sample` version 1 `postMessage` event; it never receives an
-FMU, access key or reservation credential.
+receives initial FMI values from Marketplace through the public
+`decentralabs:fmi-sample` version 1 `postMessage` event, then receives newly
+streamed timeline samples through `decentralabs:fmi-samples`. The host also
+sends `decentralabs:fmi-reset` when a new run replaces the timeline and
+`decentralabs:fmi-simulation-state` to indicate whether samples are still
+arriving. The app never receives an FMU, access key or reservation credential. The app reports
+`decentralabs:digital-twin-ready` version 1 after the GLB has initialized and
+reports `decentralabs:digital-twin-error` version 1 if scene loading fails.
+Marketplace sends `decentralabs:digital-twin-host-ready` version 1 after the
+iframe document loads; the app retains its startup result until that handshake
+arrives.
 
 ## Build
 

@@ -15,6 +15,15 @@ from archive_utils import write_reproducible_zip
 ROOT = Path(__file__).resolve().parent
 WEBAPP_ROOT = ROOT / "webapp"
 OUTPUT = ROOT / "SmartWarehouseCell.webapp.zip"
+REQUIRED_HOST_PROTOCOL_MESSAGES = (
+    "decentralabs:digital-twin-host-ready",
+    "decentralabs:digital-twin-ready",
+    "decentralabs:digital-twin-error",
+    "decentralabs:fmi-sample",
+    "decentralabs:fmi-reset",
+    "decentralabs:fmi-simulation-state",
+    "decentralabs:fmi-samples",
+)
 
 
 def build(three_root: Path) -> None:
@@ -91,6 +100,19 @@ def build(three_root: Path) -> None:
         target = posixpath.normpath(specifier)
         if target.startswith("../") or target not in bundle_files:
             raise FileNotFoundError(f"Three.js app index asset is missing from the bundle: {specifier}")
+
+    app_script_path = WEBAPP_ROOT / "app.js"
+    if not app_script_path.is_file():
+        raise FileNotFoundError("Three.js app is missing its root app.js entry point")
+    app_script = app_script_path.read_text(encoding="utf-8")
+    missing_protocol_messages = [
+        message for message in REQUIRED_HOST_PROTOCOL_MESSAGES if message not in app_script
+    ]
+    if missing_protocol_messages:
+        raise ValueError(
+            "Three.js app is missing Marketplace host protocol messages: "
+            + ", ".join(missing_protocol_messages)
+        )
 
     write_reproducible_zip(WEBAPP_ROOT, OUTPUT)
     print(f"Built {OUTPUT} ({OUTPUT.stat().st_size:,} bytes)")

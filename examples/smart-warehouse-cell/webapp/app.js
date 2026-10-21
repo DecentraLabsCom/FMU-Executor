@@ -66,6 +66,20 @@ const bindings = []
 let latest = { outputs: {}, time: null }
 const allowedTargets = new Set(['position.x', 'position.y', 'position.z', 'rotation.x', 'rotation.y', 'rotation.z', 'scale.x', 'scale.y', 'scale.z', 'visible', 'material.color'])
 const dash = '\u2014'
+let hostHandshakeReady = false
+let sceneReady = false
+let sceneErrorCode = null
+const playback = {
+  samples: [],
+  sampleIndex: -1,
+  playing: false,
+  simulationRunning: false,
+  autoPlayPending: true,
+  modelTime: 0,
+  lastFrameTime: 0,
+}
+const PLAYBACK_SPEED = 10
+const playbackButton = document.getElementById('playback-toggle')
 
 function setText(id, value) {
   const element = document.getElementById(id)
@@ -154,17 +168,148 @@ function applySample(sample) {
   setText('connection', Number.isFinite(sample.time) ? 'SIMULATION LINK ACTIVE' : 'WAITING FOR SIMULATION')
 }
 
+function updatePlaybackButton() {
+  if (!playbackButton) return
+  const canPlay = playback.samples.length > 1
+  playbackButton.disabled = !canPlay
+  playbackButton.setAttribute('aria-pressed', String(playback.playing))
+  playbackButton.setAttribute('aria-label', playback.playing ? 'Pause simulation replay' : 'Play simulation replay')
+  setText('playback-label', playback.playing ? 'PAUSE' : 'PLAY')
+  const icon = playbackButton.querySelector('.playback-icon')
+  if (icon) icon.textContent = playback.playing ? '\u275a\u275a' : '\u25b6'
+}
+
+function setPlaybackPlaying(playing) {
+  playback.playing = playing
+  playback.lastFrameTime = 0
+  updatePlaybackButton()
+}
+
+function startPlayback() {
+  if (playback.samples.length < 2) return
+  if (playback.sampleIndex < 0 || (playback.sampleIndex >= playback.samples.length - 1 && !playback.simulationRunning)) {
+    playback.sampleIndex = 0
+  }
+  playback.modelTime = playback.samples[playback.sampleIndex].time
+  applySample(playback.samples[playback.sampleIndex])
+  setPlaybackPlaying(true)
+}
+
+function togglePlayback() {
+  if (playback.playing) {
+    setPlaybackPlaying(false)
+    return
+  }
+  startPlayback()
+}
+
+function resetPlayback() {
+  playback.samples = []
+  playback.sampleIndex = -1
+  playback.modelTime = 0
+  playback.simulationRunning = false
+  playback.autoPlayPending = true
+  setPlaybackPlaying(false)
+}
+
+function appendSamples(rawSamples) {
+  if (!Array.isArray(rawSamples)) return
+  const wasEmpty = playback.samples.length === 0
+  for (const rawSample of rawSamples) {
+    if (!rawSample || typeof rawSample !== 'object' || !Number.isFinite(rawSample.time)) continue
+    if (playback.samples.length > 0 && rawSample.time <= playback.samples[playback.samples.length - 1].time) continue
+    if (!rawSample.outputs || typeof rawSample.outputs !== 'object' || Array.isArray(rawSample.outputs)) continue
+    const outputs = {}
+    for (const [name, value] of Object.entries(rawSample.outputs)) {
+      if (typeof value === 'boolean' || (typeof value === 'number' && Number.isFinite(value))) outputs[name] = value
+    }
+    playback.samples.push({ time: rawSample.time, outputs })
+  }
+  if (wasEmpty && playback.samples.length > 0) {
+    playback.sampleIndex = 0
+    playback.modelTime = playback.samples[0].time
+    applySample(playback.samples[0])
+  }
+  if (playback.autoPlayPending && playback.samples.length > 1) {
+    playback.autoPlayPending = false
+    startPlayback()
+  }
+  updatePlaybackButton()
+}
+
+function advancePlayback(now) {
+  if (!playback.playing || playback.sampleIndex < 0) return
+  if (playback.lastFrameTime === 0) {
+    playback.lastFrameTime = now
+    return
+  }
+  const elapsedSeconds = Math.min((now - playback.lastFrameTime) / 1000, 0.1)
+  playback.lastFrameTime = now
+  playback.modelTime += elapsedSeconds * PLAYBACK_SPEED
+  const lastSample = playback.samples[playback.samples.length - 1]
+  if (playback.simulationRunning && lastSample) playback.modelTime = Math.min(playback.modelTime, lastSample.time)
+
+  let nextIndex = playback.sampleIndex
+  while (nextIndex + 1 < playback.samples.length && playback.samples[nextIndex + 1].time <= playback.modelTime) {
+    nextIndex += 1
+  }
+  if (nextIndex !== playback.sampleIndex) {
+    playback.sampleIndex = nextIndex
+    applySample(playback.samples[nextIndex])
+  }
+  if (!playback.simulationRunning && playback.sampleIndex >= playback.samples.length - 1) {
+    setPlaybackPlaying(false)
+  }
+}
+
+function reportSceneStatus() {
+  if (!hostHandshakeReady || window.parent === window) return
+  if (sceneErrorCode) {
+    window.parent.postMessage({
+      type: 'decentralabs:digital-twin-error',
+      version: 1,
+      code: sceneErrorCode,
+    }, '*')
+  } else if (sceneReady) {
+    window.parent.postMessage({
+      type: 'decentralabs:digital-twin-ready',
+      version: 1,
+    }, '*')
+  }
+}
+
 window.addEventListener('message', (event) => {
   if (event.source !== window.parent) return
   const data = event.data
-  if (!data || data.type !== 'decentralabs:fmi-sample' || data.version !== 1) return
-  if (data.outputs === null || typeof data.outputs !== 'object' || Array.isArray(data.outputs)) return
-  const outputs = {}
-  for (const [name, value] of Object.entries(data.outputs)) {
-    if (typeof value === 'boolean' || (typeof value === 'number' && Number.isFinite(value))) outputs[name] = value
+  if (data?.type === 'decentralabs:digital-twin-host-ready' && data.version === 1) {
+    hostHandshakeReady = true
+    reportSceneStatus()
+    return
   }
-  applySample({ time: Number.isFinite(data.time) ? data.time : null, outputs })
+  if (!data || data.version !== 1) return
+  if (data.type === 'decentralabs:fmi-reset') {
+    resetPlayback()
+    return
+  }
+  if (data.type === 'decentralabs:fmi-simulation-state') {
+    playback.simulationRunning = data.state === 'running'
+    return
+  }
+  if (data.type === 'decentralabs:fmi-samples') {
+    appendSamples(data.samples)
+    return
+  }
+  if (data.type === 'decentralabs:fmi-sample' && data.outputs && typeof data.outputs === 'object' && !Array.isArray(data.outputs)) {
+    const outputs = {}
+    for (const [name, value] of Object.entries(data.outputs)) {
+      if (typeof value === 'boolean' || (typeof value === 'number' && Number.isFinite(value))) outputs[name] = value
+    }
+    applySample({ time: Number.isFinite(data.time) ? data.time : null, outputs })
+  }
 })
+
+playbackButton?.addEventListener('click', togglePlayback)
+updatePlaybackButton()
 
 new GLTFLoader().load('./warehouse.glb', (gltf) => {
   if (disposed) return
@@ -197,7 +342,13 @@ new GLTFLoader().load('./warehouse.glb', (gltf) => {
   scene.add(warehouse)
   applyBindings(latest.outputs)
   setText('connection', 'SCENE READY · WAITING FOR FMI')
-}, undefined, () => { document.getElementById('load-error').hidden = false })
+  sceneReady = true
+  reportSceneStatus()
+}, undefined, () => {
+  sceneErrorCode = 'SCENE_LOAD_FAILED'
+  document.getElementById('load-error').hidden = false
+  reportSceneStatus()
+})
 
 function setCamera(mode) {
   const direction = mode === 'top'
@@ -242,6 +393,7 @@ resize.observe(canvasRoot)
 function render() {
   if (disposed) return
   frame = requestAnimationFrame(render)
+  advancePlayback(performance.now())
   controls.update()
   renderer.render(scene, camera)
 }
