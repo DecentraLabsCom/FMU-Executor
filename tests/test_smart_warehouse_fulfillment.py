@@ -46,7 +46,7 @@ def simulate(*, order_quantity=6, speed=0.68, rush_order=False, jam=False, stop_
         ],
         dtype=[
             ("time", np.float64),
-            ("conveyorSpeed", np.float64),
+            ("robotSpeed", np.float64),
             ("startStop", np.bool_),
             ("jam", np.bool_),
             ("rushOrder", np.bool_),

@@ -1,7 +1,7 @@
 import * as THREE from './vendor/three.module.js'
-import { GLTFLoader } from './vendor/GLTFLoader.js'
 import { OrbitControls } from './vendor/OrbitControls.js'
 import { RoomEnvironment } from './vendor/RoomEnvironment.js'
+import { createSmartWarehouseScene } from './scene.js'
 
 const host = document.querySelector('#scene')
 const canvasRoot = document.querySelector('.viewport')
@@ -23,30 +23,6 @@ const environmentTarget = pmremGenerator.fromScene(studioEnvironment, 0.04)
 scene.environment = environmentTarget.texture
 studioEnvironment.dispose()
 const camera = new THREE.PerspectiveCamera(42, 1, 0.1, 300)
-const hemisphere = new THREE.HemisphereLight('#d4fff1', '#18242a', 1.2)
-scene.add(hemisphere)
-const key = new THREE.DirectionalLight('#fff1d4', 2.35)
-key.position.set(-10, 18, 12)
-key.castShadow = true
-key.shadow.mapSize.set(2048, 2048)
-key.shadow.camera.left = -20
-key.shadow.camera.right = 20
-key.shadow.camera.top = 20
-key.shadow.camera.bottom = -20
-scene.add(key)
-const fill = new THREE.PointLight('#12c9bb', 10, 38, 2)
-fill.position.set(6, 8, -7)
-scene.add(fill)
-const rim = new THREE.DirectionalLight('#40b6dc', 0.9)
-rim.position.set(10, 10, -12)
-scene.add(rim)
-const roofLights = []
-for (const [index, z] of [-5, -1.7, 1.7, 5].entries()) {
-  const roofLight = new THREE.PointLight(index % 2 ? '#c8f4ff' : '#ffe4bc', 8, 15, 2)
-  roofLight.position.set(index % 2 ? 3.4 : -3.4, 6.0, z)
-  scene.add(roofLight)
-  roofLights.push(roofLight)
-}
 
 const controls = new OrbitControls(camera, renderer.domElement)
 controls.target.set(0, 1.5, 0)
@@ -56,15 +32,13 @@ controls.maxPolarAngle = Math.PI * 0.49
 controls.minDistance = 5
 controls.maxDistance = 56
 
-let warehouse = null
+let warehouseScene = null
 let disposed = false
 let frame = 0
 let sceneCenter = new THREE.Vector3()
 let sceneRadius = 12
 let theme = 'night'
-const bindings = []
 let latest = { outputs: {}, time: null }
-const allowedTargets = new Set(['position.x', 'position.y', 'position.z', 'rotation.x', 'rotation.y', 'rotation.z', 'scale.x', 'scale.y', 'scale.z', 'visible', 'material.color'])
 const dash = '\u2014'
 let hostHandshakeReady = false
 let sceneReady = false
@@ -78,7 +52,9 @@ const playback = {
   modelTime: 0,
   lastFrameTime: 0,
 }
-const PLAYBACK_SPEED = 10
+// The Marketplace GLB timeline advances one 0.05 s FMU sample every 25 ms.
+// Use the same 2x rate so both views animate at a comparable pace.
+const PLAYBACK_SPEED = 2
 const playbackButton = document.getElementById('playback-toggle')
 
 function setText(id, value) {
@@ -90,38 +66,13 @@ function formatted(value, digits = 1) {
   return value === undefined || value === null || !Number.isFinite(Number(value)) ? dash : Number(value).toFixed(digits)
 }
 
-function applyBindings(outputs) {
-  for (const { node, binding } of bindings) {
-    const value = outputs[binding.variable]
-    if (value === undefined || value === null) continue
-    if (binding.target === 'visible') {
-      if (Object.prototype.hasOwnProperty.call(binding, 'visibleWhenGreaterThanOrEqual')) {
-        const threshold = Number(binding.visibleWhenGreaterThanOrEqual)
-        const numeric = Number(value)
-        node.visible = Number.isFinite(threshold) && Number.isFinite(numeric) && numeric >= threshold
-      } else {
-        node.visible = Boolean(value)
-      }
-      continue
-    }
-    if (binding.target === 'material.color') {
-      if (node.material?.color) {
-        node.material.color.set(value ? (binding.trueColor || '#ff365f') : (binding.falseColor || '#31dfa0'))
-        if (node.material.emissive) node.material.emissive.set(value ? '#51101f' : '#06382a')
-      }
-      continue
-    }
-    if (typeof value !== 'number' || !Number.isFinite(value)) continue
-    const mapped = value * (Number(binding.scale) || 1) + (Number(binding.offset) || 0)
-    if (Math.abs(mapped) > 100000) continue
-    const [property, axis] = binding.target.split('.')
-    node[property][axis] = mapped
-  }
+function applySceneOutputs(outputs) {
+  warehouseScene?.update(outputs)
 }
 
 function applySample(sample) {
   latest = sample
-  applyBindings(sample.outputs)
+  applySceneOutputs(sample.outputs)
   setText('orders', formatted(sample.outputs.ordersPicked, 0))
   setText('truck-load', `${formatted(sample.outputs.truckLoadCount, 0)} / 6`)
   setText('inventory', formatted(sample.outputs.inventoryLevel, 0))
@@ -311,50 +262,36 @@ window.addEventListener('message', (event) => {
 playbackButton?.addEventListener('click', togglePlayback)
 updatePlaybackButton()
 
-new GLTFLoader().load('./warehouse.glb', (gltf) => {
-  if (disposed) return
-  warehouse = gltf.scene
-  const bounds = new THREE.Box3().setFromObject(warehouse)
-  sceneCenter = bounds.getCenter(new THREE.Vector3())
-  sceneRadius = Math.max(bounds.getSize(new THREE.Vector3()).length() / 2, 1)
-  const direction = new THREE.Vector3(1.05, .74, 1.22).normalize()
-  camera.position.copy(sceneCenter).addScaledVector(direction, sceneRadius * 1.72)
-  camera.near = .05
+try {
+  warehouseScene = createSmartWarehouseScene(scene, renderer)
+  sceneCenter = warehouseScene.center
+  sceneRadius = warehouseScene.radius
+  const direction = new THREE.Vector3(1.05, 0.74, 1.22).normalize()
+  camera.position.copy(sceneCenter).addScaledVector(direction, sceneRadius * 1.45)
+  camera.near = 0.05
   camera.far = sceneRadius * 10
   camera.lookAt(sceneCenter)
   camera.updateProjectionMatrix()
   controls.target.copy(sceneCenter)
-  controls.minDistance = Math.max(sceneRadius * .28, 5)
+  controls.minDistance = Math.max(sceneRadius * 0.28, 5)
   controls.maxDistance = sceneRadius * 3.5
   controls.update()
-  warehouse.traverse((node) => {
-    if (node.isMesh) {
-      node.castShadow = true
-      node.receiveShadow = true
-      if (node.material) node.material.envMapIntensity = 0.48
-    }
-    const declared = node.userData?.fmiBindings
-    if (!Array.isArray(declared)) return
-    for (const binding of declared) {
-      if (binding && typeof binding.variable === 'string' && allowedTargets.has(binding.target)) bindings.push({ node, binding })
-    }
-  })
-  scene.add(warehouse)
-  applyBindings(latest.outputs)
-  setText('connection', 'SCENE READY · WAITING FOR FMI')
+  applySceneOutputs(latest.outputs)
+  setText('connection', 'PROCEDURAL SCENE READY - WAITING FOR FMI')
   sceneReady = true
   reportSceneStatus()
-}, undefined, () => {
-  sceneErrorCode = 'SCENE_LOAD_FAILED'
+} catch (error) {
+  sceneErrorCode = 'SCENE_INIT_FAILED'
   document.getElementById('load-error').hidden = false
   reportSceneStatus()
-})
+  console.error('Could not build the procedural Smart Warehouse scene.', error)
+}
 
 function setCamera(mode) {
   const direction = mode === 'top'
     ? new THREE.Vector3(.015, 1, .015)
     : new THREE.Vector3(1.05, .74, 1.22).normalize()
-  const distance = mode === 'top' ? sceneRadius * 2.1 : sceneRadius * 1.72
+  const distance = mode === 'top' ? sceneRadius * 1.9 : sceneRadius * 1.45
   camera.position.copy(sceneCenter).addScaledVector(direction, distance)
   controls.target.copy(sceneCenter)
   controls.update()
@@ -372,10 +309,7 @@ document.getElementById('theme-toggle').addEventListener('click', (event) => {
   scene.fog.color.copy(background)
   scene.fog.near = day ? 48 : 34
   scene.fog.far = day ? 125 : 92
-  hemisphere.intensity = day ? 1.55 : 1.2
-  key.intensity = day ? 2.8 : 2.35
-  fill.intensity = day ? 6 : 10
-  roofLights.forEach((light) => { light.intensity = day ? 5 : 8 })
+  warehouseScene?.setDayMode(day)
   document.body.dataset.theme = theme
   event.currentTarget.textContent = day ? 'NIGHT MODE' : 'DAY MODE'
 })
@@ -393,7 +327,9 @@ resize.observe(canvasRoot)
 function render() {
   if (disposed) return
   frame = requestAnimationFrame(render)
-  advancePlayback(performance.now())
+  const now = performance.now()
+  advancePlayback(now)
+  warehouseScene?.animate(now / 1000)
   controls.update()
   renderer.render(scene, camera)
 }
@@ -404,6 +340,7 @@ window.addEventListener('pagehide', () => {
   cancelAnimationFrame(frame)
   resize.disconnect()
   controls.dispose()
+  warehouseScene?.dispose()
   environmentTarget.dispose()
   pmremGenerator.dispose()
   renderer.dispose()

@@ -17,10 +17,13 @@ The example ships with these companion artifacts:
   and Lab Station Linux.
 - `smart-warehouse-cell.glb`: self-contained geometry with `extras.fmiBindings`
   for rack pickup, AGV travel, conveyor transfer, loader arm, truck cargo slots,
-  lift and alarm lamp.
-- `SmartWarehouseCell.webapp.zip`: optional static Three.js application for a
-  custom warehouse presentation. It contains the GLB, viewer modules and no
-  external runtime dependency.
+  lift and alarm lamp. It includes a closed warehouse shell with high windows,
+  two open loading bays, a long high-bay rack, the center pallet rack, detailed
+  cartons and dock lighting.
+- `SmartWarehouseCell.webapp.zip`: optional static Three.js application with
+  its own procedural warehouse scene. It bundles its viewer modules and does
+  not include or load the companion GLB. Marketplace sends it the same live FMI
+  samples as the GLB viewer; it needs no separate asset server or CDN.
 
 The scene includes high-bay racks, roof structure, loading docks, a centered
 animated roller conveyor and an outbound truck with an open loading door. The
@@ -31,20 +34,29 @@ package disappears as the gripper closes around it, and its dimensions and
 color follow it onto the AGV, along the conveyor and into its truck slot. Cargo
 slots fill from the truck's deep row toward the rear opening, leaving the access
 path clear for later parcels.
-The GLB embeds subtle procedural PBR textures for cardboard, brushed metal,
-concrete and dock asphalt, plus softly beveled cartons, truck cab and cart body.
-Tires use matte rubber while hubs and conveyor rollers remain metallic, and all
-cylindrical parts use smoother geometry. Both Marketplace's
-standard GLB viewer and the companion app add a studio reflection environment;
-the app also lights the cell from warm and cool warehouse roof fixtures.
+The GLB embeds procedural PBR textures for cardboard, shipping labels, timber,
+painted steel, concrete and dock asphalt, plus beveled cartons, a detailed
+truck cab and the carrier cart. Its ribbed walls, high windows, rack bracing,
+lit dock details and warm/cool punctual lights bring it closer to the richer
+Three.js scene while preserving the GLB bindings in node metadata. Marketplace's
+generic viewer adds its environment reflections and renders the GLB materials
+and punctual lights.
 The conveyor rails stop short at the AGV handoff so parcels enter without
 catching the rail ends. The near-dock rack is narrowed to keep both truck
 entrances clear. The FMU drives the overhead trolley, gripper motion, package
 paths, AGV, loading arm, belt rollers, inventory, order status and safety lamp.
-The Three.js app offers orbit, zoom, top-view and lighting controls while
-showing the same order progress and FMI values. Its play/pause button replays
-the FMU output timeline in the scene at an accelerated rate; the surrounding
-Marketplace simulation controls still start the FMU run.
+
+The Three.js app builds a separate, code-generated fulfillment hall: a long
+multi-tier rack running beside the full AGV lane, a second loaded pallet rack
+between the truck docks, corrugated warehouse walls with high windows and two
+open loading bays, overhead picker rails, a moving gripper, a four-wheel
+powered carrier, animated rollers, two detailed trucks, roof trusses, dock
+signage and traffic markings. Textures, carton labels, rounded geometry,
+warm/cool industrial lights and emissive safety strips are created locally by
+the app. Its orbit, zoom, top-view, lighting and play/pause controls belong to
+that full presentation. Both visualizations receive the same FMU outputs, but
+GLB bindings are declared in the model asset while the Three.js app maps those
+outputs directly to its own scene.
 
 The FMU describes its own inputs and outputs in `modelDescription.xml`. The
 visual bindings live with the scene nodes in the GLB. A static Three.js app
@@ -53,9 +65,10 @@ receives initial FMI values from Marketplace through the public
 streamed timeline samples through `decentralabs:fmi-samples`. The host also
 sends `decentralabs:fmi-reset` when a new run replaces the timeline and
 `decentralabs:fmi-simulation-state` to indicate whether samples are still
-arriving. The app never receives an FMU, access key or reservation credential. The app reports
-`decentralabs:digital-twin-ready` version 1 after the GLB has initialized and
-reports `decentralabs:digital-twin-error` version 1 if scene loading fails.
+arriving. The app never receives an FMU, access key or reservation credential.
+It reports `decentralabs:digital-twin-ready` version 1 after its procedural
+scene has initialized and reports `decentralabs:digital-twin-error` version 1
+if scene construction fails.
 Marketplace sends `decentralabs:digital-twin-host-ready` version 1 after the
 iframe document loads; the app retains its startup result until that handshake
 arrives.
@@ -90,13 +103,13 @@ either FMU backend.
 1. Provision `SmartWarehouseCell.fmu` as an FMU laboratory.
 2. In Lab Manager, attach either the companion GLB or the Three.js app ZIP.
 3. Sync the AAS and book/open the lab in Marketplace.
-4. Set `orderQuantity` from one to six packages. `conveyorSpeed` controls AGV
+4. Set `orderQuantity` from one to six packages. `robotSpeed` controls AGV
    travel; `rushOrder` speeds up the next outbound trip by 45%; `jam` freezes
    the entire process and raises the safety alarm.
 5. Run for about 200 seconds to see the full default six-package order at the
-   default speed. Shorter runs stop part-way through the cycle. The default GLB
-   viewer applies node bindings, or the app bundle presents the same live output
-   stream in its own Three.js layout.
+   default speed. Shorter runs stop part-way through the cycle. The GLB option
+   presents the authored asset through Marketplace's generic viewer; the
+   Three.js option presents its separate native scene from the same FMI stream.
 
 ## License
 

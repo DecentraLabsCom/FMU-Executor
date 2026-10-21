@@ -31,16 +31,13 @@ def build(three_root: Path) -> None:
     vendor = WEBAPP_ROOT / "vendor"
     if vendor.exists():
         shutil.rmtree(vendor)
-    (vendor / "utils").mkdir(parents=True)
+    vendor.mkdir(parents=True)
 
     copy_plan = {
         three_root / "build" / "three.module.js": vendor / "three.module.js",
         three_root / "build" / "three.core.js": vendor / "three.core.js",
         three_root / "examples" / "jsm" / "controls" / "OrbitControls.js": vendor / "OrbitControls.js",
-        three_root / "examples" / "jsm" / "loaders" / "GLTFLoader.js": vendor / "GLTFLoader.js",
         three_root / "examples" / "jsm" / "environments" / "RoomEnvironment.js": vendor / "RoomEnvironment.js",
-        three_root / "examples" / "jsm" / "utils" / "BufferGeometryUtils.js": vendor / "utils" / "BufferGeometryUtils.js",
-        three_root / "examples" / "jsm" / "utils" / "SkeletonUtils.js": vendor / "utils" / "SkeletonUtils.js",
         three_root / "LICENSE": vendor / "THREE-LICENSE.txt",
     }
     for source, destination in copy_plan.items():
@@ -50,26 +47,15 @@ def build(three_root: Path) -> None:
 
     # These examples import the package specifier `three`. Rewrite only that
     # import to the vendored module so the ZIP runs without an import map/CDN.
-    for filename in ("OrbitControls.js", "GLTFLoader.js", "RoomEnvironment.js"):
+    for filename in ("OrbitControls.js", "RoomEnvironment.js"):
         path = vendor / filename
         source = path.read_text(encoding="utf-8")
         source = source.replace("from 'three'", "from './three.module.js'")
         source = source.replace('from "three"', 'from "./three.module.js"')
-        if filename == "GLTFLoader.js":
-            source = source.replace("from '../utils/", "from './utils/")
-            source = source.replace('from "../utils/', 'from "./utils/')
         path.write_text(source, encoding="utf-8")
-    for filename in ("BufferGeometryUtils.js", "SkeletonUtils.js"):
-        path = vendor / "utils" / filename
-        source = path.read_text(encoding="utf-8")
-        source = source.replace("from 'three'", "from '../three.module.js'")
-        source = source.replace('from "three"', 'from "../three.module.js"')
-        path.write_text(source, encoding="utf-8")
-
-    glb = ROOT / "smart-warehouse-cell.glb"
-    if not glb.is_file():
-        raise FileNotFoundError("Build the warehouse GLB before the web app ZIP")
-    shutil.copyfile(glb, WEBAPP_ROOT / "warehouse.glb")
+    companion_glb = WEBAPP_ROOT / "warehouse.glb"
+    if companion_glb.exists():
+        raise ValueError("The procedural Three.js app must not bundle the GLB companion scene")
 
     bundle_files = {
         path.relative_to(WEBAPP_ROOT).as_posix()
@@ -105,6 +91,10 @@ def build(three_root: Path) -> None:
     if not app_script_path.is_file():
         raise FileNotFoundError("Three.js app is missing its root app.js entry point")
     app_script = app_script_path.read_text(encoding="utf-8")
+    if "GLTFLoader" in app_script or "warehouse.glb" in app_script:
+        raise ValueError("The Three.js demo app must build its own scene without loading the companion GLB")
+    if "createSmartWarehouseScene" not in app_script or "scene.js" not in bundle_files:
+        raise ValueError("The Three.js demo app is missing its procedural warehouse scene module")
     missing_protocol_messages = [
         message for message in REQUIRED_HOST_PROTOCOL_MESSAGES if message not in app_script
     ]

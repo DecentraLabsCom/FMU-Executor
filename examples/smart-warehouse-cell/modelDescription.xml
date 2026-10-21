@@ -24,7 +24,7 @@
   </UnitDefinitions>
   <DefaultExperiment startTime="0" stopTime="220" stepSize="0.05" tolerance="1e-6" />
   <ModelVariables>
-    <ScalarVariable name="conveyorSpeed" valueReference="0" description="AGV travel speed for outbound and return trips." causality="input" variability="continuous" initial="exact"><Real start="0.68" min="0" max="1.4" unit="m_per_s" /></ScalarVariable>
+    <ScalarVariable name="robotSpeed" valueReference="0" description="AGV travel speed for outbound and return trips." causality="input" variability="continuous" initial="exact"><Real start="0.68" min="0" max="1.4" unit="m_per_s" /></ScalarVariable>
     <ScalarVariable name="startStop" valueReference="1" description="Start or pause warehouse operations." causality="input" variability="discrete" initial="exact"><Boolean start="true" /></ScalarVariable>
     <ScalarVariable name="jam" valueReference="2" description="Inject a safety stop and raise the warehouse alarm." causality="input" variability="discrete" initial="exact"><Boolean start="false" /></ScalarVariable>
     <ScalarVariable name="rushOrder" valueReference="3" description="Prioritize the next outbound AGV trip with a 45% higher speed setpoint." causality="input" variability="discrete" initial="exact"><Boolean start="false" /></ScalarVariable>
