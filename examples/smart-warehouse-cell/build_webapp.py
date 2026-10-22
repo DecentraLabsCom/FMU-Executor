@@ -23,6 +23,7 @@ REQUIRED_HOST_PROTOCOL_MESSAGES = (
     "decentralabs:fmi-reset",
     "decentralabs:fmi-simulation-state",
     "decentralabs:fmi-samples",
+    "decentralabs:fmi-run-request",
 )
 
 

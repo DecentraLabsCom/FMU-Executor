@@ -56,6 +56,9 @@ const playback = {
 // Use the same 2x rate so both views animate at a comparable pace.
 const PLAYBACK_SPEED = 2
 const playbackButton = document.getElementById('playback-toggle')
+const simulationForm = document.getElementById('simulation-form')
+const simulationRunButton = document.getElementById('run-simulation')
+let lastSimulationState = 'idle'
 
 function setText(id, value) {
   const element = document.getElementById(id)
@@ -128,6 +131,48 @@ function updatePlaybackButton() {
   setText('playback-label', playback.playing ? 'PAUSE' : 'PLAY')
   const icon = playbackButton.querySelector('.playback-icon')
   if (icon) icon.textContent = playback.playing ? '\u275a\u275a' : '\u25b6'
+}
+
+function updateSimulationControls() {
+  if (simulationRunButton) {
+    simulationRunButton.disabled = !hostHandshakeReady || !sceneReady || lastSimulationState === 'running'
+    setText('run-simulation', lastSimulationState === 'running'
+      ? 'SIMULATION RUNNING…'
+      : lastSimulationState === 'completed' ? 'RUN AGAIN' : 'RUN SIMULATION')
+  }
+  const status = lastSimulationState === 'running'
+    ? 'The FMU is calculating the response.'
+    : lastSimulationState === 'completed'
+      ? `${playback.samples.length.toLocaleString('en-US')} samples ready for replay.`
+      : lastSimulationState === 'error'
+        ? 'The FMU run failed. Adjust the inputs and try again.'
+        : sceneReady ? 'Choose the inputs and run the FMU.' : 'Preparing the warehouse scene…'
+  setText('simulation-run-status', status)
+}
+
+function requestSimulation(event) {
+  event?.preventDefault()
+  if (!hostHandshakeReady || !sceneReady || lastSimulationState === 'running') return
+
+  const speed = Number(document.getElementById('robot-speed')?.value)
+  const quantity = Number(document.getElementById('order-quantity')?.value)
+  if (!Number.isFinite(speed) || !Number.isInteger(quantity)) return
+
+  lastSimulationState = 'running'
+  updateSimulationControls()
+  const settings = document.querySelector('.simulation-setup')
+  if (settings) settings.open = false
+  window.parent.postMessage({
+    type: 'decentralabs:fmi-run-request',
+    version: 1,
+    parameters: {
+      robotSpeed: Math.max(0, Math.min(1.4, speed)),
+      orderQuantity: Math.max(1, Math.min(6, quantity)),
+      startStop: Boolean(document.getElementById('start-stop')?.checked),
+      jam: Boolean(document.getElementById('jam-input')?.checked),
+      rushOrder: Boolean(document.getElementById('rush-order')?.checked),
+    },
+  }, '*')
 }
 
 function setPlaybackPlaying(playing) {
@@ -244,6 +289,8 @@ window.addEventListener('message', (event) => {
   }
   if (data.type === 'decentralabs:fmi-simulation-state') {
     playback.simulationRunning = data.state === 'running'
+    lastSimulationState = ['running', 'completed', 'error'].includes(data.state) ? data.state : 'idle'
+    updateSimulationControls()
     return
   }
   if (data.type === 'decentralabs:fmi-samples') {
@@ -260,7 +307,9 @@ window.addEventListener('message', (event) => {
 })
 
 playbackButton?.addEventListener('click', togglePlayback)
+simulationForm?.addEventListener('submit', requestSimulation)
 updatePlaybackButton()
+updateSimulationControls()
 
 try {
   warehouseScene = createSmartWarehouseScene(scene, renderer)
@@ -279,6 +328,7 @@ try {
   applySceneOutputs(latest.outputs)
   setText('connection', 'PROCEDURAL SCENE READY - WAITING FOR FMI')
   sceneReady = true
+  updateSimulationControls()
   reportSceneStatus()
 } catch (error) {
   sceneErrorCode = 'SCENE_INIT_FAILED'

@@ -26,6 +26,38 @@
           <span class="pulse"></span>
           <div><small>SIMULATION LINK</small><strong id="connection">WAITING FOR SIMULATION</strong></div>
         </div>
+        <details class="simulation-setup">
+          <summary>RUN CONTROLS</summary>
+          <form class="simulation-panel" id="simulation-form">
+            <div class="simulation-panel-heading"><span>MODEL INPUTS</span><span>FMU</span></div>
+            <label class="input-control" for="robot-speed">
+              <span><strong>AGV travel speed</strong><small>Robot speed (m/s)</small></span>
+              <input id="robot-speed" name="robotSpeed" type="number" min="0" max="1.4" step="0.05" value="0.68">
+            </label>
+            <label class="input-control" for="order-quantity">
+              <span><strong>Truck order size</strong><small>Packages to load · max 6</small></span>
+              <select id="order-quantity" name="orderQuantity">
+                <option value="1">1 package</option><option value="2">2 packages</option>
+                <option value="3">3 packages</option><option value="4">4 packages</option>
+                <option value="5">5 packages</option><option value="6" selected>6 packages</option>
+              </select>
+            </label>
+            <label class="input-toggle" for="rush-order">
+              <span><strong>Rush order</strong><small>Speed up the next outbound trip</small></span>
+              <input id="rush-order" name="rushOrder" type="checkbox">
+            </label>
+            <label class="input-toggle" for="jam-input">
+              <span><strong>Inject a jam</strong><small>Pause operations and raise the alarm</small></span>
+              <input id="jam-input" name="jam" type="checkbox">
+            </label>
+            <label class="input-toggle" for="start-stop">
+              <span><strong>Start operations</strong><small>Allow the warehouse to process the order</small></span>
+              <input id="start-stop" name="startStop" type="checkbox" checked>
+            </label>
+            <button class="run-simulation" id="run-simulation" type="submit" disabled>RUN SIMULATION</button>
+            <p class="simulation-run-status" id="simulation-run-status" role="status">Connect to the FMU to begin.</p>
+          </form>
+        </details>
         <div class="view-actions" aria-label="Scene controls">
           <button type="button" data-view="reset" title="Reset camera">RESET</button>
           <button type="button" data-view="top" title="Top view">TOP VIEW</button>

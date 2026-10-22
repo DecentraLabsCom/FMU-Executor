@@ -65,7 +65,13 @@ receives initial FMI values from Marketplace through the public
 streamed timeline samples through `decentralabs:fmi-samples`. The host also
 sends `decentralabs:fmi-reset` when a new run replaces the timeline and
 `decentralabs:fmi-simulation-state` to indicate whether samples are still
-arriving. The app never receives an FMU, access key or reservation credential.
+arriving. A complete app can request a run by sending
+`decentralabs:fmi-run-request` version 1 with a `parameters` object whose keys
+are FMU input names. Marketplace validates each name against the FMU metadata,
+then runs the model and streams its samples back to the app. Apps own their
+input controls and presentation; Marketplace does not wrap a Three.js app in
+the standard FMU controls. The app never receives an FMU, access key or
+reservation credential.
 It reports `decentralabs:digital-twin-ready` version 1 after its procedural
 scene has initialized and reports `decentralabs:digital-twin-error` version 1
 if scene construction fails.
