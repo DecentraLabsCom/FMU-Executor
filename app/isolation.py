@@ -169,6 +169,7 @@ def apply_worker_limits(
     policy: dict[str, Any] | None = None,
     worker_directory: str | None = None,
     fmu_path: str | None = None,
+    access_key: str | None = None,
 ) -> None:
     """Apply platform worker limits before loading untrusted native FMU code."""
     if os.name == "nt":
@@ -177,6 +178,7 @@ def apply_worker_limits(
     try:
         import resource
 
+        spawn_executable = _configured_spawn_executable(access_key)
         policy = policy or {}
         cpu_seconds = min(config.WORKER_CPU_SECONDS, int(policy.get("maxCpuSeconds", config.WORKER_CPU_SECONDS)))
         memory_bytes = min(
@@ -195,13 +197,41 @@ def apply_worker_limits(
                 raise WorkerIsolationError("Linux FMU worker has no private work directory")
             if not fmu_path:
                 raise WorkerIsolationError("Linux FMU worker has no immutable FMU path")
-            _install_linux_landlock(worker_directory, fmu_path)
-            _install_linux_worker_filter()
+            _install_linux_landlock(worker_directory, fmu_path, spawn_executable)
+            _install_linux_worker_filter(allow_spawn=spawn_executable is not None)
     except (ImportError, OSError, ValueError) as exc:
         raise WorkerIsolationError("Unable to apply FMU worker resource limits") from exc
 
 
-def _install_linux_landlock(worker_directory: str, fmu_path: str) -> None:
+def _configured_spawn_executable(access_key: str | None) -> Path | None:
+    """Resolve the one explicitly configured child executable for local demos."""
+    allowed_keys = {
+        value.strip()
+        for value in os.environ.get("FMU_SPAWN_ACCESS_KEYS", "").split(",")
+        if value.strip()
+    }
+    if not access_key or access_key not in allowed_keys:
+        return None
+
+    executable_value = os.environ.get("FMU_SPAWN_EXECUTABLE", "").strip()
+    spawn_path_value = os.environ.get("SPAWNPATH", "").strip()
+    if not executable_value or not spawn_path_value:
+        raise WorkerIsolationError("A whitelisted FMU requires a configured Spawn executable")
+    try:
+        executable = Path(executable_value).resolve(strict=True)
+        spawn_path = Path(spawn_path_value).resolve(strict=True)
+    except OSError as exc:
+        raise WorkerIsolationError("The configured Spawn runtime is unavailable") from exc
+    if not executable.is_file() or executable.parent != spawn_path or not os.access(executable, os.X_OK):
+        raise WorkerIsolationError("The configured Spawn executable is not inside SPAWNPATH")
+    return executable
+
+
+def _install_linux_landlock(
+    worker_directory: str,
+    fmu_path: str,
+    spawn_executable: Path | None = None,
+) -> None:
     """Whitelist runtime reads and limit FMU writes to the private worker directory."""
     libc = ctypes.CDLL(None, use_errno=True)
     libc.syscall.restype = ctypes.c_long
@@ -222,7 +252,7 @@ def _install_linux_landlock(worker_directory: str, fmu_path: str) -> None:
     truncate = 1 << 14 if version >= 3 else 0
     handled = execute | write_file | read_file | read_dir | remove_dir | remove_file | make_bits | refer | truncate
     traverse_access = execute
-    read_directory_access = execute | read_file | read_dir
+    read_directory_access = read_file | read_dir
     worker_access = handled
     read_file_access = read_file
     ruleset_attr = _LandlockRulesetAttr(handled)
@@ -271,6 +301,25 @@ def _install_linux_landlock(worker_directory: str, fmu_path: str) -> None:
         add_path_rule(worker_directory, worker_access, required=True)
         add_path_rule(fmu_path, read_file_access, required=True)
 
+        if spawn_executable is not None:
+            spawn_root = spawn_executable.parent.parent
+            add_path_rule(spawn_root, read_directory_access, required=True)
+            add_path_rule(spawn_executable, execute | read_file, required=True)
+            # Modelica's EnergyPlus adapter invokes Spawn through `/bin/sh -c`.
+            # Permit that exact shell binary; Landlock still blocks every other
+            # executable except Spawn and the dynamic loader below.
+            add_path_rule("/bin/sh", execute | read_file, required=True)
+            machine = platform.machine().lower()
+            interpreter = {
+                "x86_64": "/lib64/ld-linux-x86-64.so.2",
+                "amd64": "/lib64/ld-linux-x86-64.so.2",
+                "aarch64": "/lib/ld-linux-aarch64.so.1",
+                "arm64": "/lib/ld-linux-aarch64.so.1",
+            }.get(machine)
+            if interpreter is None:
+                raise WorkerIsolationError("Spawn is unsupported on this Linux architecture")
+            add_path_rule(interpreter, execute | read_file, required=True)
+
         for runtime_file in (
             "/etc/ld.so.cache", "/etc/nsswitch.conf", "/etc/passwd", "/etc/group",
             "/etc/localtime", "/proc/self/maps", "/proc/cpuinfo", "/proc/meminfo",
@@ -291,8 +340,8 @@ def _install_linux_landlock(worker_directory: str, fmu_path: str) -> None:
         os.close(ruleset_fd)
 
 
-def _install_linux_worker_filter() -> None:
-    """Deny network socket creation and executable child processes in Linux workers."""
+def _install_linux_worker_filter(*, allow_spawn: bool = False) -> None:
+    """Deny networking and child execution, except an opt-in Spawn worker."""
     machine = platform.machine().lower()
     if machine in {"x86_64", "amd64"}:
         denied = (
@@ -309,22 +358,31 @@ def _install_linux_worker_filter() -> None:
     else:
         raise WorkerIsolationError("Linux worker isolation is unsupported on this architecture")
 
+    if allow_spawn:
+        denied = tuple(number for number in denied if number not in {57, 58, 59, 322})
+
     instructions: list[_SockFilter] = [_SockFilter(0x20, 0, 0, 0)]  # seccomp_data.nr
     for syscall_number in denied:
         instructions.extend((
             _SockFilter(0x15, 0, 1, syscall_number),  # JEQ: skip the next instruction when not equal
             _SockFilter(0x06, 0, 0, 0x00050000 | 1),  # RET_ERRNO(EPERM)
         ))
-    instructions.extend((
-        _SockFilter(0x15, 0, 4, clone_number),
-        _SockFilter(0x20, 0, 0, 16),  # seccomp_data.args[0] (clone flags)
-        _SockFilter(0x45, 1, 0, clone_thread_flag),  # JSET: allow pthread clone only
-        _SockFilter(0x06, 0, 0, 0x00050000 | 1),
-        _SockFilter(0x06, 0, 0, 0x7FFF0000),
-        _SockFilter(0x15, 0, 1, clone3_number),
-        _SockFilter(0x06, 0, 0, 0x00050000 | 38),  # ENOSYS makes libc retry with clone()
-        _SockFilter(0x06, 0, 0, 0x7FFF0000),  # allow everything else
-    ))
+    if allow_spawn:
+        # Child process creation is enabled only when a specific access key is
+        # whitelisted. Landlock restricts exec to `/bin/sh`, the configured
+        # Spawn binary and their dynamic loader.
+        instructions.append(_SockFilter(0x06, 0, 0, 0x7FFF0000))
+    else:
+        instructions.extend((
+            _SockFilter(0x15, 0, 4, clone_number),
+            _SockFilter(0x20, 0, 0, 16),  # seccomp_data.args[0] (clone flags)
+            _SockFilter(0x45, 1, 0, clone_thread_flag),  # JSET: allow pthread clone only
+            _SockFilter(0x06, 0, 0, 0x00050000 | 1),
+            _SockFilter(0x06, 0, 0, 0x7FFF0000),
+            _SockFilter(0x15, 0, 1, clone3_number),
+            _SockFilter(0x06, 0, 0, 0x00050000 | 38),  # ENOSYS makes libc retry with clone()
+            _SockFilter(0x06, 0, 0, 0x7FFF0000),  # allow everything else
+        ))
     filter_array = (_SockFilter * len(instructions))(*instructions)
     program = _SockFprog(len(instructions), filter_array)
     libc = ctypes.CDLL(None, use_errno=True)

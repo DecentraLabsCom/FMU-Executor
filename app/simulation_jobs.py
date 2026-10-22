@@ -27,7 +27,7 @@ from .simulation_store import QuotaExceededError, SimulationStore, reservation_s
 
 
 _JOB_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
-_MAX_PARAMETERS_PER_CASE = 32
+_MAX_PARAMETERS_PER_CASE = config.MAX_SIMULATION_PARAMETERS
 _MAX_PARAMETER_BYTES = 16 * 1024
 
 

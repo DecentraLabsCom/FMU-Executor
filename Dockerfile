@@ -16,6 +16,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /opt/fmu-executor
 
+# Optional runtime library for the local-only BOPTEST building preview.
+# Release images omit it unless a developer explicitly opts in at build time.
+ARG INSTALL_LOCAL_BOPTEST_RUNTIME=false
+RUN if [ "$INSTALL_LOCAL_BOPTEST_RUNTIME" = "true" ]; then \
+      apt-get update \
+      && apt-get install --yes --no-install-recommends libgfortran5 \
+      && rm -rf /var/lib/apt/lists/*; \
+    fi
+
 COPY pyproject.toml README.md VERSION ./
 COPY app ./app
 

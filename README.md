@@ -82,10 +82,11 @@ the Gateway environment expected for station mode:
 | `FMU_MAX_ARCHIVE_BYTES` | `512 MiB` | Maximum compressed FMU size |
 | `FMU_MAX_EXPANDED_BYTES` | `2 GiB` | Maximum total expanded size of archive entries |
 | `FMU_MAX_ARCHIVE_ENTRIES` | `20,000` | Maximum ZIP entries in an FMU |
-| `FMU_MAX_MODEL_DESCRIPTION_BYTES` | `8 MiB` | Maximum `modelDescription.xml` size |
+| `FMU_MAX_MODEL_DESCRIPTION_BYTES` | `32 MiB` | Maximum `modelDescription.xml` size |
 | `FMU_WORKER_CPU_SECONDS` | `300` | Per-worker CPU-time limit |
 | `FMU_WORKER_MEMORY_MIB` | `1024` | Per-worker memory limit |
 | `FMU_WORKER_FILE_MIB` | `128` | Linux per-file write limit; Windows AppContainer workers have no per-file quota |
+| `FMU_MAX_SIMULATION_PARAMETERS` | `32` | Maximum named input parameters per run or scenario |
 | `FMU_EXECUTOR_COMMIT` | Build metadata | Source commit recorded in execution evidence |
 | `FMU_MAX_INPUT_UPDATE_BYTES` | `65536` | Maximum JSON size for one `sim.setInputs` update |
 | `FMU_MAX_INPUT_UPDATES_PER_DAY` | `100000` | Daily runtime input update limit per reservation and FMU |
@@ -124,7 +125,7 @@ All endpoints require `X-Internal-Session-Token` header (except `/internal/healt
 |---|---|---|
 | GET | `/internal/health` | Health & diagnostics |
 | GET | `/internal/fmu/catalog` | FMU inventory; `X-FMU-Access-Key` header |
-| GET | `/internal/fmu/describe` | Model description; `X-FMU-Access-Key` header |
+| GET | `/internal/fmu/describe` | Model description; `X-FMU-Access-Key` header; `?publicOnly=true` omits local implementation variables; `?causality=output` selects one FMI causality |
 | GET | `/internal/fmu/companion-asset?assetType=glb\|threejs-app` | Same-stem `.glb` or `.webapp.zip`; requires internal and FMU access-key headers |
 | GET | `/internal/fmu/companion-app/{asset_path}` | One safe file from the same-stem `.webapp.zip`; requires internal and FMU access-key headers |
 | GET | `/internal/fmu/capacity` | Effective execution capacity; internal token required |
@@ -293,6 +294,14 @@ its model description can be parsed.
 `/internal/fmu/describe` reports the capabilities declared by the FMU artifact.
 Its `supportsModelExchange` field describes that artifact; it does not mean the
 Executor can run it. An FMU must provide Co-Simulation to be executable here.
+Description parsing and validation still cover the full `modelDescription.xml`.
+For API consumers that need its FMI interface rather than internal state,
+`publicOnly=true` omits variables whose causality is `local` before building the
+JSON response; it keeps inputs, outputs, parameters, the FMI independent
+variable, and other non-local causality values. `causality=output` can select
+only outputs for a visualization that does not need controls or parameters.
+These options reduce response and normalization volume; they do not relax FMI
+validation or change simulation.
 
 ### OMSimulator (future composition backend)
 
@@ -364,7 +373,8 @@ base64url JSON. The internal token authenticates the channel; the stored scope
 hash enforces reservation ownership.
 
 Batch requests have at most 8 scenarios. Each scenario can set up to 32
-parameters and at most 16 KiB of parameter JSON. A reservation is limited to
+parameters by default and at most 16 KiB of parameter JSON. The parameter
+count can be raised to 256 with `FMU_MAX_SIMULATION_PARAMETERS`. A reservation is limited to
 100 scenario starts per UTC day by default. Authenticated Gateway one-shot
 runs, streams, async jobs, batch cases, realtime `sim.initialize`/`sim.reset`
 operations, and each non-empty realtime `sim.setInputs` update consume this
@@ -387,6 +397,7 @@ available until retention or storage pruning removes their output data.
 | `FMU_MAX_BATCH_CASES` | 8 | 1–20 |
 | `FMU_MAX_SCENARIOS_PER_RESERVATION_PER_DAY` | 100 | 1–10,000 |
 | `FMU_MAX_SIMULATION_STEPS` | 10,000 | 100–100,000 |
+| `FMU_MAX_SIMULATION_PARAMETERS` | 32 | 1–256 |
 | `FMU_HISTORY_RETENTION_DAYS` | 7 | 1–30 |
 | `FMU_MAX_HISTORY_RECORDS` | 10,000 | 100–100,000 |
 | `FMU_MAX_RESULT_BYTES` | 8 MiB | 64 KiB–32 MiB |
@@ -476,15 +487,14 @@ assets. The Linux arm64 package omits this x86_64-only demo. Lab Manager can
 link either the GLB or the app, and Marketplace selects the viewer from the AAS
 File MIME type.
 
-The previous Gateway FMI example models are now canonical in
-[`examples/reference-fmus`](examples/reference-fmus/README.md). Their FMU
-archives include Linux x64 binaries; FMI 2 uses `linux64` and FMI 3 uses
-`x86_64-linux`. `BinaryClockTest.fmu` now includes both Windows and Linux x64
-builds, generated from its included source. Gateway refreshes all development
-copies, including Smart Warehouse assets, with the
-`Lab Gateway/scripts/sync_fmu_examples.py` script.
-The example directories document their sources, licenses, builds and platform
-variants.
+The six reference FMUs in
+[`examples/reference-fmus`](examples/reference-fmus/README.md) remain tracked
+and distributed in this repository. Gateway's normal example sync copies them
+with Smart Warehouse by default. Windows and Linux x86_64 Lab Station releases
+include all six; Linux arm64 releases include the three models with native
+arm64 binaries. The local-only policy for new digital-twin demos does not apply
+to these existing reference examples. Their directory documents provenance,
+licenses, builds and platform variants.
 
 ## Tests
 

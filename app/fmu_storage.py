@@ -485,18 +485,48 @@ def get_fmu_path(access_key: str) -> Path:
     return path
 
 
-def describe(access_key: str) -> dict[str, Any]:
+def describe(
+    access_key: str,
+    *,
+    public_only: bool = False,
+    causality: str | None = None,
+) -> dict[str, Any]:
     """Parse the model description and return a normalised dict compatible with the Gateway contract."""
-    return describe_path(get_fmu_path(access_key))
+    return describe_path(
+        get_fmu_path(access_key),
+        public_only=public_only,
+        causality=causality,
+    )
 
 
-def describe_path(path: Path) -> dict[str, Any]:
+def describe_path(
+    path: Path,
+    *,
+    public_only: bool = False,
+    causality: str | None = None,
+) -> dict[str, Any]:
     """Describe a specific immutable FMU file."""
-    fmu_path = str(path)
-    md = fmpy.read_model_description(fmu_path)
+    md = fmpy.read_model_description(str(path))
+    return describe_model_description(md, public_only=public_only, causality=causality)
+
+
+def describe_model_description(
+    md: Any,
+    *,
+    public_only: bool = False,
+    causality: str | None = None,
+) -> dict[str, Any]:
+    """Normalize a parsed FMI description without reopening the FMU archive."""
 
     variables: list[dict[str, Any]] = []
     for var in md.modelVariables:
+        # Local variables are internal state, not part of the FMI interface.
+        # FMI's independent variable (usually time) and future causality values
+        # remain available to callers of the reduced description.
+        if public_only and var.causality == "local":
+            continue
+        if causality is not None and var.causality != causality:
+            continue
         entry: dict[str, Any] = {
             "name": var.name,
             "valueReference": var.valueReference,

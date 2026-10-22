@@ -324,11 +324,18 @@ async def companion_app_asset(
 
 
 @app.get("/internal/fmu/describe", dependencies=[Depends(_check_token)])
-async def describe(access_key: str = Header(..., alias="X-FMU-Access-Key")):
+async def describe(
+    access_key: str = Header(..., alias="X-FMU-Access-Key"),
+    public_only: bool = Query(False, alias="publicOnly"),
+    causality: str | None = Query(
+        None,
+        pattern="^(input|output|parameter|calculatedParameter|structuralParameter|independent|local)$",
+    ),
+):
     access_key = _validated_access_key(access_key)
     if not fmu_storage.fmu_exists(access_key):
         raise HTTPException(404, "FMU_NOT_FOUND")
-    return fmu_storage.describe(access_key)
+    return fmu_storage.describe(access_key, public_only=public_only, causality=causality)
 
 
 # ── Validate / Quarantine ────────────────────────────────────────

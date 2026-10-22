@@ -685,8 +685,10 @@ class FmuSession:
 
     def _describe(self) -> dict[str, Any]:
         from . import fmu_storage
-        # Re-use the same normalised describe logic
-        return fmu_storage.describe(self.access_key)
+        # The isolated worker may only access the staged FMU path, not the
+        # catalog root used to resolve access keys. Reuse its parsed model
+        # description and avoid opening a large modelDescription.xml twice.
+        return fmu_storage.describe_model_description(self._md)
 
     def _validate_values(self, params: dict[str, Any], *, phase: str) -> dict[str, Any]:
         if not isinstance(params, dict):

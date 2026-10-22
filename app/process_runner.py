@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import os
 import multiprocessing as mp
@@ -36,6 +37,8 @@ from .windows_appcontainer import WindowsAppContainerProcess, delete_worker_appc
 
 if TYPE_CHECKING:
     from .engine import OutputSubscription
+
+logger = logging.getLogger(__name__)
 
 
 class ProcessExecutionError(RuntimeError):
@@ -141,6 +144,19 @@ def _sanitize_worker_environment() -> None:
         upper_name = name.upper()
         if any(marker in upper_name for marker in _SECRET_ENV_MARKERS):
             os.environ.pop(name, None)
+    # Native math runtimes may size their worker pools from the host's CPU
+    # count rather than the constrained FMU worker allocation. Keep those
+    # pools single-threaded so large FMUs cannot exhaust their memory budget
+    # before simulation starts.
+    for name in (
+        "OPENBLAS_NUM_THREADS",
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+        "BLIS_NUM_THREADS",
+    ):
+        os.environ[name] = "1"
 
 
 def _stage_windows_fmu(source: Path, worker_directory: Path) -> Path:
@@ -219,7 +235,7 @@ def _realtime_session_worker(
             bind_worker_to_parent(expected_parent_pid)
         if start_gate is not None:
             start_gate.wait()
-        apply_worker_limits(resource_policy, worker_directory, str(fmu_path))
+        apply_worker_limits(resource_policy, worker_directory, str(fmu_path), access_key)
         _sanitize_worker_environment()
         if worker_directory:
             os.chdir(worker_directory)
@@ -779,7 +795,7 @@ def _execute_worker(
             bind_worker_to_parent(expected_parent_pid)
         if start_gate is not None:
             start_gate.wait()
-        apply_worker_limits(resource_policy, worker_directory, fmu_path)
+        apply_worker_limits(resource_policy, worker_directory, fmu_path, access_key)
         _sanitize_worker_environment()
         if worker_directory:
             os.chdir(worker_directory)
@@ -926,7 +942,13 @@ def _execute_worker(
             "message": "FMU worker isolation could not be applied",
             "retryable": False,
         })
-    except Exception:
+    except Exception as exc:
+        logger.exception(
+            "Isolated FMU worker failed (accessKey=%s, probe=%s, errorType=%s)",
+            access_key,
+            probe_only,
+            type(exc).__name__,
+        )
         output_queue.put({
             "kind": "error",
             "code": "FMU_EXECUTION_FAILED",
@@ -948,7 +970,7 @@ def _new_process(
     capture_series: bool = False,
     probe_only: bool = False,
     resource_policy: dict[str, Any] | None = None,
-) -> tuple[Any, Any, WindowsWorkerJob | None, Path]:
+) -> tuple[Any, Any, WindowsWorkerJob | None, Path, Any]:
     context = mp.get_context("spawn")
     config.TEMP_DIR.mkdir(parents=True, exist_ok=True)
     worker_directory = Path(tempfile.mkdtemp(prefix="worker_", dir=str(config.TEMP_DIR)))
@@ -980,7 +1002,12 @@ def _new_process(
         job = attach_worker_limits(process, resource_policy)
         _mark_worker_directory(worker_directory, worker_pid)
         start_gate.set()
-        return process, context, job, worker_directory
+        # Keep the event alive until the caller has received a worker result.
+        # Process.start() drops its copy of _args immediately, while a spawned
+        # child may still be unpickling the semaphore-backed event. Returning a
+        # strong reference prevents its parent-side finalizer from unlinking
+        # the semaphore before the child can rebuild it.
+        return process, context, job, worker_directory, start_gate
     except Exception as exc:
         start_gate.set()
         terminate_worker(process)
@@ -1010,7 +1037,7 @@ def run(
     context = mp.get_context("spawn")
     output_queue = context.Queue(maxsize=1)
     try:
-        process, _, job, worker_directory = _new_process(
+        process, _, job, worker_directory, _start_gate = _new_process(
             fmu_path, access_key, parameters, options, output_queue,
             False, capture_series, probe_only, resource_policy,
         )
@@ -1097,7 +1124,7 @@ def stream(
     context = mp.get_context("spawn")
     output_queue = context.Queue(maxsize=64)
     try:
-        process, _, job, worker_directory = _new_process(
+        process, _, job, worker_directory, _start_gate = _new_process(
             fmu_path, access_key, parameters, options, output_queue, True,
             resource_policy=resource_policy,
         )
