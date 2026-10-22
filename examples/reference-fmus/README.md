@@ -4,8 +4,8 @@ This directory holds six distributed FMI examples for development and
 validation. Their `.fmu` archives are tracked in Git and copied by Gateway's
 normal example sync. Windows and Linux x86_64 Lab Station releases include all
 six archives with the license; Linux arm64 releases include the three models
-with native aarch64 binaries. The local-only policy for new demos does not
-apply to these existing reference FMUs. The five upstream reference models are unmodified FMU artifacts from
+with native aarch64 binaries. The five upstream reference models are
+unmodified FMU artifacts from
 [Modelica Reference FMUs v0.0.39](https://github.com/modelica/Reference-FMUs/tree/v0.0.39):
 
 | FMU | FMI | Linux x86_64 archive platform |
@@ -50,12 +50,9 @@ development data directory, run from the workspace root:
 python "Lab Gateway/scripts/sync_fmu_examples.py" --examples-root "FMU-Executor/examples"
 ```
 
-The local-only BOPTEST office preview is staged separately with
-`--include-local-boptest`. That option copies its assets only to the ignored
-`Lab Gateway/fmu-data/` directory; it does not add them to Docker images,
-Lab Station installers or Marketplace assets. A clean checkout contains these
-six tracked FMU archives. The five upstream files come from the pinned
-Modelica Reference FMUs release and `BinaryClockTest.fmu` can be rebuilt from
+A clean checkout contains these six tracked FMU archives. The five upstream
+files come from the pinned Modelica Reference FMUs release and
+`BinaryClockTest.fmu` can be rebuilt from
 the source and scripts below.
 
 The Reference FMUs and their bundled source files are licensed under the

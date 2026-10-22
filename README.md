@@ -492,9 +492,8 @@ The six reference FMUs in
 and distributed in this repository. Gateway's normal example sync copies them
 with Smart Warehouse by default. Windows and Linux x86_64 Lab Station releases
 include all six; Linux arm64 releases include the three models with native
-arm64 binaries. The local-only policy for new digital-twin demos does not apply
-to these existing reference examples. Their directory documents provenance,
-licenses, builds and platform variants.
+arm64 binaries. Their directory documents provenance, licenses, builds and
+platform variants.
 
 ## Tests
 
