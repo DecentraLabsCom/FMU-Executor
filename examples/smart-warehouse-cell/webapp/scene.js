@@ -1,6 +1,42 @@
 import * as THREE from './vendor/three.module.js'
 
-const SOURCE_PACKAGE_X = [-4.0, -3.5, -3.0, -1.7, -1.2, -0.7]
+const SOURCE_PACKAGE_X = [-4.11, -2.53, -0.95, 2.20, 3.78, 5.36]
+const AGV_START_X = -6.2
+const AGV_ROUTE_CENTER_Z = -0.12
+const AGV_CHASSIS_DEPTH_Z = 1.22
+const AGV_TRAY_DEPTH_Z = 1.38
+const AGV_TRAY_SIDE_OFFSET_Z = AGV_CHASSIS_DEPTH_Z / 2 + AGV_TRAY_DEPTH_Z / 2
+const AGV_TRAY_DECK_PLATE_DEPTH_Z = 1.22
+const AGV_TRAY_ROLLER_MARGIN_Z = 0.10
+const AGV_TRAY_ROLLER_LENGTH_Z = AGV_TRAY_DEPTH_Z - AGV_TRAY_ROLLER_MARGIN_Z * 2
+const TRUCK_CONVEYOR_X = 4.9
+const TRUCK_CONVEYOR_FRAME_WIDTH_X = 1.46
+const TRUCK_CONVEYOR_BELT_WIDTH_X = 1.32
+export const TRUCK_CONVEYOR_ENTRY_Z = AGV_ROUTE_CENTER_Z + AGV_TRAY_SIDE_OFFSET_Z
+const TRUCK_CONVEYOR_BELT_START_Z = 0.58
+const TRUCK_CONVEYOR_BELT_END_Z = 5.52
+const TRUCK_CONVEYOR_FRAME_START_Z = 0.50
+const TRUCK_CONVEYOR_FRAME_END_Z = 5.58
+const TRUCK_CONVEYOR_BELT_LENGTH_Z = TRUCK_CONVEYOR_BELT_END_Z - TRUCK_CONVEYOR_BELT_START_Z
+const TRUCK_CONVEYOR_ROLLER_COUNT = 19
+const TRUCK_CONVEYOR_ROLLER_MARGIN_Z = 0.07
+const TRUCK_CONVEYOR_ROLLER_SPACING_Z = (TRUCK_CONVEYOR_BELT_LENGTH_Z - TRUCK_CONVEYOR_ROLLER_MARGIN_Z * 2) / (TRUCK_CONVEYOR_ROLLER_COUNT - 1)
+const TRUCK_CONVEYOR_BELT_CENTER_Z = (TRUCK_CONVEYOR_BELT_START_Z + TRUCK_CONVEYOR_BELT_END_Z) / 2
+const TRUCK_CONVEYOR_FRAME_LENGTH_Z = TRUCK_CONVEYOR_FRAME_END_Z - TRUCK_CONVEYOR_FRAME_START_Z
+const TRUCK_CONVEYOR_FRAME_CENTER_Z = (TRUCK_CONVEYOR_FRAME_START_Z + TRUCK_CONVEYOR_FRAME_END_Z) / 2
+const TRUCK_CONVEYOR_ENTRY_PACKAGE_HALF_DEPTH_Z = 0.32
+const TRUCK_CONVEYOR_ENTRY_RAIL_CLEARANCE_Z = 0.20
+const TRUCK_CONVEYOR_ENTRY_RAIL_START_Z = TRUCK_CONVEYOR_ENTRY_Z + TRUCK_CONVEYOR_ENTRY_PACKAGE_HALF_DEPTH_Z + TRUCK_CONVEYOR_ENTRY_RAIL_CLEARANCE_Z
+const TRUCK_CONVEYOR_ENTRY_RAIL_LENGTH_Z = TRUCK_CONVEYOR_BELT_END_Z - TRUCK_CONVEYOR_ENTRY_RAIL_START_Z
+const TRUCK_CONVEYOR_OPPOSITE_RAIL_LENGTH_Z = TRUCK_CONVEYOR_BELT_LENGTH_Z
+const TRUCK_CONVEYOR_OPPOSITE_RAIL_CENTER_Z = TRUCK_CONVEYOR_BELT_CENTER_Z
+const TRUCK_LOADER_SUPPORT_OFFSET_X = TRUCK_CONVEYOR_FRAME_WIDTH_X / 2 + 0.24
+const TRUCK_LOADER_LIFT_Y = 0.40
+const AGV_TRAY_WIDTH_X = 1.44
+const TRUCK_CONVEYOR_FRAME_ENTRY_X = TRUCK_CONVEYOR_X - TRUCK_CONVEYOR_FRAME_WIDTH_X / 2
+const AGV_ROUTE_END_X = TRUCK_CONVEYOR_FRAME_ENTRY_X - AGV_TRAY_WIDTH_X / 2
+const AGV_ROUTE_LENGTH = AGV_ROUTE_END_X - AGV_START_X
+const TRAY_PACKAGE_TRAVEL = TRUCK_CONVEYOR_X - AGV_ROUTE_END_X
 const PACKAGE_SIZES = [
   [0.48, 0.42, 0.46],
   [0.60, 0.54, 0.40],
@@ -10,6 +46,18 @@ const PACKAGE_SIZES = [
   [0.50, 0.56, 0.58],
 ]
 const PACKAGE_PALETTE = ['blue', 'gold', 'coral']
+const MIDDLE_RACK_TOP_PACKAGE_SIZES = [
+  [0.52, 0.26, 0.44],
+  [0.46, 0.30, 0.50],
+  [0.56, 0.28, 0.42],
+  [0.50, 0.24, 0.52],
+]
+const SECOND_SHELF_STOCK_SIZES = [
+  [0.50, 0.44, 0.46],
+  [0.54, 0.50, 0.50],
+  [0.46, 0.40, 0.42],
+  [0.52, 0.48, 0.46],
+]
 const CARGO_SLOTS = [
   [0.0, 7.27], [-0.7, 7.27], [0.7, 7.27],
   [0.0, 6.27], [-0.7, 6.27], [0.7, 6.27],
@@ -210,18 +258,18 @@ function setParcelDimensions(parcel, size, color) {
   parcel.tape.position.set(0, 0, depth / 2 + 0.009)
   parcel.topTape.scale.set(width * 0.13, 0.012, depth * 0.96)
   parcel.topTape.position.set(0, height / 2 + 0.006, 0)
-  parcel.label.scale.set(width * 0.43, height * 0.25, 1)
-  parcel.label.position.set(width * 0.20, -height * 0.12, depth / 2 + 0.018)
+  parcel.label.scale.set(width * 0.32, height * 0.18, 1)
+  parcel.label.position.set(width * 0.18, -height * 0.10, depth / 2 + 0.004)
 }
 
-function makeParcel(parent, geometry, boxGeometry, materials, labelMaterial, position, size, color, name) {
+function makeParcel(parent, geometry, boxGeometry, labelGeometry, materials, labelMaterial, position, size, color, name) {
   const group = new THREE.Group()
   group.position.set(position[0], position[1], position[2])
   group.name = name
   const body = addMesh(group, geometry, materials[color] || materials.blue, [0, 0, 0], size, { name: `${name}_carton` })
   const tape = addMesh(group, boxGeometry, materials.tape, [0, 0, 0], [0.1, 0.9, 0.01], { castShadow: false })
   const topTape = addMesh(group, boxGeometry, materials.tape, [0, 0, 0], [0.1, 0.01, 0.9], { castShadow: false })
-  const label = addMesh(group, boxGeometry, labelMaterial, [0, 0, 0], [0.4, 0.25, 0.01], { castShadow: false })
+  const label = addMesh(group, labelGeometry, labelMaterial, [0, 0, 0], [0.4, 0.25, 1], { castShadow: false })
   parent.add(group)
   const parcel = { group, body, tape, topTape, label, materials }
   setParcelDimensions(parcel, size, color)
@@ -241,12 +289,14 @@ export function createSmartWarehouseScene(scene, renderer) {
   scene.add(root)
 
   const boxGeometry = new THREE.BoxGeometry(1, 1, 1)
+  const labelGeometry = new THREE.PlaneGeometry(1, 1)
   const roundedBoxGeometry = makeRoundedBoxGeometry()
   const cylinderGeometry = new THREE.CylinderGeometry(1, 1, 1, 32, 1)
   const sphereGeometry = new THREE.SphereGeometry(1, 28, 20)
   const torusGeometry = new THREE.TorusGeometry(1, 0.16, 12, 36)
   const wheelGeometry = new THREE.CylinderGeometry(0.34, 0.34, 0.22, 40, 1)
-  const rollerGeometry = new THREE.CylinderGeometry(0.055, 0.055, 0.92, 24, 1)
+  const rollerGeometry = new THREE.CylinderGeometry(0.055, 0.055, 1.34, 24, 1)
+  const trayRollerGeometry = new THREE.CylinderGeometry(0.055, 0.055, AGV_TRAY_ROLLER_LENGTH_Z, 24, 1)
   const textures = []
   const floorCanvas = seededNoiseTexture([104, 117, 119], 24017)
   const floorTexture = makeCanvasTexture(renderer, floorCanvas)
@@ -331,7 +381,9 @@ export function createSmartWarehouseScene(scene, renderer) {
     transferParcel: null,
     pickerReach: null,
     pickerInnerReach: null,
+    pickerReachHead: null,
     pickerDropRod: null,
+    pickerDropInner: null,
     pickerTool: null,
     gripper: null,
     gripperLeft: null,
@@ -377,7 +429,7 @@ export function createSmartWarehouseScene(scene, renderer) {
   }
 
   function makeParcelAt(position, size, color, name) {
-    return makeParcel(root, roundedBoxGeometry, boxGeometry, parcelMaterials, labelMaterial, position, size, color, name)
+    return makeParcel(root, roundedBoxGeometry, boxGeometry, labelGeometry, parcelMaterials, labelMaterial, position, size, color, name)
   }
 
   function makeCanvasSign(parent, position, size, texture = signTexture) {
@@ -408,10 +460,11 @@ export function createSmartWarehouseScene(scene, renderer) {
   addBox(root, materials.foundation, [22.2, 0.45, 21.0], [0, -0.31, 1.8])
   addBox(root, materials.concrete, [21.8, 0.20, 20.6], [0, -0.08, 1.8], { castShadow: false })
   addBox(root, materials.apron, [18.4, 0.22, 4.4], [0, -0.09, 9.1], { castShadow: false })
-  addBox(root, materials.aisle, [11.4, 0.026, 2.0], [0.7, 0.027, -0.12], { castShadow: false })
+  const agvRouteCenterX = (AGV_START_X + AGV_ROUTE_END_X) / 2
+  addBox(root, materials.aisle, [AGV_ROUTE_LENGTH + 3.0, 0.026, 2.0], [agvRouteCenterX, 0.027, -0.12], { castShadow: false })
   for (const z of [-1.16, 0.92]) {
-    addBox(root, materials.marking, [11.0, 0.018, 0.052], [0.7, 0.046, z], { castShadow: false })
-    addEmissiveLine(root, [10.6, 0.009, 0.018], [0.7, 0.058, z + (z < 0 ? 0.09 : -0.09)], '#1bb9b2')
+    addBox(root, materials.marking, [AGV_ROUTE_LENGTH + 2.6, 0.018, 0.052], [agvRouteCenterX, 0.046, z], { castShadow: false })
+    addEmissiveLine(root, [AGV_ROUTE_LENGTH + 2.2, 0.009, 0.018], [agvRouteCenterX, 0.058, z + (z < 0 ? 0.09 : -0.09)], '#1bb9b2')
   }
   for (let x = -8; x <= 8; x += 1) {
     addBox(root, materials.darkSteel, [0.018, 0.008, 15.8], [x, 0.025, 1.3], { castShadow: false })
@@ -496,11 +549,15 @@ export function createSmartWarehouseScene(scene, renderer) {
     addBar(root, cylinderGeometry, materials.rackOrange, [x, 0.42, rackBackZ], [x, 5.18, rackFrontZ], 0.035)
     addBar(root, cylinderGeometry, materials.rackOrange, [x, 5.18, rackBackZ], [x, 0.42, rackFrontZ], 0.035)
   }
-  for (const y of [0.48, 1.94, 3.72, 5.20]) {
+  for (const y of [0.48, 1.94, 3.72, 4.65]) {
     for (const z of [rackFrontZ, rackBackZ]) {
       addBox(root, materials.rackOrange, [rackLength, 0.14, 0.11], [rackCenterX, y, z])
     }
-    addBox(root, materials.rackDeck, [rackLength, 0.09, 1.68], [rackCenterX, y - 0.11, -3.30])
+    // Leave the bay between tiers two and three open for the picker gripper.
+    // The orange crossbeams and steel slats still support the packages above.
+    if (y !== 3.72) {
+      addBox(root, materials.rackDeck, [rackLength, 0.09, 1.68], [rackCenterX, y - 0.11, -3.30])
+    }
     for (let x = rackMinX + 0.06; x <= rackMaxX - 0.06; x += 0.38) {
       addBox(root, materials.darkSteel, [0.035, 0.04, 1.52], [x, y - 0.045, -3.30], { castShadow: false })
     }
@@ -512,7 +569,31 @@ export function createSmartWarehouseScene(scene, renderer) {
     const parcel = makeParcelAt([x, 2.01 + size[1] / 2, -3.08], size, PACKAGE_PALETTE[index % 3], `ShelfParcel_${index + 1}`)
     dynamic.sourcePackages.push(parcel)
   }
-  for (const [tierIndex, shelfY, z] of [[0, 0.48, -3.08], [1, 3.72, -3.54], [2, 5.20, -3.08]]) {
+  // Fill the second shelf around the six model-driven pickup boxes. A rear
+  // reserve row spans the full rack; a front row fills the unoccupied right bay.
+  const secondShelfRows = [
+    { name: 'Back', startX: rackMinX + 0.35, endX: rackMaxX - 0.35, z: -3.82 },
+    { name: 'Front', startX: 0.1, endX: rackMaxX - 0.35, z: -2.72 },
+  ]
+  for (let rowIndex = 0; rowIndex < secondShelfRows.length; rowIndex += 1) {
+    const row = secondShelfRows[rowIndex]
+    let cartonIndex = 0
+    for (let x = row.startX; x <= row.endX; x += 0.66) {
+      const size = SECOND_SHELF_STOCK_SIZES[(cartonIndex + rowIndex) % SECOND_SHELF_STOCK_SIZES.length]
+      const color = PACKAGE_PALETTE[(cartonIndex + rowIndex + 1) % PACKAGE_PALETTE.length]
+      const shelfTop = 1.94 - 0.065
+      if (row.name !== 'Front' || SOURCE_PACKAGE_X.every((sourceX) => Math.abs(x - sourceX) >= 0.72)) {
+        makeParcelAt(
+          [x, shelfTop + size[1] / 2, row.z],
+          size,
+          color,
+          `ReserveStock_SecondShelf_${row.name}_${cartonIndex}`,
+        )
+      }
+      cartonIndex += 1
+    }
+  }
+  for (const [tierIndex, shelfY, z] of [[0, 0.48, -3.08], [1, 3.72, -3.54], [2, 4.65, -3.08]]) {
     let cartonIndex = 0
     for (let x = rackMinX + 0.35; x <= rackMaxX - 0.35; x += tierIndex === 1 ? 0.92 : 1.18) {
       if (tierIndex === 0 && x < -3.9) continue
@@ -528,17 +609,23 @@ export function createSmartWarehouseScene(scene, renderer) {
   }
   addBox(root, materials.darkSteel, [0.18, 0.08, 0.20], [-2.3, 0.09, -2.12])
 
-  // Overhead picking rail with a travelling trolley, telescopic reach and a closing gripper.
-  for (const x of [rackMinX + 0.35, rackMaxX - 0.35]) {
-    addBox(root, materials.rackUpright, [0.21, 3.23, 0.24], [x, 1.63, -3.08])
-    addBox(root, materials.graphite, [0.43, 0.075, 0.40], [x, 0.08, -3.08])
+  // Ceiling-suspended gantry runs behind the full rack and reaches over its shelves.
+  const pickerRailY = 6.4
+  const pickerRailZ = rackBackZ - 0.43
+  const pickerRailMinX = Math.min(rackMinX, AGV_START_X) - 0.75
+  const pickerRailMaxX = rackMaxX + 0.65
+  const pickerRailCenterX = (pickerRailMinX + pickerRailMaxX) / 2
+  const pickerRailLength = pickerRailMaxX - pickerRailMinX
+  addBox(root, materials.darkSteel, [pickerRailLength + 1.2, 0.28, 0.32], [pickerRailCenterX, 6.30, pickerRailZ])
+  for (let hangerIndex = 0; hangerIndex <= 6; hangerIndex += 1) {
+    const x = pickerRailMinX + pickerRailLength * hangerIndex / 6
+    addBox(root, materials.rackUpright, [0.14, 0.32, 0.18], [x, 6.37, pickerRailZ])
   }
-  const pickerRailLength = rackLength - 0.70
-  addBox(root, materials.rackOrange, [pickerRailLength, 0.17, 0.34], [rackCenterX, 3.43, -3.08])
-  addBox(root, materials.brightMetal, [pickerRailLength - 0.26, 0.07, 0.20], [rackCenterX, 3.31, -3.08])
-  addEmissiveLine(root, [pickerRailLength - 0.44, 0.024, 0.035], [rackCenterX, 3.21, -3.08], '#35d9c4')
+  addBox(root, materials.rackOrange, [pickerRailLength, 0.17, 0.34], [pickerRailCenterX, pickerRailY + 0.13, pickerRailZ])
+  addBox(root, materials.brightMetal, [pickerRailLength - 0.12, 0.07, 0.20], [pickerRailCenterX, pickerRailY + 0.01, pickerRailZ])
+  addEmissiveLine(root, [pickerRailLength - 0.22, 0.024, 0.035], [pickerRailCenterX, pickerRailY - 0.09, pickerRailZ + 0.18], '#35d9c4')
   const picker = new THREE.Group()
-  picker.position.set(-3.5, 3.3, -3.08)
+  picker.position.set(AGV_START_X, pickerRailY, pickerRailZ)
   root.add(picker)
   addRoundedBox(picker, materials.bluePaint, [0.72, 0.23, 0.55], [0, 0.02, 0], { name: 'Picker carriage' })
   addBox(picker, materials.graphite, [0.50, 0.09, 0.35], [0, -0.13, 0])
@@ -548,23 +635,46 @@ export function createSmartWarehouseScene(scene, renderer) {
   dynamic.pickerReach.visible = false
   dynamic.pickerInnerReach = addBox(picker, materials.rackOrange, [0.14, 0.11, 1], [0, -0.30, 0.02])
   dynamic.pickerInnerReach.visible = false
-  dynamic.pickerDropRod = addCylinder(picker, materials.metal, 0.075, 1, [0, -0.15, 0])
+  dynamic.pickerReachHead = new THREE.Group()
+  picker.add(dynamic.pickerReachHead)
+  addRoundedBox(dynamic.pickerReachHead, materials.rackOrange, [0.42, 0.18, 0.34], [0, 0, 0])
+  addRoundedBox(dynamic.pickerReachHead, materials.darkSteel, [0.24, 0.10, 0.26], [0, -0.13, 0])
+
+  // The vertical mast lowers behind the rack first. The horizontal boom then
+  // extends at the selected shelf height, so neither member sweeps through a
+  // shelf while changing position.
+  dynamic.pickerDropRod = new THREE.Group()
+  picker.add(dynamic.pickerDropRod)
+  for (const x of [-0.15, 0.15]) {
+    addRoundedBox(dynamic.pickerDropRod, materials.brightMetal, [0.085, 1, 0.12], [x, 0, 0])
+    addBox(dynamic.pickerDropRod, materials.graphite, [0.024, 1, 0.13], [x, 0, 0.012], { castShadow: false })
+  }
+  dynamic.pickerDropInner = new THREE.Group()
+  picker.add(dynamic.pickerDropInner)
+  addRoundedBox(dynamic.pickerDropInner, materials.goldPaint, [0.16, 0.55, 0.16], [0, 0, 0])
+  addBox(dynamic.pickerDropInner, materials.darkSteel, [0.055, 0.44, 0.025], [0.088, 0, 0.012], { castShadow: false })
   dynamic.pickerTool = new THREE.Group()
   dynamic.pickerTool.position.set(0, -0.30, 0)
   picker.add(dynamic.pickerTool)
   dynamic.gripper = new THREE.Group()
   dynamic.pickerTool.add(dynamic.gripper)
-  addRoundedBox(dynamic.gripper, materials.darkSteel, [0.60, 0.15, 0.52], [0, 0.08, 0])
-  addBox(dynamic.gripper, materials.glow, [0.38, 0.025, 0.30], [0, 0.16, 0], { castShadow: false })
+  // A slim crosshead joins both jaws while leaving the package sides open.
+  addRoundedBox(dynamic.gripper, materials.brightMetal, [0.24, 0.12, 0.22], [0, 0.20, 0])
+  addRoundedBox(dynamic.gripper, materials.darkSteel, [0.96, 0.12, 0.30], [0, 0.08, 0])
+  addBox(dynamic.gripper, materials.glow, [0.72, 0.018, 0.22], [0, 0.145, 0], { castShadow: false })
   dynamic.gripperLeft = new THREE.Group()
   dynamic.gripperRight = new THREE.Group()
   dynamic.gripper.add(dynamic.gripperLeft, dynamic.gripperRight)
-  for (const jaw of [dynamic.gripperLeft, dynamic.gripperRight]) {
-    addRoundedBox(jaw, materials.goldPaint, [0.095, 0.52, 0.13], [0, -0.15, 0])
-    addBox(jaw, materials.darkSteel, [0.15, 0.10, 0.16], [0, -0.40, 0])
-    addBox(jaw, materials.glow, [0.08, 0.035, 0.12], [0, -0.43, 0.01], { castShadow: false })
+  for (const [jawIndex, jaw] of [dynamic.gripperLeft, dynamic.gripperRight].entries()) {
+    const side = jawIndex === 0 ? -1 : 1
+    const inward = -side
+    // The compact vertical jaw meets the crosshead directly; its rubber face
+    // stays vertical, with no projecting toe pieces at the tip.
+    addRoundedBox(jaw, materials.goldPaint, [0.08, 0.40, 0.12], [0, -0.16, 0])
+    addRoundedBox(jaw, materials.rubber, [0.022, 0.30, 0.125], [inward * 0.034, -0.16, 0])
+    addBox(jaw, materials.glow, [0.014, 0.16, 0.07], [-inward * 0.035, -0.16, 0.035], { castShadow: false })
   }
-  dynamic.pickupParcel = makeParcel(dynamic.gripper, roundedBoxGeometry, boxGeometry, parcelMaterials, labelMaterial, [0, -0.12, 0], PACKAGE_SIZES[0], 'blue', 'PickTransferParcel')
+  dynamic.pickupParcel = makeParcel(dynamic.pickerTool, roundedBoxGeometry, boxGeometry, labelGeometry, parcelMaterials, labelMaterial, [0, 0, 0], PACKAGE_SIZES[0], 'blue', 'PickTransferParcel')
   dynamic.pickupParcel.group.visible = false
   dynamic.pickup = picker
 
@@ -601,10 +711,12 @@ export function createSmartWarehouseScene(scene, renderer) {
   }
   const middleRackPackageXs = middleRackPosts.slice(0, -1).map((x, index) => (x + middleRackPosts[index + 1]) / 2)
   let middleRackPackageIndex = 0
-  for (const levelY of [0.55, 1.80, 3.05]) {
+  for (const [levelIndex, levelY] of [0.55, 1.80, 3.05, 4.30].entries()) {
     for (const z of [2.88, 3.70]) {
       for (const x of middleRackPackageXs) {
-        const size = PACKAGE_SIZES[middleRackPackageIndex % PACKAGE_SIZES.length]
+        const size = levelIndex === 3
+          ? MIDDLE_RACK_TOP_PACKAGE_SIZES[middleRackPackageIndex % MIDDLE_RACK_TOP_PACKAGE_SIZES.length]
+          : PACKAGE_SIZES[middleRackPackageIndex % PACKAGE_SIZES.length]
         const color = PACKAGE_PALETTE[middleRackPackageIndex % PACKAGE_PALETTE.length]
         const deckTop = levelY - 0.065
         addPallet([x, deckTop, z], Math.max(size[0] + 0.18, 0.76), Math.max(size[2] + 0.16, 0.72))
@@ -614,11 +726,11 @@ export function createSmartWarehouseScene(scene, renderer) {
     }
   }
 
-  // Main autonomous carrier: a low, four-wheel powered trolley with a liftable roller deck.
+  // Main autonomous carrier: a low, four-wheel powered trolley with a side-mounted load deck.
   const carrier = new THREE.Group()
-  carrier.position.set(-3.5, 0, -0.12)
+  carrier.position.set(AGV_START_X, 0, AGV_ROUTE_CENTER_Z)
   root.add(carrier)
-  addRoundedBox(carrier, materials.bluePaint, [1.48, 0.36, 1.22], [0, 0.38, 0], { name: 'Carrier chassis' })
+  addRoundedBox(carrier, materials.bluePaint, [1.48, 0.36, AGV_CHASSIS_DEPTH_Z], [0, 0.38, 0], { name: 'Carrier chassis' })
   addRoundedBox(carrier, materials.blueDark, [1.22, 0.18, 0.92], [0, 0.58, -0.02])
   addBox(carrier, materials.rackOrange, [1.25, 0.055, 0.08], [0, 0.43, 0.60])
   addBox(carrier, materials.graphite, [0.88, 0.10, 0.12], [0, 0.64, 0.44])
@@ -641,50 +753,71 @@ export function createSmartWarehouseScene(scene, renderer) {
   addBox(carrier, materials.rackOrange, [0.05, 0.14, 0.12], [0, 0.92, -0.38])
   dynamic.agvStatus = addMesh(carrier, sphereGeometry, materials.glow, [0, 0.95, -0.48], [0.10, 0.10, 0.10], { castShadow: false })
   dynamic.deck = new THREE.Group()
-  dynamic.deck.position.set(0, 0.46, 0.85)
+  dynamic.deck.position.set(0, 0.46, AGV_TRAY_SIDE_OFFSET_Z)
   carrier.add(dynamic.deck)
-  addRoundedBox(dynamic.deck, materials.graphite, [1.44, 0.10, 1.38], [0, 0.015, 0])
-  addBox(dynamic.deck, materials.darkSteel, [1.30, 0.025, 1.22], [0, 0.08, 0])
-  for (let index = 0; index < 7; index += 1) {
-    const x = -0.57 + index * 0.19
-    const roller = new THREE.Group()
-    roller.position.set(x, 0.135, 0)
-    roller.rotation.z = Math.PI / 2
-    const mesh = addMesh(roller, rollerGeometry, materials.metal, [0, 0, 0], [1, 1, 1])
-    mesh.rotation.y = 0
-    dynamic.deckRollers.push(mesh)
-    dynamic.deck.add(roller)
+  for (const x of [-0.53, 0.53]) {
+    addBox(dynamic.deck, materials.darkSteel, [0.10, 0.18, 1.0], [x, -0.13, -0.20])
   }
-  for (const z of [-0.62, 0.62]) {
+  addRoundedBox(dynamic.deck, materials.graphite, [AGV_TRAY_WIDTH_X, 0.10, AGV_TRAY_DEPTH_Z], [0, 0.015, 0])
+  addBox(dynamic.deck, materials.darkSteel, [AGV_TRAY_WIDTH_X - 0.14, 0.025, AGV_TRAY_DECK_PLATE_DEPTH_Z], [0, 0.08, 0])
+  for (let index = 0; index < 9; index += 1) {
+    const axle = new THREE.Group()
+    axle.position.set(-AGV_TRAY_WIDTH_X / 2 + 0.16 + index * 0.14, 0.075, 0)
+    axle.rotation.x = Math.PI / 2
+    const roller = addMesh(axle, trayRollerGeometry, materials.metal, [0, 0, 0], [1, 1, 1])
+    dynamic.deckRollers.push(roller)
+    dynamic.deck.add(axle)
+  }
+  const trayGuideZ = AGV_TRAY_DEPTH_Z / 2 - 0.07
+  for (const z of [-trayGuideZ, trayGuideZ]) {
     addRoundedBox(dynamic.deck, materials.rackOrange, [1.34, 0.16, 0.06], [0, 0.18, z])
     addEmissiveLine(dynamic.deck, [1.20, 0.018, 0.02], [0, 0.275, z], '#ffc35a')
   }
-  for (const x of [-0.66, 0.66]) {
-    addBox(dynamic.deck, materials.rackOrange, [0.06, 0.16, 1.20], [x, 0.18, 0])
-  }
-  dynamic.carrierParcel = makeParcel(dynamic.deck, roundedBoxGeometry, boxGeometry, parcelMaterials, labelMaterial, [0, 0.13 + PACKAGE_SIZES[0][1] / 2, 0], PACKAGE_SIZES[0], 'blue', 'CarrierParcel')
+  // Keep the rear stop, but leave the forward edge open for the loader handoff.
+  addBox(dynamic.deck, materials.rackOrange, [0.06, 0.16, 1.20], [-0.66, 0.18, 0])
+  dynamic.carrierParcel = makeParcel(dynamic.deck, roundedBoxGeometry, boxGeometry, labelGeometry, parcelMaterials, labelMaterial, [0, 0.13 + PACKAGE_SIZES[0][1] / 2, 0], PACKAGE_SIZES[0], 'blue', 'CarrierParcel')
   dynamic.carrierParcel.group.visible = false
   dynamic.carrier = carrier
 
   // A detailed powered roller conveyor meets the open rear of the outbound truck.
-  addBox(root, materials.graphite, [1.12, 0.30, 4.98], [4.9, 0.48, 3.09])
-  addBox(root, materials.belt, [0.98, 0.055, 4.86], [4.9, 0.66, 3.09])
-  for (let index = 0; index < 18; index += 1) {
-    const z = 0.78 + index * 0.27
+  addBox(root, materials.graphite, [TRUCK_CONVEYOR_FRAME_WIDTH_X, 0.30, TRUCK_CONVEYOR_FRAME_LENGTH_Z], [TRUCK_CONVEYOR_X, 0.48, TRUCK_CONVEYOR_FRAME_CENTER_Z])
+  addBox(root, materials.belt, [TRUCK_CONVEYOR_BELT_WIDTH_X, 0.055, TRUCK_CONVEYOR_BELT_LENGTH_Z], [TRUCK_CONVEYOR_X, 0.66, TRUCK_CONVEYOR_BELT_CENTER_Z])
+  for (let index = 0; index < TRUCK_CONVEYOR_ROLLER_COUNT; index += 1) {
+    const z = TRUCK_CONVEYOR_BELT_START_Z + TRUCK_CONVEYOR_ROLLER_MARGIN_Z + index * TRUCK_CONVEYOR_ROLLER_SPACING_Z
     const roller = new THREE.Group()
-    roller.position.set(4.9, 0.64, z)
+    roller.position.set(TRUCK_CONVEYOR_X, 0.64, z)
     roller.rotation.z = Math.PI / 2
     const mesh = addMesh(roller, rollerGeometry, materials.metal, [0, 0, 0], [1, 1, 1])
     mesh.rotation.y = 0
     dynamic.conveyorRollers.push(mesh)
     root.add(roller)
   }
-  for (const x of [4.38, 5.42]) {
-    addRoundedBox(root, materials.bluePaint, [0.08, 0.28, 4.22], [x, 0.84, 3.40])
-    addEmissiveLine(root, [0.025, 0.05, 3.86], [x, 1.00, 3.40])
-  }
-  for (const z of [0.67, 5.49]) {
-    addBox(root, materials.rackOrange, [1.20, 0.14, 0.10], [4.9, 0.81, z])
+  const entrySideRailX = TRUCK_CONVEYOR_X - TRUCK_CONVEYOR_FRAME_WIDTH_X / 2 + 0.04
+  const oppositeSideRailX = TRUCK_CONVEYOR_X + TRUCK_CONVEYOR_FRAME_WIDTH_X / 2 - 0.04
+  addRoundedBox(
+    root,
+    materials.bluePaint,
+    [0.08, 0.28, TRUCK_CONVEYOR_ENTRY_RAIL_LENGTH_Z],
+    [entrySideRailX, 0.84, TRUCK_CONVEYOR_ENTRY_RAIL_START_Z + TRUCK_CONVEYOR_ENTRY_RAIL_LENGTH_Z / 2],
+  )
+  addEmissiveLine(
+    root,
+    [0.025, 0.05, TRUCK_CONVEYOR_ENTRY_RAIL_LENGTH_Z - 0.30],
+    [entrySideRailX, 1.00, TRUCK_CONVEYOR_ENTRY_RAIL_START_Z + TRUCK_CONVEYOR_ENTRY_RAIL_LENGTH_Z / 2],
+  )
+  addRoundedBox(
+    root,
+    materials.bluePaint,
+    [0.08, 0.28, TRUCK_CONVEYOR_OPPOSITE_RAIL_LENGTH_Z],
+    [oppositeSideRailX, 0.84, TRUCK_CONVEYOR_OPPOSITE_RAIL_CENTER_Z],
+  )
+  addEmissiveLine(
+    root,
+    [0.025, 0.05, TRUCK_CONVEYOR_OPPOSITE_RAIL_LENGTH_Z - 0.30],
+    [oppositeSideRailX, 1.00, TRUCK_CONVEYOR_OPPOSITE_RAIL_CENTER_Z],
+  )
+  for (const z of [TRUCK_CONVEYOR_BELT_END_Z - 0.03]) {
+    addBox(root, materials.rackOrange, [1.20, 0.14, 0.10], [TRUCK_CONVEYOR_X, 0.81, z])
   }
   for (const x of [4.54, 5.26]) {
     for (const z of [1.15, 2.55, 3.95, 5.05]) {
@@ -694,10 +827,29 @@ export function createSmartWarehouseScene(scene, renderer) {
   }
 
   // Telescopic loader follows the live package coordinates into the trailer cargo slots.
-  addRoundedBox(root, materials.graphite, [0.86, 0.24, 0.82], [4.9, 0.68, 5.12])
-  addCylinder(root, materials.bluePaint, 0.16, 0.94, [4.9, 1.25, 5.12])
+  // The loader is carried by a gantry clamped outside both conveyor edges. Its
+  // diagonal side brackets keep the whole center lane clear for passing cartons.
+  for (const side of [-1, 1]) {
+    const supportX = TRUCK_CONVEYOR_X + side * TRUCK_LOADER_SUPPORT_OFFSET_X
+    addRoundedBox(root, materials.graphite, [0.34, 0.12, 0.44], [supportX, 0.68, 5.12])
+    addBox(root, materials.bluePaint, [0.14, 1.42 + TRUCK_LOADER_LIFT_Y, 0.16], [supportX, 1.43 + TRUCK_LOADER_LIFT_Y / 2, 5.12])
+    addBox(root, materials.rackOrange, [0.20, 0.09, 0.22], [supportX, 2.06 + TRUCK_LOADER_LIFT_Y, 5.12])
+    addBar(
+      root,
+      cylinderGeometry,
+      materials.rackOrange,
+      [supportX, 1.54, 5.12],
+      [supportX - side * 0.34, 2.0 + TRUCK_LOADER_LIFT_Y, 5.12],
+      0.045,
+    )
+  }
+  addBox(root, materials.graphite, [2.22, 0.16, 0.24], [TRUCK_CONVEYOR_X, 2.07 + TRUCK_LOADER_LIFT_Y, 5.12])
+  addRoundedBox(root, materials.blueDark, [0.72, 0.12, 0.58], [TRUCK_CONVEYOR_X, 1.82 + TRUCK_LOADER_LIFT_Y, 5.12])
+  for (const side of [-1, 1]) {
+    addBox(root, materials.rackOrange, [0.10, 0.12, 0.16], [TRUCK_CONVEYOR_X + side * 0.25, 1.94 + TRUCK_LOADER_LIFT_Y, 5.12])
+  }
   const loader = new THREE.Group()
-  loader.position.set(4.9, 1.54, 5.12)
+  loader.position.set(TRUCK_CONVEYOR_X, 1.54 + TRUCK_LOADER_LIFT_Y, 5.12)
   root.add(loader)
   dynamic.loaderArm = loader
   addRoundedBox(loader, materials.rackOrange, [0.58, 0.46, 0.58], [0, 0, 0])
@@ -712,28 +864,35 @@ export function createSmartWarehouseScene(scene, renderer) {
   for (const x of [-0.20, 0.20]) {
     addBox(dynamic.loaderTool, materials.goldPaint, [0.10, 0.28, 0.34], [x, -0.20, 0.12])
   }
-  dynamic.transferParcel = makeParcelAt([4.9, 0.94, 0.73], PACKAGE_SIZES[0], 'blue', 'TransferParcel')
+  dynamic.transferParcel = makeParcelAt([TRUCK_CONVEYOR_X, 0.94, TRUCK_CONVEYOR_ENTRY_Z], PACKAGE_SIZES[0], 'blue', 'TransferParcel')
   dynamic.transferParcel.group.visible = false
 
-  // Two docked trucks provide scale; the open outbound trailer exposes all six live cargo slots.
+  // Two matching docked trucks provide scale. The outbound truck exposes its cargo
+  // by opening the same rear doors that remain closed on the inbound truck.
   function addTruck(x, z, openRear, bodyMaterial) {
     const truck = new THREE.Group()
     truck.position.set(x, 0, z)
     root.add(truck)
     addRoundedBox(truck, materials.graphite, [2.34, 0.32, 4.72], [0, 0.68, 0])
+    addRoundedBox(truck, materials.whitePaint, [2.62, 0.12, 3.10], [0, 0.79, -0.72])
+    addBox(truck, bodyMaterial, [2.72, 2.52, 0.13], [0, 2.0, 0.82])
+    for (const side of [-1, 1]) {
+      addBox(truck, bodyMaterial, [0.11, 2.44, 3.10], [side * 1.31, 2.0, -0.72])
+      addBox(truck, materials.bluePaint, [0.055, 0.12, 3.12], [side * 1.39, 1.50, -0.72])
+    }
+    addRoundedBox(truck, materials.whitePaint, [2.78, 0.13, 3.24], [0, 3.31, -0.72])
+    for (const side of [-1, 1]) {
+      const doorPivot = new THREE.Group()
+      doorPivot.name = `TruckRearDoorPivot_${side}`
+      doorPivot.position.set(side * 1.31, 2.0, -2.31)
+      doorPivot.rotation.y = openRear ? -side * Math.PI / 2 : 0
+      truck.add(doorPivot)
+      addBox(doorPivot, materials.whitePaint, [1.31, 2.38, 0.10], [-side * 0.655, 0, 0])
+      addBox(doorPivot, materials.bluePaint, [0.06, 2.25, 0.12], [-side * 1.25, 0, 0.012])
+      addBox(truck, materials.rackOrange, [0.13, 2.52, 0.14], [side * 1.48, 2.02, -2.31])
+    }
+    addBox(truck, materials.rackOrange, [3.00, 0.14, 0.16], [0, 3.30, -2.31])
     if (openRear) {
-      addRoundedBox(truck, materials.whitePaint, [2.62, 0.12, 3.10], [0, 0.79, -0.72])
-      addBox(truck, bodyMaterial, [2.72, 2.52, 0.13], [0, 2.0, 0.82])
-      for (const side of [-1, 1]) {
-        addBox(truck, bodyMaterial, [0.11, 2.44, 3.10], [side * 1.31, 2.0, -0.72])
-        addBox(truck, materials.rackOrange, [0.07, 2.40, 0.06], [side * 1.37, 2.0, -0.72])
-      }
-      addBox(truck, materials.graphite, [2.78, 0.12, 3.22], [0, 3.31, -0.72])
-      for (const side of [-1, 1]) {
-        const door = addBox(truck, materials.whitePaint, [1.18, 2.38, 0.10], [side * 1.80, 2.0, -2.26])
-        door.rotation.y = side * 0.26
-        addBox(truck, materials.bluePaint, [0.06, 2.25, 0.12], [side * 1.80, 2.0, -2.26])
-      }
       for (let index = 0; index < CARGO_SLOTS.length; index += 1) {
         const [slotX, slotZ] = CARGO_SLOTS[index]
         const size = PACKAGE_SIZES[index]
@@ -741,14 +900,9 @@ export function createSmartWarehouseScene(scene, renderer) {
         const parcel = makeParcelAt([x + slotX, 0.85 + size[1] / 2, z + (slotZ - 7.85)], size, color, `TruckParcel_${index + 1}`)
         dynamic.truckPackages.push(parcel)
       }
-      makeCanvasSign(truck, [-1.38, 2.40, -0.72], [1.14, 0.42], createTruckMarkTexture(renderer, textures, 'DL / OUTBOUND'))
-    } else {
-      addRoundedBox(truck, bodyMaterial, [2.72, 2.54, 3.18], [0, 2.0, -0.72])
-      addRoundedBox(truck, materials.whitePaint, [2.78, 0.13, 3.24], [0, 3.31, -0.72])
-      for (const side of [-1, 1]) {
-        addBox(truck, materials.bluePaint, [0.055, 0.12, 3.12], [side * 1.39, 1.50, -0.72])
-      }
     }
+    const sideMark = makeCanvasSign(truck, [-1.38, 2.40, -0.72], [1.14, 0.42], createTruckMarkTexture(renderer, textures, 'DL / LOGISTICS'))
+    sideMark.rotation.y = -Math.PI / 2
     addRoundedBox(truck, materials.bluePaint, [2.18, 1.50, 1.70], [0, 1.25, 1.92])
     addRoundedBox(truck, materials.blueDark, [2.10, 0.20, 1.64], [0, 2.08, 1.93])
     addBox(truck, materials.glass, [1.56, 0.60, 0.07], [0, 1.72, 2.79])
@@ -760,20 +914,12 @@ export function createSmartWarehouseScene(scene, renderer) {
         addWheel(truck, wheelGeometry, side * 1.35, 0.42, wheelZ, 0.39, 0.30, 'x')
       }
       for (let ribZ = -1.90; ribZ <= 0.80; ribZ += 0.45) {
-        if (!openRear) addBox(truck, materials.metal, [0.035, 2.34, 0.04], [side * 1.40, 2.0, ribZ])
+        addBox(truck, materials.metal, [0.035, 2.34, 0.04], [side * 1.40, 2.0, ribZ])
       }
     }
     addBox(truck, materials.rackOrange, [2.32, 0.24, 0.20], [0, 0.68, 2.82])
     for (const side of [-1, 1]) {
       addRoundedBox(truck, materials.glow, [0.16, 0.06, 0.08], [side * 0.83, 0.92, 2.87], { castShadow: false })
-    }
-    if (openRear) {
-      for (const xOffset of [-1.48, 1.48]) {
-        addBox(truck, materials.rackOrange, [0.13, 2.52, 0.14], [xOffset, 2.02, -2.31])
-      }
-      addBox(truck, materials.rackOrange, [3.00, 0.14, 0.16], [0, 3.30, -2.31])
-    } else {
-      addBox(truck, materials.whitePaint, [2.76, 2.58, 0.13], [0, 2.0, -2.34])
     }
     return truck
   }
@@ -814,10 +960,13 @@ export function createSmartWarehouseScene(scene, renderer) {
     addBox(root, materials.darkSteel, [16.8, 0.28, 0.32], [0, 6.30, z])
   }
   for (const x of [-6.7, -2.3, 2.3, 6.7]) {
-    addBar(root, cylinderGeometry, materials.rackOrange, [x, 6.28, -6.0], [x * 0.88, 5.65, 5.8], 0.035)
+    // The two lower center braces stop just inside the loading facade instead
+    // of poking through it. The other roof braces keep their existing span.
+    const lowerBraceFrontZ = Math.abs(x) === 2.3 ? 5.34 : 5.8
+    addBar(root, cylinderGeometry, materials.rackOrange, [x, 6.28, -6.0], [x * 0.88, 5.65, lowerBraceFrontZ], 0.035)
     addBar(root, cylinderGeometry, materials.rackOrange, [x, 6.28, 5.5], [x * 0.88, 5.65, -6.0], 0.035)
   }
-  for (const [index, z] of [-4.8, -1.2, 2.4, 5.2].entries()) {
+  for (const [index, z] of [-7.0, -1.2, 2.4, 5.2].entries()) {
     const lightHousing = addRoundedBox(root, materials.graphite, [4.4, 0.16, 0.40], [0, 6.0, z])
     lightHousing.castShadow = false
     addEmissiveLine(root, [3.9, 0.035, 0.10], [0, 5.88, z], index % 2 ? '#c5efff' : '#ffe1b1')
@@ -887,41 +1036,48 @@ export function createSmartWarehouseScene(scene, renderer) {
     for (const parcel of [dynamic.pickupParcel, dynamic.carrierParcel, dynamic.transferParcel]) {
       if (parcel) setParcelDimensions(parcel, size, color)
     }
+    dynamic.carrierParcel.group.position.y = 0.13 + size[1] * 0.5
+    dynamic.carrierParcel.group.position.x = clamp(Number(outputs.trayPackageX), 0, TRAY_PACKAGE_TRAVEL, 0)
 
     dynamic.pickupParcel.group.visible = outputs.pickupPackageVisible === true
     dynamic.carrierParcel.group.visible = outputs.packageOnAgv === true
     dynamic.transferParcel.group.visible = outputs.transferPackageVisible === true
     dynamic.transferParcel.group.position.set(
-      clamp(Number(outputs.transferPackageX), -20, 20, 4.9),
+      clamp(Number(outputs.transferPackageX), -20, 20, TRUCK_CONVEYOR_X),
       clamp(Number(outputs.transferPackageY), 0.25, 3.0, 0.94),
-      clamp(Number(outputs.transferPackageZ), -1, 12, 0.73),
+      clamp(Number(outputs.transferPackageZ), -1, 12, TRUCK_CONVEYOR_ENTRY_Z),
     )
 
-    dynamic.carrier.position.x = clamp(Number(outputs.agvPosition), 0, 8.4, 0) - 3.5
-    dynamic.carrier.position.z = -0.12
+    const agvTravel = clamp(Number(outputs.agvPosition), 0, AGV_ROUTE_LENGTH, 0)
+    dynamic.carrier.position.x = AGV_START_X + agvTravel
+    dynamic.carrier.position.z = AGV_ROUTE_CENTER_Z
     dynamic.deck.position.y = clamp(Number(outputs.forkHeight), 0.30, 0.65, 0.46)
-    const wheelPhase = -dynamic.carrier.position.x / 0.28
+    const wheelPhase = -agvTravel / 0.28
     for (const wheel of dynamic.carrierWheels) wheel.tire.rotation.y = wheelPhase
     const beltPhase = clamp(Number(outputs.beltPhase), -100, 100, 0)
-    for (const roller of dynamic.deckRollers) roller.rotation.y = beltPhase
-    for (const roller of dynamic.conveyorRollers) roller.rotation.y = beltPhase
+    for (const roller of dynamic.conveyorRollers) roller.rotation.y = -beltPhase
+    const trayBeltPhase = clamp(Number(outputs.trayBeltPhase), -100, 100, 0)
+    for (const roller of dynamic.deckRollers) roller.rotation.y = -trayBeltPhase
 
-    const armX = clamp(Number(outputs.pickupArmX), -5, 1, -3.5)
-    const armY = clamp(Number(outputs.pickupArmY), 2.8, 3.8, 3.3)
-    const armZ = clamp(Number(outputs.pickupArmZ), -4, -2, -3.08)
-    const reach = clamp(Number(outputs.pickupArmReachProgress), 0, 3.81, 0)
-    const drop = clamp(Number(outputs.pickupDropProgress), -2.7, -0.2, -0.3)
-    const dropLength = Math.max(0.18, -drop)
+    const armX = clamp(Number(outputs.pickupArmX), AGV_START_X, 6.15, AGV_START_X)
+    const armY = clamp(Number(outputs.pickupArmY), 6.2, 6.5, 6.4)
+    const armZ = clamp(Number(outputs.pickupArmZ), -4.8, -4.5, -4.65)
+    const reach = clamp(Number(outputs.pickupArmReachProgress), 0, 5.83, 0)
+    const drop = clamp(Number(outputs.pickupDropProgress), -5.1, -0.35, -0.35)
+    const mastExtension = Math.max(0.001, -drop - 0.30)
     dynamic.pickup.position.set(armX, armY, armZ)
     dynamic.pickerReach.scale.z = Math.max(reach, 0.001)
-    dynamic.pickerReach.position.z = reach * 0.5
+    dynamic.pickerReach.position.set(0, drop, reach * 0.5)
     dynamic.pickerReach.visible = reach > 0.08
     dynamic.pickerInnerReach.scale.z = Math.max(reach * 0.88, 0.001)
-    dynamic.pickerInnerReach.position.z = 0.10 + reach * 0.44
+    dynamic.pickerInnerReach.position.set(0, drop, 0.10 + reach * 0.44)
     dynamic.pickerInnerReach.visible = reach > 0.08
-    dynamic.pickerDropRod.scale.y = dropLength
-    dynamic.pickerDropRod.position.y = drop / 2
-    dynamic.pickerTool.position.set(0, drop, reach)
+    dynamic.pickerReachHead.position.set(0, drop, reach)
+    dynamic.pickerDropRod.scale.y = mastExtension
+    dynamic.pickerDropRod.position.set(0, (-0.30 + drop) / 2, 0)
+    dynamic.pickerDropInner.position.set(0, drop - 0.275, reach)
+    dynamic.pickerDropInner.scale.y = 1
+    dynamic.pickerTool.position.set(0, drop - 0.55, reach)
     dynamic.gripper.rotation.x = clamp(Number(outputs.robotAngle), -0.4, 0.5, 0.12)
     const jawGap = clamp(Number(outputs.pickupGripperGap), 0.35, 1.2, 1.0) / 2
     dynamic.gripperLeft.position.x = -jawGap
@@ -971,6 +1127,6 @@ export function createSmartWarehouseScene(scene, renderer) {
     scene.remove(root)
   }
 
-  return { root, center, radius, update, animate, setDayMode, dispose }
+  return { root, center, radius, update, animate, setDayMode, dispose, exportNodes: dynamic }
 }
 

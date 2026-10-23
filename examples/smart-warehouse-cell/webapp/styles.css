@@ -47,7 +47,7 @@ button { font: inherit; }
 .run-simulation:hover:not(:disabled), .run-simulation:focus-visible:not(:disabled) { filter: brightness(1.12); outline: 2px solid rgba(93,231,205,.36); }
 .run-simulation:disabled { cursor: not-allowed; opacity: .45; }
 .simulation-run-status { min-height: 12px; margin: 0; color: #7fa5a0; font-family: 'DM Mono', monospace; font-size: 7px; line-height: 1.5; }
-.scene-title { position: absolute; z-index: 1; top: 26%; left: 28px; max-width: 225px; pointer-events: none; }
+.scene-title { position: absolute; z-index: 1; top: 26%; left: 28px; max-width: 225px; pointer-events: none; transform: translateY(-24px); }
 .eyebrow { color: #7bd8c5; font-family: 'DM Mono', monospace; font-size: 7px; letter-spacing: .18em; }
 .eyebrow b { padding: 0 5px; color: #4b8d87; font-weight: 400; }
 .status-square { display: inline-block; width: 5px; height: 5px; margin: 0 5px 1px 0; background: #57e6b3; box-shadow: 0 0 9px #57e6b3; }
@@ -91,9 +91,9 @@ button { font: inherit; }
 .alarm-state.active .alarm-dot { background: #ff476a; box-shadow: 0 0 12px rgba(255,71,106,.7); animation: alert-pulse 1.2s ease-in-out infinite; }
 .alarm-state.active strong { color: #ff8295; }
 @keyframes alert-pulse { 50% { opacity: .45; } }
-.time-chip { position: absolute; z-index: 1; right: 228px; bottom: 22px; min-width: 102px; padding: 8px 11px; border: 1px solid rgba(151,198,191,.17); border-radius: 7px; background: rgba(7,23,29,.76); backdrop-filter: blur(9px); }
+.time-chip { position: absolute; z-index: 1; right: 108px; bottom: 22px; min-width: 102px; padding: 8px 11px; border: 1px solid rgba(151,198,191,.17); border-radius: 7px; background: rgba(7,23,29,.76); backdrop-filter: blur(9px); }
 .time-chip strong { display: block; color: #e6f7f1; font-family: 'DM Mono', monospace; font-size: 11px; font-weight: 500; }
-.playback-controls { position: absolute; z-index: 2; right: 340px; bottom: 22px; }
+.playback-controls { position: absolute; z-index: 2; right: 220px; bottom: 22px; }
 .playback-controls button { display: flex; min-height: 38px; min-width: 84px; align-items: center; justify-content: center; gap: 8px; padding: 0 12px; border: 1px solid rgba(93,231,205,.52); border-radius: 7px; color: #c6fff2; background: linear-gradient(145deg, rgba(22,91,81,.9), rgba(11,45,48,.94)); box-shadow: 0 0 20px rgba(26,223,184,.1), inset 0 1px rgba(255,255,255,.06); font-family: 'DM Mono', monospace; font-size: 8px; font-weight: 700; letter-spacing: .1em; cursor: pointer; transition: border-color .18s ease, color .18s ease, background .18s ease, opacity .18s ease; }
 .playback-controls button:hover:not(:disabled), .playback-controls button:focus-visible { border-color: #8bffe4; color: #fff; background: linear-gradient(145deg, rgba(31,128,110,.98), rgba(16,67,68,.98)); outline: none; }
 .playback-controls button:disabled { cursor: not-allowed; opacity: .48; }
@@ -102,8 +102,6 @@ button { font: inherit; }
 .view-hint b { color: #4f8980; font-weight: 400; }
 .mouse-icon { position: relative; width: 9px; height: 12px; border: 1px solid #7bbeb0; border-radius: 5px; }
 .mouse-icon::before { position: absolute; top: 2px; left: 3px; width: 1px; height: 3px; background: #7bbeb0; content: ''; }
-.scene-footer { position: absolute; z-index: 1; right: 22px; bottom: 11px; display: flex; gap: 14px; color: #577c77; font-family: 'DM Mono', monospace; font-size: 6px; letter-spacing: .1em; }
-.scene-footer i { color: #57c3a7; font-style: normal; }
 .load-error { position: absolute; z-index: 4; inset: 0; display: grid; place-items: center; color: #ff9b9b; background: #09151bdf; font-size: 13px; }
 .load-error[hidden] { display: none; }
 body[data-theme='day'] .viewport { background: linear-gradient(180deg, #bdd5d1, #6c9998 55%, #335d62); }
@@ -136,13 +134,12 @@ body[data-theme='day'] .scene-title h1 { color: #f6fffc; }
   .detail-row strong { font-size: 9px; }
   .package-state { min-height: 27px; padding: 0 9px; font-size: 5px; }
   .alarm-state { min-height: 36px; padding: 6px 9px; }
-  .time-chip { right: 10px; bottom: 61px; min-width: 88px; padding: 6px 8px; }
-  .playback-controls { right: 111px; bottom: 61px; }
+  .time-chip { right: 4px; bottom: 61px; min-width: 88px; padding: 6px 8px; }
+  .playback-controls { right: 105px; bottom: 61px; }
   .playback-controls button { min-height: 31px; min-width: 76px; gap: 6px; padding: 0 8px; font-size: 7px; }
   .time-chip small { font-size: 6px; }
   .time-chip strong { font-size: 9px; }
   .view-hint { bottom: 16px; left: 10px; font-size: 5px; }
-  .scene-footer { right: 10px; bottom: 5px; gap: 7px; font-size: 5px; }
 }
 @media (max-width: 430px) { .scene-title { display: none; } }
 @media (max-height: 430px) {

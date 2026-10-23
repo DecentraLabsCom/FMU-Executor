@@ -6,8 +6,8 @@ $workPath = Join-Path $exampleRoot '.build'
 $binaryPath = Join-Path $workPath 'binaries\win64'
 $resourcePath = Join-Path $workPath 'resources'
 
-python (Join-Path $exampleRoot 'generate_scene.py')
-if ($LASTEXITCODE -ne 0) { throw 'GLB scene generation failed.' }
+$scenePath = Join-Path $exampleRoot 'smart-warehouse-cell.glb'
+if (-not (Test-Path -LiteralPath $scenePath)) { throw 'The Three.js-exported GLB scene is missing.' }
 Remove-Item -LiteralPath $workPath -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Path $binaryPath, $resourcePath -Force | Out-Null
 Copy-Item (Join-Path $exampleRoot 'modelDescription.xml') $workPath

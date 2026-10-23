@@ -2,6 +2,20 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define AGV_ROUTE_START_X (-6.2)
+#define AGV_TRAY_WIDTH_X (1.44)
+#define AGV_ROUTE_CENTER_Z (-0.12)
+#define AGV_CHASSIS_DEPTH_Z (1.22)
+#define AGV_TRAY_DEPTH_Z (1.38)
+#define AGV_TRAY_SIDE_OFFSET_Z (AGV_CHASSIS_DEPTH_Z / 2.0 + AGV_TRAY_DEPTH_Z / 2.0)
+#define TRUCK_CONVEYOR_X (4.9)
+#define TRUCK_CONVEYOR_FRAME_WIDTH_X (1.46)
+#define TRUCK_CONVEYOR_ENTRY_Z (AGV_ROUTE_CENTER_Z + AGV_TRAY_SIDE_OFFSET_Z)
+#define TRUCK_CONVEYOR_TRANSFER_END_Z (5.45)
+#define AGV_STOP_X (TRUCK_CONVEYOR_X - TRUCK_CONVEYOR_FRAME_WIDTH_X / 2.0 - AGV_TRAY_WIDTH_X / 2.0)
+#define AGV_HANDOFF_OFFSET_X (TRUCK_CONVEYOR_X - AGV_STOP_X)
+#define ROUTE_LENGTH (AGV_STOP_X - AGV_ROUTE_START_X)
+
 typedef void* fmi2Component;
 typedef void* fmi2Environment;
 typedef const char* fmi2String;
@@ -41,6 +55,8 @@ typedef struct {
     fmi2Real loaderAngle;
     fmi2Real loaderReach;
     fmi2Real beltPhase;
+    fmi2Real trayPackageX;
+    fmi2Real trayBeltPhase;
     fmi2Real packageSizeX;
     fmi2Real packageSizeY;
     fmi2Real packageSizeZ;
@@ -72,30 +88,51 @@ typedef struct {
     fmi2Boolean shelfPackageAvailable[6];
 } SmartWarehouseCell;
 
-enum { PHASE_PICKUP = 0, PHASE_OUTBOUND = 1, PHASE_TRANSFER = 2, PHASE_RETURN = 3, PHASE_COMPLETE = 4 };
+enum {
+    PHASE_PICKUP = 0,
+    PHASE_OUTBOUND = 1,
+    PHASE_DECK_LIFT = 2,
+    PHASE_TRAY_TRANSFER = 3,
+    PHASE_TRANSFER = 4,
+    PHASE_RETURN = 5,
+    PHASE_COMPLETE = 6
+};
 
-static const fmi2Real PICKUP_DURATION = 7.2;
-static const fmi2Real PICKUP_MOVE_TO_SHELF_END = 1.2;
-static const fmi2Real PICKUP_LOWER_END = 1.8;
-static const fmi2Real PICKUP_GRIP_END = 2.05;
-static const fmi2Real PICKUP_LIFT_END = 2.75;
-static const fmi2Real PICKUP_RETURN_END = 4.15;
-static const fmi2Real PICKUP_EXTEND_END = 5.10;
-static const fmi2Real PICKUP_LOWER_AGV_END = 5.80;
-static const fmi2Real PICKUP_HANDOFF_END = 5.95;
-static const fmi2Real PICKUP_CLEAR_END = 6.55;
-static const fmi2Real PICKUP_HOME_X = -3.5;
-static const fmi2Real PICKUP_RAIL_Y = 3.3;
-static const fmi2Real PICKUP_CLEARANCE_Y = 3.0;
-static const fmi2Real PICKUP_AGV_Y = 0.585;
-static const fmi2Real PICKUP_AGV_Z = 0.73;
+static const fmi2Real PICKUP_DURATION = 9.2;
+static const fmi2Real PICKUP_MOVE_TO_SHELF_END = 0.9;
+static const fmi2Real PICKUP_LOWER_AT_RAIL_END = 1.9;
+static const fmi2Real PICKUP_EXTEND_TO_SHELF_END = 2.5;
+static const fmi2Real PICKUP_LOWER_TO_PACKAGE_END = 3.0;
+static const fmi2Real PICKUP_GRIP_END = 3.3;
+static const fmi2Real PICKUP_LIFT_END = 4.0;
+static const fmi2Real PICKUP_RETRACT_FROM_SHELF_END = 4.6;
+static const fmi2Real PICKUP_RAISE_AT_RAIL_END = 5.6;
+static const fmi2Real PICKUP_CLEARANCE_HOLD_END = 5.85;
+static const fmi2Real PICKUP_MOVE_TO_AGV_END = 6.85;
+static const fmi2Real PICKUP_EXTEND_TO_AGV_END = 7.35;
+static const fmi2Real PICKUP_LOWER_AGV_END = 8.15;
+static const fmi2Real PICKUP_HANDOFF_END = 8.35;
+static const fmi2Real PICKUP_RAISE_FROM_AGV_END = 8.85;
+static const fmi2Real PICKUP_HOME_X = -6.2;
+static const fmi2Real PICKUP_RAIL_Y = 6.4;
+static const fmi2Real PICKUP_RAIL_Z = -4.65;
+static const fmi2Real PICKUP_SHELF_REACH = 1.57;
+static const fmi2Real PICKUP_CLEARANCE_Y = 5.5;
+static const fmi2Real PICKUP_SHELF_APPROACH_Y = 3.0;
+static const fmi2Real PICKUP_GRIPPER_OFFSET = 0.55;
+static const fmi2Real PICKUP_AGV_Y = 0.59;
+static const fmi2Real PICKUP_AGV_Z = TRUCK_CONVEYOR_ENTRY_Z;
+static const fmi2Real CONVEYOR_ROLLER_TOP_Y = 0.695;
+static const fmi2Real AGV_HANDOFF_FORK_HEIGHT = 0.565;
+static const fmi2Real DECK_LIFT_DURATION = 1.0;
+static const fmi2Real TRAY_TRANSFER_DURATION = 1.3;
+static const fmi2Real TRAY_BELT_ANGULAR_SPEED = 20.0;
 static const fmi2Real TRANSFER_DURATION = 3.2;
-static const fmi2Real ROUTE_LENGTH = 8.4;
 static const fmi2Real PACKAGE_SIZES[6][3] = {
     {0.48, 0.42, 0.46}, {0.60, 0.54, 0.40}, {0.42, 0.36, 0.64},
     {0.56, 0.60, 0.50}, {0.60, 0.48, 0.62}, {0.50, 0.56, 0.58}
 };
-static const fmi2Real SOURCE_PACKAGE_X[6] = {-4.0, -3.5, -3.0, -1.7, -1.2, -0.7};
+static const fmi2Real SOURCE_PACKAGE_X[6] = {-4.11, -2.53, -0.95, 2.20, 3.78, 5.36};
 
 static fmi2Real clamp(fmi2Real value, fmi2Real minimum, fmi2Real maximum) {
     return fmin(maximum, fmax(minimum, value));
@@ -118,21 +155,23 @@ static void update_selected_package(SmartWarehouseCell* state) {
     state->packageSizeY = PACKAGE_SIZES[index][1];
     state->packageSizeZ = PACKAGE_SIZES[index][2];
     state->pickupArmY = PICKUP_RAIL_Y;
-    state->pickupArmZ = -3.08;
+    state->pickupArmZ = PICKUP_RAIL_Z;
     state->pickupArmAngle = 0.0;
     state->pickupArmReach = PICKUP_AGV_Z - state->pickupArmZ;
     state->pickupDropY = sourceY - state->pickupArmY;
     state->sourcePackageVisible = state->shelfPackageAvailable[index]
-        && (state->phase != PHASE_PICKUP || state->phaseTime < PICKUP_LOWER_END);
+        && (state->phase != PHASE_PICKUP || state->phaseTime < PICKUP_GRIP_END);
 }
 
 static void update_pickup_arm_animation(SmartWarehouseCell* state) {
     const int index = (int)clamp(state->truckLoadCount, 0, 5);
     const fmi2Real sourceX = SOURCE_PACKAGE_X[index];
     const fmi2Real sourceY = 2.01 + state->packageSizeY * 0.5;
-    const fmi2Real sourceDrop = sourceY - PICKUP_RAIL_Y;
-    const fmi2Real clearanceDrop = PICKUP_CLEARANCE_Y - PICKUP_RAIL_Y;
-    const fmi2Real agvDrop = PICKUP_AGV_Y + state->packageSizeY * 0.5 - PICKUP_RAIL_Y;
+    const fmi2Real sourceDrop = sourceY - PICKUP_RAIL_Y + PICKUP_GRIPPER_OFFSET;
+    const fmi2Real approachDrop = PICKUP_SHELF_APPROACH_Y - PICKUP_RAIL_Y + PICKUP_GRIPPER_OFFSET;
+    const fmi2Real clearanceDrop = PICKUP_CLEARANCE_Y - PICKUP_RAIL_Y + PICKUP_GRIPPER_OFFSET;
+    const fmi2Real agvDrop = PICKUP_AGV_Y + state->packageSizeY * 0.5
+        - PICKUP_RAIL_Y + PICKUP_GRIPPER_OFFSET;
     const fmi2Real time = state->phase == PHASE_PICKUP
         ? clamp(state->phaseTime, 0.0, PICKUP_DURATION)
         : PICKUP_DURATION;
@@ -147,68 +186,118 @@ static void update_pickup_arm_animation(SmartWarehouseCell* state) {
 
     if (time < PICKUP_MOVE_TO_SHELF_END) {
         state->pickupArmX = interpolate(PICKUP_HOME_X, sourceX, time / PICKUP_MOVE_TO_SHELF_END);
-    } else if (time < PICKUP_LOWER_END) {
+    } else if (time < PICKUP_LOWER_AT_RAIL_END) {
         state->pickupArmX = sourceX;
         state->pickupDropProgress = interpolate(
             clearanceDrop,
+            approachDrop,
+            (time - PICKUP_MOVE_TO_SHELF_END) / (PICKUP_LOWER_AT_RAIL_END - PICKUP_MOVE_TO_SHELF_END));
+    } else if (time < PICKUP_EXTEND_TO_SHELF_END) {
+        state->pickupArmX = sourceX;
+        state->pickupDropProgress = approachDrop;
+        state->pickupArmReachProgress = interpolate(
+            0.0,
+            PICKUP_SHELF_REACH,
+            (time - PICKUP_LOWER_AT_RAIL_END) / (PICKUP_EXTEND_TO_SHELF_END - PICKUP_LOWER_AT_RAIL_END));
+    } else if (time < PICKUP_LOWER_TO_PACKAGE_END) {
+        state->pickupArmX = sourceX;
+        state->pickupArmReachProgress = PICKUP_SHELF_REACH;
+        state->pickupGripperGap = 1.0;
+        state->pickupDropProgress = interpolate(
+            approachDrop,
             sourceDrop,
-            (time - PICKUP_MOVE_TO_SHELF_END) / (PICKUP_LOWER_END - PICKUP_MOVE_TO_SHELF_END));
+            (time - PICKUP_EXTEND_TO_SHELF_END) / (PICKUP_LOWER_TO_PACKAGE_END - PICKUP_EXTEND_TO_SHELF_END));
     } else if (time < PICKUP_GRIP_END) {
         state->pickupArmX = sourceX;
+        state->pickupArmReachProgress = PICKUP_SHELF_REACH;
         state->pickupDropProgress = sourceDrop;
         state->pickupGripperGap = interpolate(
             1.0,
             state->packageSizeX + 0.08,
-            (time - PICKUP_LOWER_END) / (PICKUP_GRIP_END - PICKUP_LOWER_END));
+            (time - PICKUP_LOWER_TO_PACKAGE_END) / (PICKUP_GRIP_END - PICKUP_LOWER_TO_PACKAGE_END));
         state->robotAngle = interpolate(0.12, 0.34,
-            (time - PICKUP_LOWER_END) / (PICKUP_GRIP_END - PICKUP_LOWER_END));
+            (time - PICKUP_LOWER_TO_PACKAGE_END) / (PICKUP_GRIP_END - PICKUP_LOWER_TO_PACKAGE_END));
     } else if (time < PICKUP_LIFT_END) {
         state->pickupArmX = sourceX;
+        state->pickupArmReachProgress = PICKUP_SHELF_REACH;
         state->pickupDropProgress = interpolate(
             sourceDrop,
-            clearanceDrop,
+            approachDrop,
             (time - PICKUP_GRIP_END) / (PICKUP_LIFT_END - PICKUP_GRIP_END));
         state->pickupGripperGap = state->packageSizeX + 0.08;
         state->robotAngle = interpolate(0.34, 0.12,
             (time - PICKUP_GRIP_END) / (PICKUP_LIFT_END - PICKUP_GRIP_END));
-    } else if (time < PICKUP_RETURN_END) {
+    } else if (time < PICKUP_RETRACT_FROM_SHELF_END) {
+        // Lift into the clear gap between shelf levels before retracting from the rack.
+        state->pickupArmX = sourceX;
+        state->pickupDropProgress = approachDrop;
+        state->pickupArmReachProgress = interpolate(
+            PICKUP_SHELF_REACH,
+            0.0,
+            (time - PICKUP_LIFT_END) / (PICKUP_RETRACT_FROM_SHELF_END - PICKUP_LIFT_END));
+        state->pickupGripperGap = state->packageSizeX + 0.08;
+    } else if (time < PICKUP_RAISE_AT_RAIL_END) {
+        // With the mast retracted into the aisle, raise the package above the
+        // highest cartons before translating the carriage across the rack.
+        state->pickupArmX = sourceX;
+        state->pickupArmReachProgress = 0.0;
+        state->pickupDropProgress = interpolate(
+            approachDrop,
+            clearanceDrop,
+            (time - PICKUP_RETRACT_FROM_SHELF_END) / (PICKUP_RAISE_AT_RAIL_END - PICKUP_RETRACT_FROM_SHELF_END));
+        state->pickupGripperGap = state->packageSizeX + 0.08;
+    } else if (time < PICKUP_CLEARANCE_HOLD_END) {
+        state->pickupArmX = sourceX;
+        state->pickupArmReachProgress = 0.0;
+        state->pickupDropProgress = clearanceDrop;
+        state->pickupGripperGap = state->packageSizeX + 0.08;
+    } else if (time < PICKUP_MOVE_TO_AGV_END) {
+        // Hold at the clear height briefly, then move horizontally to the AGV.
         state->pickupArmX = interpolate(
             sourceX,
             PICKUP_HOME_X,
-            (time - PICKUP_LIFT_END) / (PICKUP_RETURN_END - PICKUP_LIFT_END));
+            (time - PICKUP_CLEARANCE_HOLD_END) / (PICKUP_MOVE_TO_AGV_END - PICKUP_CLEARANCE_HOLD_END));
+        state->pickupArmReachProgress = 0.0;
+        state->pickupDropProgress = clearanceDrop;
         state->pickupGripperGap = state->packageSizeX + 0.08;
-    } else if (time < PICKUP_EXTEND_END) {
+    } else if (time < PICKUP_EXTEND_TO_AGV_END) {
+        state->pickupArmX = PICKUP_HOME_X;
+        state->pickupDropProgress = clearanceDrop;
         state->pickupArmReachProgress = interpolate(
             0.0,
             state->pickupArmReach,
-            (time - PICKUP_RETURN_END) / (PICKUP_EXTEND_END - PICKUP_RETURN_END));
+            (time - PICKUP_MOVE_TO_AGV_END) / (PICKUP_EXTEND_TO_AGV_END - PICKUP_MOVE_TO_AGV_END));
         state->pickupGripperGap = state->packageSizeX + 0.08;
     } else if (time < PICKUP_LOWER_AGV_END) {
+        state->pickupArmX = PICKUP_HOME_X;
         state->pickupArmReachProgress = state->pickupArmReach;
         state->pickupDropProgress = interpolate(
             clearanceDrop,
             agvDrop,
-            (time - PICKUP_EXTEND_END) / (PICKUP_LOWER_AGV_END - PICKUP_EXTEND_END));
+            (time - PICKUP_EXTEND_TO_AGV_END) / (PICKUP_LOWER_AGV_END - PICKUP_EXTEND_TO_AGV_END));
         state->pickupGripperGap = state->packageSizeX + 0.08;
     } else if (time < PICKUP_HANDOFF_END) {
+        state->pickupArmX = PICKUP_HOME_X;
         state->pickupArmReachProgress = state->pickupArmReach;
         state->pickupDropProgress = agvDrop;
         state->pickupGripperGap = state->packageSizeX + 0.08;
-    } else if (time < PICKUP_CLEAR_END) {
+    } else if (time < PICKUP_RAISE_FROM_AGV_END) {
+        state->pickupArmX = PICKUP_HOME_X;
         state->pickupArmReachProgress = state->pickupArmReach;
         state->pickupDropProgress = interpolate(
             agvDrop,
             clearanceDrop,
-            (time - PICKUP_HANDOFF_END) / (PICKUP_CLEAR_END - PICKUP_HANDOFF_END));
+            (time - PICKUP_HANDOFF_END) / (PICKUP_RAISE_FROM_AGV_END - PICKUP_HANDOFF_END));
         state->pickupGripperGap = interpolate(
             state->packageSizeX + 0.08,
             1.0,
-            (time - PICKUP_HANDOFF_END) / (PICKUP_CLEAR_END - PICKUP_HANDOFF_END));
+            (time - PICKUP_HANDOFF_END) / (PICKUP_RAISE_FROM_AGV_END - PICKUP_HANDOFF_END));
     } else {
         state->pickupArmReachProgress = interpolate(
             state->pickupArmReach,
             0.0,
-            (time - PICKUP_CLEAR_END) / (PICKUP_DURATION - PICKUP_CLEAR_END));
+            (time - PICKUP_RAISE_FROM_AGV_END) / (PICKUP_DURATION - PICKUP_RAISE_FROM_AGV_END));
+        state->pickupGripperGap = 1.0;
     }
 }
 
@@ -220,9 +309,11 @@ static void initialize_state(SmartWarehouseCell* state) {
     state->phase = PHASE_PICKUP;
     state->sourcePackageVisible = 1;
     for (int index = 0; index < 6; ++index) state->shelfPackageAvailable[index] = 1;
-    state->transferPackageX = 4.9;
-    state->transferPackageY = 0.73 + PACKAGE_SIZES[0][1] * 0.5;
-    state->transferPackageZ = 0.73;
+    state->transferPackageX = AGV_STOP_X + AGV_HANDOFF_OFFSET_X;
+    state->transferPackageY = CONVEYOR_ROLLER_TOP_Y + PACKAGE_SIZES[0][1] * 0.5;
+    state->transferPackageZ = TRUCK_CONVEYOR_ENTRY_Z;
+    state->trayPackageX = 0.0;
+    state->trayBeltPhase = 0.0;
     state->robotAngle = 0.12;
     state->forkHeight = 0.38;
     update_selected_package(state);
@@ -285,10 +376,10 @@ EXPORT fmi2Status fmi2DoStep(fmi2Component c, fmi2Real currentCommunicationPoint
             case PHASE_PICKUP: {
                 s->pickupProgress = clamp(s->phaseTime / PICKUP_DURATION, 0.0, 1.0);
                 const int selectedPackage = (int)clamp(s->truckLoadCount, 0, 5);
-                if (s->phaseTime >= PICKUP_LOWER_END) s->shelfPackageAvailable[selectedPackage] = 0;
+                if (s->phaseTime >= PICKUP_GRIP_END) s->shelfPackageAvailable[selectedPackage] = 0;
                 s->sourcePackageVisible = s->shelfPackageAvailable[selectedPackage]
-                    && s->phaseTime < PICKUP_LOWER_END;
-                s->pickupPackageVisible = s->phaseTime >= PICKUP_LOWER_END
+                    && s->phaseTime < PICKUP_GRIP_END;
+                s->pickupPackageVisible = s->phaseTime >= PICKUP_GRIP_END
                     && s->phaseTime < PICKUP_HANDOFF_END;
                 s->packageOnAgv = s->phaseTime >= PICKUP_HANDOFF_END;
                 s->forkHeight = s->phaseTime < PICKUP_HANDOFF_END ? 0.38 : 0.46;
@@ -310,15 +401,52 @@ EXPORT fmi2Status fmi2DoStep(fmi2Component c, fmi2Real currentCommunicationPoint
                 s->forkHeight = 0.46;
                 if (s->agvPosition >= ROUTE_LENGTH) {
                     s->agvPosition = ROUTE_LENGTH;
+                    s->phase = PHASE_DECK_LIFT;
+                    s->phaseTime = 0.0;
+                    s->packageOnAgv = 1;
+                    s->transferPackageVisible = 0;
+                    s->trayPackageX = 0.0;
+                    s->trayBeltPhase = 0.0;
+                    s->beltPhase = 0.0;
+                    s->forkHeight = 0.46;
+                    s->rushOrderPending = 0;
+                }
+                break;
+            }
+            case PHASE_DECK_LIFT: {
+                const fmi2Real liftProgress = clamp(s->phaseTime / DECK_LIFT_DURATION, 0.0, 1.0);
+                s->agvPosition = ROUTE_LENGTH;
+                s->forkHeight = interpolate(0.46, AGV_HANDOFF_FORK_HEIGHT, smoothstep(liftProgress));
+                s->packageOnAgv = 1;
+                s->trayPackageX = 0.0;
+                s->trayBeltPhase = 0.0;
+                if (s->phaseTime >= DECK_LIFT_DURATION) {
+                    s->forkHeight = AGV_HANDOFF_FORK_HEIGHT;
+                    s->phase = PHASE_TRAY_TRANSFER;
+                    s->phaseTime = 0.0;
+                }
+                break;
+            }
+            case PHASE_TRAY_TRANSFER: {
+                const fmi2Real progress = clamp(s->phaseTime / TRAY_TRANSFER_DURATION, 0.0, 1.0);
+                s->agvPosition = ROUTE_LENGTH;
+                s->forkHeight = AGV_HANDOFF_FORK_HEIGHT;
+                s->packageOnAgv = 1;
+                s->trayPackageX = AGV_HANDOFF_OFFSET_X * smoothstep(progress);
+                s->trayBeltPhase = fmod(s->trayBeltPhase + communicationStepSize * TRAY_BELT_ANGULAR_SPEED,
+                                        6.283185307179586);
+                if (s->phaseTime >= TRAY_TRANSFER_DURATION) {
+                    s->trayPackageX = AGV_HANDOFF_OFFSET_X;
+                    s->trayBeltPhase = 0.0;
                     s->phase = PHASE_TRANSFER;
                     s->phaseTime = 0.0;
                     s->packageOnAgv = 0;
                     s->transferPackageVisible = 1;
-                    s->transferPackageX = 4.9;
-                    s->transferPackageY = 0.73 + s->packageSizeY * 0.5;
-                    s->transferPackageZ = 0.73;
+                    s->transferPackageX = TRUCK_CONVEYOR_X;
+                    s->transferPackageY = CONVEYOR_ROLLER_TOP_Y + s->packageSizeY * 0.5;
+                    s->transferPackageZ = TRUCK_CONVEYOR_ENTRY_Z;
                     s->loaderReach = 0.0;
-                    s->rushOrderPending = 0;
+                    s->beltPhase = 0.0;
                 }
                 break;
             }
@@ -329,16 +457,18 @@ EXPORT fmi2Status fmi2DoStep(fmi2Component c, fmi2Real currentCommunicationPoint
                 static const fmi2Real slotX[] = {0.0, -0.7, 0.7, 0.0, -0.7, 0.7};
                 static const fmi2Real slotZ[] = {7.27, 7.27, 7.27, 6.27, 6.27, 6.27};
                 const int slot = (int)clamp(s->truckLoadCount, 0, 5);
-                const fmi2Real targetX = 4.9 + slotX[slot];
+                const fmi2Real targetX = TRUCK_CONVEYOR_X + slotX[slot];
                 const fmi2Real targetZ = slotZ[slot];
-                const fmi2Real beltY = 0.73 + s->packageSizeY * 0.5;
+                const fmi2Real beltY = CONVEYOR_ROLLER_TOP_Y + s->packageSizeY * 0.5;
                 const fmi2Real cargoY = 0.85 + s->packageSizeY * 0.5;
                 s->transferPackageVisible = 1;
-                s->transferPackageX = 4.9 + (targetX - 4.9) * loaderProgress;
+                s->transferPackageX = TRUCK_CONVEYOR_X + (targetX - TRUCK_CONVEYOR_X) * loaderProgress;
                 s->transferPackageY = beltY + (cargoY - beltY) * loaderProgress
                     + 0.12 * sin(3.141592653589793 * loaderProgress);
-                s->transferPackageZ = 0.73 + 4.72 * beltProgress + (targetZ - 5.45) * loaderProgress;
-                const fmi2Real loaderOffsetX = s->transferPackageX - 4.9;
+                s->transferPackageZ = TRUCK_CONVEYOR_ENTRY_Z
+                    + (TRUCK_CONVEYOR_TRANSFER_END_Z - TRUCK_CONVEYOR_ENTRY_Z) * beltProgress
+                    + (targetZ - TRUCK_CONVEYOR_TRANSFER_END_Z) * loaderProgress;
+                const fmi2Real loaderOffsetX = s->transferPackageX - TRUCK_CONVEYOR_X;
                 const fmi2Real loaderOffsetZ = s->transferPackageZ - 5.12;
                 s->loaderAngle = loaderOffsetZ > 0.0 ? atan2(loaderOffsetX, loaderOffsetZ) : 0.0;
                 s->loaderReach = loaderOffsetZ > 0.0
@@ -367,6 +497,9 @@ EXPORT fmi2Status fmi2DoStep(fmi2Component c, fmi2Real currentCommunicationPoint
             case PHASE_RETURN: {
                 s->agvPosition = fmax(0.0, s->agvPosition - s->speed * communicationStepSize);
                 s->robotAngle = 0.12;
+                s->forkHeight = 0.46;
+                s->trayPackageX = 0.0;
+                s->trayBeltPhase = 0.0;
                 if (s->agvPosition <= 0.0) {
                     s->agvPosition = 0.0;
                     s->phase = PHASE_PICKUP;
@@ -421,6 +554,8 @@ EXPORT fmi2Status fmi2GetReal(fmi2Component c, const fmi2ValueReference vr[], si
             case 40: values[i] = s->pickupArmReachProgress; break;
             case 41: values[i] = s->pickupDropProgress; break;
             case 45: values[i] = s->pickupGripperGap; break;
+            case 46: values[i] = s->trayPackageX; break;
+            case 47: values[i] = s->trayBeltPhase; break;
             default: return fmi2Error;
         }
     }

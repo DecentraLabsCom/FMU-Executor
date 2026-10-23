@@ -9,7 +9,8 @@ resource_path="$work_path/resources"
 command -v gcc >/dev/null 2>&1 || { echo 'GCC is required to build the Linux x64 FMI binary.' >&2; exit 1; }
 command -v python3 >/dev/null 2>&1 || { echo 'Python 3 is required to package the Linux x64 FMU.' >&2; exit 1; }
 
-python3 "$example_root/generate_scene.py"
+scene_path="$example_root/smart-warehouse-cell.glb"
+test -f "$scene_path" || { echo 'The Three.js-exported GLB scene is missing.' >&2; exit 1; }
 rm -rf -- "$work_path"
 mkdir -p "$binary_path" "$resource_path"
 cp "$example_root/modelDescription.xml" "$work_path/modelDescription.xml"

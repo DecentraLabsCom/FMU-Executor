@@ -1,10 +1,11 @@
 # Smart Warehouse Cell
 
 An FMI 2.0 Co-Simulation example for an automated warehouse. The deterministic
-FMU models a complete order fulfillment cycle: an overhead trolley slides along
-a rail to one of six individually sized cartons, lowers and closes its gripper,
-lifts the carton clear of the rack, and returns to the AGV handoff point. The
-low-profile AGV carries each carton on a guarded roller deck toward a delivery
+FMU models a complete order fulfillment cycle: a ceiling-suspended trolley runs
+behind the full-length rack to one of six individually sized cartons, lowers
+and closes its gripper, lifts the carton clear of the rack, and returns to the
+AGV handoff point. The
+low-profile AGV carries each carton on a guarded load deck toward a delivery
 truck, where a conveyor and loader arm place it inside. The cart then returns
 for another parcel.
 The cycle ends when the requested quantity is loaded or the truck reaches its
@@ -15,11 +16,10 @@ The example ships with these companion artifacts:
 - `SmartWarehouseCell.fmu`: Windows x64 build for Lab Station on Windows.
 - `SmartWarehouseCell-linux64.fmu`: Linux x86_64 build for Gateway development
   and Lab Station Linux.
-- `smart-warehouse-cell.glb`: self-contained geometry with `extras.fmiBindings`
-  for rack pickup, AGV travel, conveyor transfer, loader arm, truck cargo slots,
-  lift and alarm lamp. It includes a closed warehouse shell with high windows,
-  two open loading bays, a long high-bay rack, the center pallet rack, detailed
-  cartons and dock lighting.
+- `smart-warehouse-cell.glb`: the default GLB exported from the same procedural
+  Three.js scene as the web app. It includes `extras.fmiBindings` for rack
+  pickup, AGV travel, conveyor transfer, loader arm, truck cargo slots, lift and
+  alarm lamp, and is embedded in the distributed FMUs.
 - `SmartWarehouseCell.webapp.zip`: optional static Three.js application with
   its own procedural warehouse scene. It bundles its viewer modules and does
   not include or load the companion GLB. Marketplace sends it the same live FMI
@@ -28,7 +28,7 @@ The example ships with these companion artifacts:
 The scene includes high-bay racks, roof structure, loading docks, a centered
 animated roller conveyor and an outbound truck with an open loading door. The
 four-wheel carrier cart has a clear blue chassis, visible wheels, a liftable
-roller deck, amber cargo guides and forward lights. Six
+flat load deck, amber cargo guides and forward lights. Six
 different parcel sizes and colors are tracked separately: the selected shelf
 package disappears as the gripper closes around it, and its dimensions and
 color follow it onto the AGV, along the conveyor and into its truck slot. Cargo
@@ -41,10 +41,22 @@ lit dock details and warm/cool punctual lights bring it closer to the richer
 Three.js scene while preserving the GLB bindings in node metadata. Marketplace's
 generic viewer adds its environment reflections and renders the GLB materials
 and punctual lights.
-The conveyor rails stop short at the AGV handoff so parcels enter without
-catching the rail ends. The near-dock rack is narrowed to keep both truck
-entrances clear. The FMU drives the overhead trolley, gripper motion, package
-paths, AGV, loading arm, belt rollers, inventory, order status and safety lamp.
+The picker rail is suspended from the warehouse roof behind the full-width
+storage rack. The trolley first travels with its boom retracted, lowers the
+vertical mast behind the rack, extends into the selected shelf bay at package
+height, and lowers the gripper to take the carton. Source cartons sit between
+the rack uprights so the boom has a clear approach. The parcel then follows the
+same modeled path to the center of the AGV load deck before the trolley
+retracts. The six animated parcels are spread across the rack so the trolley
+traverses most of the storage bay.
+The AGV stops with the front edge of its load tray aligned to the truck
+conveyor's entry edge. Its powered tray rollers then move each parcel across
+the tray and onto the transverse conveyor, whose rollers take over the truck
+loading sequence. The conveyor rails stop short at the handoff so parcels enter
+without catching the rail ends. The near-dock rack is narrowed to keep both
+truck entrances clear. The FMU drives the overhead trolley, gripper motion,
+package paths, AGV, both roller conveyors, loading arm, inventory, order status
+and safety lamp.
 
 The Three.js app builds a separate, code-generated fulfillment hall: a long
 multi-tier rack running beside the full AGV lane, a second loaded pallet rack
@@ -106,10 +118,23 @@ Build the browser app bundle from the installed Marketplace Three.js package:
 python build_webapp.py --three-root ../../../Marketplace/node_modules/three
 ```
 
-Both FMU builds embed the same generated GLB in `resources/` and ship a
-same-stem companion `.glb` for Gateway/Station asset import. The optional
+Both FMU builds embed the default Three.js-exported GLB in `resources/` and ship
+a same-stem companion `.glb` for Gateway/Station asset import. The optional
 `.webapp.zip` is also kept beside the FMU so Lab Manager can import it from
-either FMU backend.
+either FMU backend. Build scripts package the checked-in default scene as-is.
+
+## Local scene authoring
+
+To export the current Three.js app scene to the checked-in GLB, start the local
+export helper from this directory:
+
+```powershell
+python tools/serve-scene-export.py --three-root ../../../Marketplace/node_modules/three
+```
+
+Open `http://127.0.0.1:8765/tools/export-scene.html` to generate
+`smart-warehouse-cell.glb` from the app scene. The helper binds only to
+loopback; it does not upload the scene or contact an external asset server.
 
 ## Demo profile
 
@@ -129,5 +154,5 @@ either FMU backend.
 
 ## License
 
-The model, generated scene and app code are provided under the MIT license in
+The model, Three.js scene and app code are provided under the MIT license in
 `LICENSE.txt`. The app bundle also includes the upstream Three.js license.
