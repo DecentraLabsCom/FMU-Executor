@@ -72,9 +72,15 @@ then runs the model and streams its samples back to the app. The duration
 control sends `options.stopTime` (5-300 s) with that request; the Marketplace
 host supplies the model's remaining FMI options. Apps own their input controls
 and presentation; Marketplace does not wrap a Three.js app in the standard FMU
-controls. The app never receives an FMU, access key or reservation credential.
-It reports `decentralabs:digital-twin-ready` version 1 after its procedural
-scene has initialized and reports `decentralabs:digital-twin-error` version 1
+controls. An app that supports Marketplace playback-rate control advertises
+`capabilities: ["playback-rate"]` in its `decentralabs:digital-twin-ready`
+version 1 message. Marketplace then sends
+`decentralabs:fmi-playback-control` version 1 with `rate` expressed as model
+seconds per real second. The rate changes visual playback only, not FMU
+execution or its output values. This app uses that rate for its existing
+play/pause replay control. Apps that do not advertise the capability keep
+their own playback behavior. The app never receives an FMU, access key or
+reservation credential. It reports `decentralabs:digital-twin-error` version 1
 if scene construction fails.
 Marketplace sends `decentralabs:digital-twin-host-ready` version 1 after the
 iframe document loads; the app retains its startup result until that handshake

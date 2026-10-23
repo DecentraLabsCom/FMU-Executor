@@ -24,6 +24,8 @@ REQUIRED_HOST_PROTOCOL_MESSAGES = (
     "decentralabs:fmi-simulation-state",
     "decentralabs:fmi-samples",
     "decentralabs:fmi-run-request",
+    "decentralabs:fmi-playback-control",
+    "playback-rate",
 )
 
 

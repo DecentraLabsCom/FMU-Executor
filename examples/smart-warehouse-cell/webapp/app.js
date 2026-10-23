@@ -51,10 +51,8 @@ const playback = {
   autoPlayPending: true,
   modelTime: 0,
   lastFrameTime: 0,
+  rate: 1,
 }
-// The Marketplace GLB timeline advances one 0.05 s FMU sample every 25 ms.
-// Use the same 2x rate so both views animate at a comparable pace.
-const PLAYBACK_SPEED = 2
 const playbackButton = document.getElementById('playback-toggle')
 const simulationForm = document.getElementById('simulation-form')
 const simulationRunButton = document.getElementById('run-simulation')
@@ -246,9 +244,9 @@ function advancePlayback(now) {
     playback.lastFrameTime = now
     return
   }
-  const elapsedSeconds = Math.min((now - playback.lastFrameTime) / 1000, 0.1)
+  const elapsedSeconds = Math.max((now - playback.lastFrameTime) / 1000, 0)
   playback.lastFrameTime = now
-  playback.modelTime += elapsedSeconds * PLAYBACK_SPEED
+  playback.modelTime += elapsedSeconds * playback.rate
   const lastSample = playback.samples[playback.samples.length - 1]
   if (playback.simulationRunning && lastSample) playback.modelTime = Math.min(playback.modelTime, lastSample.time)
 
@@ -277,6 +275,7 @@ function reportSceneStatus() {
     window.parent.postMessage({
       type: 'decentralabs:digital-twin-ready',
       version: 1,
+      capabilities: ['playback-rate'],
     }, '*')
   }
 }
@@ -298,6 +297,16 @@ window.addEventListener('message', (event) => {
     playback.simulationRunning = data.state === 'running'
     lastSimulationState = ['running', 'completed', 'error'].includes(data.state) ? data.state : 'idle'
     updateSimulationControls()
+    return
+  }
+  if (data.type === 'decentralabs:fmi-playback-control') {
+    const rate = Number(data.rate)
+    if (
+      data.rateUnit === 'model-seconds-per-real-second'
+      && Number.isFinite(rate)
+      && rate >= 0.01
+      && rate <= 100000
+    ) playback.rate = rate
     return
   }
   if (data.type === 'decentralabs:fmi-samples') {
