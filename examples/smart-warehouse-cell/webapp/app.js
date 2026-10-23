@@ -150,13 +150,19 @@ function updateSimulationControls() {
   setText('simulation-run-status', status)
 }
 
+function updateDurationLabel() {
+  const duration = Number(document.getElementById('simulation-duration')?.value)
+  setText('duration-value', Number.isFinite(duration) ? String(duration) : '220')
+}
+
 function requestSimulation(event) {
   event?.preventDefault()
   if (!hostHandshakeReady || !sceneReady || lastSimulationState === 'running') return
 
   const speed = Number(document.getElementById('robot-speed')?.value)
   const quantity = Number(document.getElementById('order-quantity')?.value)
-  if (!Number.isFinite(speed) || !Number.isInteger(quantity)) return
+  const stopTime = Number(document.getElementById('simulation-duration')?.value)
+  if (!Number.isFinite(speed) || !Number.isInteger(quantity) || !Number.isFinite(stopTime)) return
 
   lastSimulationState = 'running'
   updateSimulationControls()
@@ -172,6 +178,7 @@ function requestSimulation(event) {
       jam: Boolean(document.getElementById('jam-input')?.checked),
       rushOrder: Boolean(document.getElementById('rush-order')?.checked),
     },
+    options: { stopTime: Math.max(5, Math.min(300, stopTime)) },
   }, '*')
 }
 
@@ -308,6 +315,8 @@ window.addEventListener('message', (event) => {
 
 playbackButton?.addEventListener('click', togglePlayback)
 simulationForm?.addEventListener('submit', requestSimulation)
+document.getElementById('simulation-duration')?.addEventListener('input', updateDurationLabel)
+updateDurationLabel()
 updatePlaybackButton()
 updateSimulationControls()
 

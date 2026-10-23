@@ -19,7 +19,7 @@ import time
 import zipfile
 import zlib
 from pathlib import PurePosixPath
-from typing import Any, Callable, cast
+from typing import Any, Callable, Protocol, cast
 
 from fastapi import (
     Depends,
@@ -447,6 +447,7 @@ class SimulationBody(BaseModel):
     reservationKey: str | None = None
     parameters: dict = Field(default_factory=dict)
     options: dict = Field(default_factory=dict)
+    inputSchedule: list[dict] = Field(default_factory=list, max_length=128)
 
 
 class BatchScenario(BaseModel):
@@ -564,6 +565,85 @@ def _strict_number(value: Any, name: str) -> float:
     return number
 
 
+def _validate_input_schedule(
+    input_schedule: list[dict[str, Any]],
+    *,
+    options: dict[str, Any],
+    model_metadata: dict[str, Any],
+    fmu_path: Any,
+    access_key: str,
+) -> list[dict[str, Any]]:
+    if not input_schedule:
+        return []
+    if len(input_schedule) > 128:
+        raise HTTPException(status_code=422, detail="INPUT_SCHEDULE_LIMIT_EXCEEDED")
+
+    try:
+        start = float(options.get("startTime", 0.0))
+        stop = float(options.get("stopTime", 1.0))
+        step = float(options.get("stepSize", model_metadata.get("defaultStepSize") or 0.001))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise HTTPException(status_code=422, detail="INVALID_INPUT_SCHEDULE") from exc
+    if not all(math.isfinite(value) for value in (start, stop, step)) or step <= 0 or stop <= start:
+        raise HTTPException(status_code=422, detail="INVALID_INPUT_SCHEDULE")
+
+    input_names = {
+        item.get("name")
+        for item in model_metadata.get("modelVariables", [])
+        if item.get("causality") == "input"
+    }
+    normalized_schedule: list[dict[str, Any]] = []
+    seen_values: set[tuple[float, str]] = set()
+    previous_time = start
+    for event in input_schedule:
+        if not isinstance(event, dict) or set(event) != {"time", "values"}:
+            raise HTTPException(status_code=422, detail="INVALID_INPUT_SCHEDULE")
+        event_time = event["time"]
+        if isinstance(event_time, bool) or not isinstance(event_time, (int, float)):
+            raise HTTPException(status_code=422, detail="INVALID_INPUT_SCHEDULE")
+        event_time = float(event_time)
+        if not math.isfinite(event_time) or event_time < start or event_time >= stop or event_time < previous_time:
+            raise HTTPException(status_code=422, detail="INVALID_INPUT_SCHEDULE")
+        step_index = round((event_time - start) / step)
+        tolerance = max(1e-9, abs(step) * 1e-7)
+        if abs(start + step_index * step - event_time) > tolerance:
+            raise HTTPException(status_code=422, detail="INPUT_SCHEDULE_TIME_MUST_ALIGN_TO_STEP")
+        values = event["values"]
+        _validate_parameters(values)
+        if not values or any(name not in input_names for name in values):
+            raise HTTPException(status_code=422, detail="INPUT_SCHEDULE_CONTAINS_UNKNOWN_INPUT")
+        for name in values:
+            identity = (event_time, name)
+            if identity in seen_values:
+                raise HTTPException(status_code=422, detail="DUPLICATE_SCHEDULED_INPUT")
+            seen_values.add(identity)
+        normalized_schedule.append({"time": event_time, "values": values})
+        previous_time = event_time
+
+    validator = engine.FmuSession(
+        f"schedule_validation_{secrets.token_hex(6)}",
+        fmu_path,
+        access_key=access_key,
+    )
+    try:
+        validator.load()
+        for event in normalized_schedule:
+            try:
+                event["values"] = validator.validate_runtime_input_values(event["values"])
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise HTTPException(status_code=422, detail="INVALID_SCHEDULED_INPUT_VALUE") from exc
+    finally:
+        validator.terminate()
+
+    try:
+        encoded = json.dumps(normalized_schedule, separators=(",", ":"), allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="INVALID_INPUT_SCHEDULE") from exc
+    if len(encoded.encode("utf-8")) > 16 * 1024:
+        raise HTTPException(status_code=413, detail="INPUT_SCHEDULE_TOO_LARGE")
+    return normalized_schedule
+
+
 def _validate_active_reservation_deadline(context: dict[str, Any]) -> None:
     claims = context.get("claims") or {}
     if not isinstance(claims, dict):
@@ -609,6 +689,13 @@ async def run_simulation(body: SimulationBody):
         raise HTTPException(status_code=422, detail={"code": "FMU_NOT_COMPATIBLE", "issues": report["issues"][:8]})
     model_metadata = fmu_storage.describe_path(fmu_path)
     _validate_options(access_key, body.options, policy, model_metadata=model_metadata)
+    input_schedule = _validate_input_schedule(
+        body.inputSchedule,
+        options=body.options,
+        model_metadata=model_metadata,
+        fmu_path=fmu_path,
+        access_key=access_key,
+    )
     evidence_options = effective_execution_options(
         model_metadata,
         body.options,
@@ -646,6 +733,7 @@ async def run_simulation(body: SimulationBody):
                     authorization_expires_at=auth_expiry,
                     reservation_ends_at=reservation_end,
                     resource_policy=policy,
+                    input_schedule=input_schedule,
                 )
             )
             try:
@@ -663,6 +751,7 @@ async def run_simulation(body: SimulationBody):
                 parameters=body.parameters or {},
                 options=evidence_options,
                 policy=applied_execution_policy(policy, evidence_options),
+                input_schedule=input_schedule,
             )
 
         if slot is None:
@@ -678,7 +767,16 @@ async def run_simulation(body: SimulationBody):
             parameters=body.parameters or None,
             early_return_allowed=body.options.get("earlyReturnAllowed", False),
         )
-        result = slot.run_until(float(stop), step_size=float(step) if step is not None else None)
+        if input_schedule:
+            for _snapshot in slot.run_until_streaming(
+                float(stop),
+                step_size=float(step) if step is not None else None,
+                input_schedule=input_schedule,
+            ):
+                pass
+            result = {"time": slot._time, "finishReason": slot._finished_reason}
+        else:
+            result = slot.run_until(float(stop), step_size=float(step) if step is not None else None)
         outputs = slot.get_outputs()
         selected_outputs = outputs.get("outputs", {})
         if body.options.get("outputVariables") is not None:
@@ -697,6 +795,7 @@ async def run_simulation(body: SimulationBody):
             parameters=body.parameters or {},
             options=evidence_options,
             policy=applied_execution_policy(policy, evidence_options),
+            input_schedule=input_schedule,
         )
     except process_runner.ProcessExecutionError as exc:
         status = {
@@ -719,6 +818,8 @@ async def run_simulation(body: SimulationBody):
 
 @app.post("/internal/fmu/simulations/jobs", status_code=202, dependencies=[Depends(_check_token)])
 async def submit_simulation_job(body: SimulationBody):
+    if body.inputSchedule:
+        raise HTTPException(status_code=422, detail="INPUT_SCHEDULE_NOT_SUPPORTED_FOR_ASYNC_JOBS")
     access_key = _validated_access_key(body.accessKey)
     if not isinstance(body.gatewayContext, dict):
         raise HTTPException(status_code=403, detail="RESERVATION_SCOPE_REQUIRED")
@@ -820,6 +921,13 @@ async def stream_simulation(body: SimulationBody):
         raise HTTPException(status_code=422, detail={"code": "FMU_NOT_COMPATIBLE", "issues": report["issues"][:8]})
     model_metadata = fmu_storage.describe_path(fmu_path)
     _validate_options(access_key, body.options, policy, model_metadata=model_metadata)
+    input_schedule = _validate_input_schedule(
+        body.inputSchedule,
+        options=body.options,
+        model_metadata=model_metadata,
+        fmu_path=fmu_path,
+        access_key=access_key,
+    )
     evidence_options = effective_execution_options(
         model_metadata,
         body.options,
@@ -880,6 +988,7 @@ async def stream_simulation(body: SimulationBody):
                     authorization_expires_at=auth_expiry,
                     reservation_ends_at=reservation_end,
                     resource_policy=policy,
+                    input_schedule=input_schedule,
                 ):
                     if snapshot.get("type") == "sim.done":
                         policy_evidence = applied_execution_policy(policy, evidence_options)
@@ -891,6 +1000,7 @@ async def stream_simulation(body: SimulationBody):
                             finish_reason=snapshot.get("finishReason") or "completed",
                             policy=policy_evidence,
                             result_sha256=stream_digest.hexdigest(),
+                            input_schedule=input_schedule,
                         )
                         snapshot = {**snapshot, "fmuSha256": model_sha256, "evidence": evidence}
                     line = encode_line(snapshot)
@@ -914,6 +1024,7 @@ async def stream_simulation(body: SimulationBody):
                 for snapshot in slot.run_until_streaming(
                     float(stop),
                     step_size=float(step) if step is not None else None,
+                    input_schedule=input_schedule,
                 ):
                     line = encode_line(snapshot)
                     stream_digest.update(line.encode("utf-8"))
@@ -931,6 +1042,7 @@ async def stream_simulation(body: SimulationBody):
                     finish_reason=slot._finished_reason or "completed",
                     policy=applied_execution_policy(policy, evidence_options),
                     result_sha256=stream_digest.hexdigest(),
+                    input_schedule=input_schedule,
                 )
                 yield encode_line({**final_payload, "fmuSha256": model_sha256, "evidence": final_evidence})
         except process_runner.ProcessExecutionError as exc:
@@ -1260,7 +1372,11 @@ def _sim_outputs_payload(
     return payload
 
 
-def _output_read_rate_limit_exception(exc: process_runner.OutputReadRateLimitError) -> HTTPException:
+class _OutputReadRateLimitErrorLike(Protocol):
+    retry_after_ms: int
+
+
+def _output_read_rate_limit_exception(exc: _OutputReadRateLimitErrorLike) -> HTTPException:
     return HTTPException(
         status_code=429,
         detail={

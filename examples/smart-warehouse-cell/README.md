@@ -68,10 +68,11 @@ sends `decentralabs:fmi-reset` when a new run replaces the timeline and
 arriving. A complete app can request a run by sending
 `decentralabs:fmi-run-request` version 1 with a `parameters` object whose keys
 are FMU input names. Marketplace validates each name against the FMU metadata,
-then runs the model and streams its samples back to the app. Apps own their
-input controls and presentation; Marketplace does not wrap a Three.js app in
-the standard FMU controls. The app never receives an FMU, access key or
-reservation credential.
+then runs the model and streams its samples back to the app. The duration
+control sends `options.stopTime` (5-300 s) with that request; the Marketplace
+host supplies the model's remaining FMI options. Apps own their input controls
+and presentation; Marketplace does not wrap a Three.js app in the standard FMU
+controls. The app never receives an FMU, access key or reservation credential.
 It reports `decentralabs:digital-twin-ready` version 1 after its procedural
 scene has initialized and reports `decentralabs:digital-twin-error` version 1
 if scene construction fails.
@@ -112,8 +113,11 @@ either FMU backend.
 4. Set `orderQuantity` from one to six packages. `robotSpeed` controls AGV
    travel; `rushOrder` speeds up the next outbound trip by 45%; `jam` freezes
    the entire process and raises the safety alarm.
-5. Run for about 200 seconds to see the full default six-package order at the
-   default speed. Shorter runs stop part-way through the cycle. The GLB option
+5. Choose a simulation duration from 5 to 300 seconds in the Three.js app and
+   run the FMU. The app sends that duration through the standard
+   `options.stopTime` field; shorter runs stop part-way through the cycle. Run
+   for about 200 seconds to see the full default six-package order at the
+   default speed. The GLB option
    presents the authored asset through Marketplace's generic viewer; the
    Three.js option presents its separate native scene from the same FMI stream.
 

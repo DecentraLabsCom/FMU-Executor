@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import math
 import hashlib
 import logging
 import os
@@ -13,6 +14,7 @@ import stat
 import tempfile
 import time as _time
 import zipfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
@@ -507,7 +509,43 @@ def describe_path(
 ) -> dict[str, Any]:
     """Describe a specific immutable FMU file."""
     md = fmpy.read_model_description(str(path))
-    return describe_model_description(md, public_only=public_only, causality=causality)
+    return describe_model_description(
+        md,
+        public_only=public_only,
+        causality=causality,
+        display_unit_inverses=_display_unit_inverse_map(path),
+    )
+
+
+def _display_unit_inverse_map(path: Path) -> dict[tuple[str, str], bool] | None:
+    """Read FMI 3 inverse display units that the installed FMPy parser may omit."""
+    try:
+        with zipfile.ZipFile(path) as archive:
+            info = archive.getinfo("modelDescription.xml")
+            if info.file_size > config.MAX_FMU_MODEL_DESCRIPTION_BYTES:
+                return None
+            with archive.open(info) as source:
+                root = ET.parse(source).getroot()
+    except (OSError, KeyError, RuntimeError, ET.ParseError, zipfile.BadZipFile):
+        return None
+
+    def children_named(element: ET.Element, name: str):
+        return (child for child in element if child.tag.rsplit("}", 1)[-1] == name)
+
+    inverse_units: dict[tuple[str, str], bool] = {}
+    unit_definitions = next(children_named(root, "UnitDefinitions"), None)
+    if unit_definitions is None:
+        return inverse_units
+    for unit in children_named(unit_definitions, "Unit"):
+        unit_name = unit.get("name")
+        if not unit_name:
+            continue
+        for display in children_named(unit, "DisplayUnit"):
+            display_name = display.get("name")
+            inverse = str(display.get("inverse", "false")).strip().lower() in {"true", "1"}
+            if display_name and inverse:
+                inverse_units[(unit_name, display_name)] = True
+    return inverse_units
 
 
 def describe_model_description(
@@ -515,8 +553,79 @@ def describe_model_description(
     *,
     public_only: bool = False,
     causality: str | None = None,
+    display_unit_inverses: dict[tuple[str, str], bool] | None = None,
 ) -> dict[str, Any]:
     """Normalize a parsed FMI description without reopening the FMU archive."""
+
+    def finite_number(value: Any, *, integer: bool = False) -> int | float | None:
+        if value is None:
+            return None
+        try:
+            parsed = int(value) if integer else float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if isinstance(parsed, float) and not math.isfinite(parsed):
+            return None
+        return parsed
+
+    def display_unit_for(var: Any, declared_type: Any) -> dict[str, Any] | None:
+        unit_name = getattr(var, "unit", None) or getattr(declared_type, "unit", None)
+        display_name = getattr(var, "displayUnit", None) or getattr(declared_type, "displayUnit", None)
+        if not isinstance(unit_name, str) or not unit_name or not isinstance(display_name, str) or not display_name:
+            return None
+
+        unit = next(
+            (item for item in (getattr(md, "unitDefinitions", None) or []) if getattr(item, "name", None) == unit_name),
+            None,
+        )
+        display = next(
+            (item for item in (getattr(unit, "displayUnits", None) or []) if getattr(item, "name", None) == display_name),
+            None,
+        )
+        if display is None:
+            return None
+
+        try:
+            factor = float(getattr(display, "factor", 1.0))
+            offset = float(getattr(display, "offset", 0.0))
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(factor) or factor == 0 or not math.isfinite(offset):
+            return None
+
+        fmi_major_version = str(getattr(md, "fmiVersion", "")).split(".", 1)[0]
+        raw_inverse = getattr(display, "inverse", None)
+        if raw_inverse is None:
+            if fmi_major_version == "3" and display_unit_inverses is None:
+                return None
+            inverse = bool(display_unit_inverses and display_unit_inverses.get((unit_name, display_name), False))
+        else:
+            inverse = raw_inverse is True or str(raw_inverse).strip().lower() in {"true", "1"}
+        if inverse and (fmi_major_version == "1" or offset != 0):
+            return None
+
+        # The public metadata uses one consistent equation for every FMI
+        # version: display = factor * model_value + offset.
+        if str(getattr(md, "fmiVersion", "")).split(".", 1)[0] == "1":
+            factor, offset = 1.0 / factor, -offset / factor
+        variable_relative = getattr(var, "relativeQuantity", None)
+        type_relative = getattr(declared_type, "relativeQuantity", None)
+        if (
+            variable_relative is True
+            or type_relative is True
+            or str(variable_relative).strip().lower() in {"true", "1"}
+            or str(type_relative).strip().lower() in {"true", "1"}
+        ):
+            offset = 0.0
+        result: dict[str, Any] = {"name": display_name, "factor": factor, "offset": offset}
+        if inverse:
+            result["inverse"] = True
+        return result
+
+    integer_types = {
+        "Integer", "Enumeration", "Int8", "UInt8", "Int16", "UInt16",
+        "Int32", "UInt32", "Int64", "UInt64",
+    }
 
     variables: list[dict[str, Any]] = []
     for var in md.modelVariables:
@@ -527,6 +636,7 @@ def describe_model_description(
             continue
         if causality is not None and var.causality != causality:
             continue
+        declared_type = getattr(var, "declaredType", None)
         entry: dict[str, Any] = {
             "name": var.name,
             "valueReference": var.valueReference,
@@ -555,12 +665,41 @@ def describe_model_description(
                 entry["start"] = base64.b64encode(bytes(var.start)).decode("ascii")
             else:
                 entry["start"] = var.start
-        if var.unit:
-            entry["unit"] = var.unit
-        if var.min is not None:
-            entry["min"] = var.min
-        if var.max is not None:
-            entry["max"] = var.max
+        unit = getattr(var, "unit", None) or getattr(declared_type, "unit", None)
+        if unit:
+            entry["unit"] = unit
+        description = getattr(var, "description", None)
+        if isinstance(description, str) and description.strip():
+            entry["description"] = description.strip()[:4096]
+        minimum = getattr(var, "min", None)
+        if minimum is None:
+            minimum = getattr(declared_type, "min", None)
+        maximum = getattr(var, "max", None)
+        if maximum is None:
+            maximum = getattr(declared_type, "max", None)
+        normalized_min = finite_number(minimum, integer=var.type in integer_types)
+        normalized_max = finite_number(maximum, integer=var.type in integer_types)
+        if normalized_min is not None:
+            entry["min"] = normalized_min
+        if normalized_max is not None:
+            entry["max"] = normalized_max
+        display_unit = display_unit_for(var, declared_type)
+        if display_unit is not None:
+            entry["displayUnit"] = display_unit
+        if var.type == "Enumeration" and declared_type is not None:
+            items = []
+            for item in getattr(declared_type, "items", []) or []:
+                value = finite_number(getattr(item, "value", None), integer=True)
+                name = getattr(item, "name", None)
+                if value is None or not isinstance(name, str) or not name.strip():
+                    continue
+                option = {"value": value, "name": name.strip()[:256]}
+                item_description = getattr(item, "description", None)
+                if isinstance(item_description, str) and item_description.strip():
+                    option["description"] = item_description.strip()[:1024]
+                items.append(option)
+            if items and len(items) <= 256:
+                entry["enumItems"] = items
         variables.append(entry)
 
     cs = md.coSimulation

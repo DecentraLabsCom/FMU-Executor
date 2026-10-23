@@ -30,6 +30,10 @@
           <summary>RUN CONTROLS</summary>
           <form class="simulation-panel" id="simulation-form">
             <div class="simulation-panel-heading"><span>MODEL INPUTS</span><span>FMU</span></div>
+            <label class="input-control" for="simulation-duration">
+              <span><strong>Simulation duration</strong><small><output id="duration-value">220</output> seconds</small></span>
+              <input id="simulation-duration" name="stopTime" type="range" min="5" max="300" step="5" value="220">
+            </label>
             <label class="input-control" for="robot-speed">
               <span><strong>AGV travel speed</strong><small>Robot speed (m/s)</small></span>
               <input id="robot-speed" name="robotSpeed" type="number" min="0" max="1.4" step="0.05" value="0.68">

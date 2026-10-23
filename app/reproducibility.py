@@ -111,8 +111,9 @@ def build_execution_evidence(
     warnings: list[str] | None = None,
     policy: dict[str, Any] | None = None,
     result_sha256: str | None = None,
+    input_schedule: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    return {
+    evidence: dict[str, Any] = {
         "fmuSha256": model_sha256,
         "executorVersion": executor_version(),
         "executorCommit": os.environ.get("FMU_EXECUTOR_COMMIT", "unknown"),
@@ -125,6 +126,9 @@ def build_execution_evidence(
         "warnings": warnings or [],
         "resultSha256": result_sha256 or canonical_sha256(result),
     }
+    if input_schedule:
+        evidence["inputSchedule"] = input_schedule
+    return evidence
 
 
 def build_runtime_metadata(
@@ -156,6 +160,7 @@ def attach_evidence(
     options: dict[str, Any],
     finish_reason: str | None = None,
     policy: dict[str, Any] | None = None,
+    input_schedule: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     payload = dict(result)
     payload["evidence"] = build_execution_evidence(
@@ -165,5 +170,6 @@ def attach_evidence(
         result=result,
         finish_reason=finish_reason or result.get("finishReason") or "completed",
         policy=policy,
+        input_schedule=input_schedule,
     )
     return payload

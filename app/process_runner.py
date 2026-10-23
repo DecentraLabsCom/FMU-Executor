@@ -787,6 +787,7 @@ def _execute_worker(
     probe_only: bool = False,
     resource_policy: dict[str, Any] | None = None,
     expected_parent_pid: int | None = None,
+    input_schedule: list[dict[str, Any]] | None = None,
 ) -> None:
     """Worker entry point; imports native FMU code only after OS limits apply."""
     session = None
@@ -832,6 +833,9 @@ def _execute_worker(
             parameters=parameters or None,
             early_return_allowed=options.get("earlyReturnAllowed", True),
         )
+        scheduled_inputs = list(input_schedule or [])
+        while scheduled_inputs and float(scheduled_inputs[0]["time"]) <= start + 1e-12:
+            session.set_inputs(scheduled_inputs.pop(0)["values"])
         requested_outputs = options.get("outputVariables")
         result_size_limit = config.MAX_STORED_RESULT_BYTES
         if resource_policy is not None:
@@ -850,7 +854,11 @@ def _execute_worker(
             result_bytes = 0
             sample_every = max(1, int(options.get("outputSampleEverySteps", 1)))
             step_index = 0
-            for snapshot in session.run_until_streaming(stop, step_size=step_value):
+            for snapshot in session.run_until_streaming(
+                stop,
+                step_size=step_value,
+                input_schedule=scheduled_inputs,
+            ):
                 step_index += 1
                 is_final = session._finished_reason is not None or snapshot["time"] >= stop
                 if step_index % sample_every != 0 and not is_final:
@@ -884,7 +892,11 @@ def _execute_worker(
             sample_every = max(1, int(options.get("outputSampleEverySteps", 1)))
             step_index = 0
             last_sample_time = initial["time"]
-            for snapshot in session.run_until_streaming(stop, step_size=step_value):
+            for snapshot in session.run_until_streaming(
+                stop,
+                step_size=step_value,
+                input_schedule=scheduled_inputs,
+            ):
                 step_index += 1
                 is_final = session._finished_reason is not None or snapshot["time"] >= stop
                 if step_index % sample_every != 0 and not is_final:
@@ -917,7 +929,19 @@ def _execute_worker(
                 },
             })
         else:
-            result = session.run_until(stop, step_size=step_value)
+            if scheduled_inputs:
+                for _snapshot in session.run_until_streaming(
+                    stop,
+                    step_size=step_value,
+                    input_schedule=scheduled_inputs,
+                ):
+                    pass
+                result = {
+                    "time": session._time,
+                    "finishReason": session._finished_reason,
+                }
+            else:
+                result = session.run_until(stop, step_size=step_value)
             outputs = session.get_outputs()
             selected_outputs = select_outputs(outputs.get("outputs", {}))
             payload = {
@@ -970,6 +994,7 @@ def _new_process(
     capture_series: bool = False,
     probe_only: bool = False,
     resource_policy: dict[str, Any] | None = None,
+    input_schedule: list[dict[str, Any]] | None = None,
 ) -> tuple[Any, Any, WindowsWorkerJob | None, Path, Any]:
     context = mp.get_context("spawn")
     config.TEMP_DIR.mkdir(parents=True, exist_ok=True)
@@ -985,7 +1010,7 @@ def _new_process(
     worker_args = (
         str(worker_fmu_path), access_key, parameters, options, output_queue,
         streaming, capture_series, start_gate, str(worker_directory),
-        probe_only, resource_policy, os.getpid(),
+        probe_only, resource_policy, os.getpid(), input_schedule,
     )
     process = _worker_process(
         context,
@@ -1032,6 +1057,7 @@ def run(
     reservation_ends_at: float | None = None,
     probe_only: bool = False,
     resource_policy: dict[str, Any] | None = None,
+    input_schedule: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Run a one-shot simulation in a spawned process."""
     context = mp.get_context("spawn")
@@ -1039,7 +1065,7 @@ def run(
     try:
         process, _, job, worker_directory, _start_gate = _new_process(
             fmu_path, access_key, parameters, options, output_queue,
-            False, capture_series, probe_only, resource_policy,
+            False, capture_series, probe_only, resource_policy, input_schedule,
         )
     except Exception:
         output_queue.close()
@@ -1119,6 +1145,7 @@ def stream(
     authorization_expires_at: float | None = None,
     reservation_ends_at: float | None = None,
     resource_policy: dict[str, Any] | None = None,
+    input_schedule: list[dict[str, Any]] | None = None,
 ) -> Iterator[dict[str, Any]]:
     """Yield NDJSON payloads from an isolated streaming worker."""
     context = mp.get_context("spawn")
@@ -1127,6 +1154,7 @@ def stream(
         process, _, job, worker_directory, _start_gate = _new_process(
             fmu_path, access_key, parameters, options, output_queue, True,
             resource_policy=resource_policy,
+            input_schedule=input_schedule,
         )
     except Exception:
         output_queue.close()
