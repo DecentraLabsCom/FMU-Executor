@@ -13,8 +13,6 @@ fmu-data/*
 !fmu-data/.gitkeep
 examples/smart-warehouse-cell/.build*/
 examples/smart-warehouse-cell/webapp/vendor/
-examples/smart-warehouse-cell/webapp/warehouse.glb
 # Prebuilt assets for demos that are intentionally local-only.
-examples/boptest-building/
 examples/local-demos/
 .coverage
