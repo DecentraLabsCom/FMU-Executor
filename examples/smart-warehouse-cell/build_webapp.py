@@ -25,11 +25,27 @@ REQUIRED_HOST_PROTOCOL_MESSAGES = (
     "decentralabs:fmi-simulation-state",
     "decentralabs:fmi-samples",
     "decentralabs:fmi-run-request",
+    "decentralabs:fmi-run-accepted",
+    "decentralabs:fmi-run-rejected",
+    "decentralabs:fmi-run-cancel",
+    "decentralabs:fmi-run-cancelled",
     "decentralabs:fmi-playback-control",
+    "decentralabs:fmi-samples-ack",
     "playback-rate",
+    "sample-acknowledgement",
+    "MAX_SAMPLE_BATCH_JSON_CHARS",
     "playbackControlPosition",
     "bottom-right",
+    "isHostMessageEvent",
 )
+
+
+def find_protocol_source() -> Path:
+    for parent in (ROOT, *ROOT.parents):
+        candidate = parent / "Marketplace" / "src" / "components" / "simulation" / "digitalTwinAppProtocol.js"
+        if candidate.is_file():
+            return candidate
+    raise FileNotFoundError("Marketplace digital-twin protocol source was not found")
 
 
 def build(three_root: Path) -> None:
@@ -81,6 +97,10 @@ def build(three_root: Path) -> None:
             raise FileNotFoundError(f"Three.js source file is missing: {source}")
         shutil.copyfile(source, destination)
 
+    protocol_source = find_protocol_source()
+    protocol_target = WEBAPP_ROOT / "digitalTwinAppProtocol.js"
+    shutil.copyfile(protocol_source, protocol_target)
+
     # These examples import the package specifier `three`. Rewrite only that
     # import to the vendored module so the ZIP runs without an import map/CDN.
     for filename in ("OrbitControls.js", "RoomEnvironment.js"):
@@ -126,9 +146,8 @@ def build(three_root: Path) -> None:
         raise ValueError("The Three.js demo app must build its own scene without loading the companion GLB")
     if "createSmartWarehouseScene" not in app_script or "scene.js" not in bundle_files:
         raise ValueError("The Three.js demo app is missing its procedural warehouse scene module")
-    missing_protocol_messages = [
-        message for message in REQUIRED_HOST_PROTOCOL_MESSAGES if message not in app_script
-    ]
+    protocol_surface = app_script + protocol_target.read_text(encoding="utf-8")
+    missing_protocol_messages = [message for message in REQUIRED_HOST_PROTOCOL_MESSAGES if message not in protocol_surface]
     if missing_protocol_messages:
         raise ValueError(
             "Three.js app is missing Marketplace host protocol messages: "

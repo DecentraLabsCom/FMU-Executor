@@ -2,6 +2,16 @@ import * as THREE from './vendor/three.module.js'
 import { OrbitControls } from './vendor/OrbitControls.js'
 import { RoomEnvironment } from './vendor/RoomEnvironment.js'
 import { createSmartWarehouseScene } from './scene.js'
+import {
+  acknowledgeSampleBatch,
+  createProtocolId,
+  DIGITAL_TWIN_CAPABILITY,
+  DIGITAL_TWIN_MESSAGE,
+  DIGITAL_TWIN_PROTOCOL_VERSION,
+  isHostMessageEvent,
+  isValidSamplesBatch,
+  postToHost,
+} from './digitalTwinAppProtocol.js'
 
 const host = document.querySelector('#scene')
 const canvasRoot = document.querySelector('.viewport')
@@ -43,6 +53,8 @@ const dash = '\u2014'
 let hostHandshakeReady = false
 let sceneReady = false
 let sceneErrorCode = null
+let activeRunId = null
+let pendingRequestId = null
 const playback = {
   samples: [],
   sampleIndex: -1,
@@ -141,6 +153,8 @@ function updateSimulationControls() {
     ? 'The FMU is calculating the response.'
     : lastSimulationState === 'completed'
       ? `${playback.samples.length.toLocaleString('en-US')} samples ready for replay.`
+      : lastSimulationState === 'cancelled'
+        ? 'Simulation cancelled. You can review the samples already received or start again.'
       : lastSimulationState === 'error'
         ? 'The FMU run failed. Adjust the inputs and try again.'
         : sceneReady ? 'Choose the inputs and run the FMU.' : 'Preparing the warehouse scene…'
@@ -164,9 +178,9 @@ function requestSimulation() {
   updateSimulationControls()
   const settings = document.querySelector('.simulation-setup')
   if (settings) settings.open = false
-  window.parent.postMessage({
-    type: 'decentralabs:fmi-run-request',
-    version: 1,
+  pendingRequestId = createProtocolId('request')
+  postToHost(DIGITAL_TWIN_MESSAGE.RUN_REQUEST, {
+    requestId: pendingRequestId,
     parameters: {
       robotSpeed: Math.max(0, Math.min(1.4, speed)),
       orderQuantity: Math.max(1, Math.min(6, quantity)),
@@ -175,7 +189,7 @@ function requestSimulation() {
       rushOrder: Boolean(document.getElementById('rush-order')?.checked),
     },
     options: { stopTime: Math.max(5, Math.min(300, stopTime)) },
-  }, '*')
+  })
 }
 
 function setPlaybackPlaying(playing) {
@@ -265,40 +279,52 @@ function reportSceneStatus() {
   if (!hostHandshakeReady || window.parent === window) return
   if (sceneErrorCode) {
     window.parent.postMessage({
-      type: 'decentralabs:digital-twin-error',
-      version: 1,
+      type: DIGITAL_TWIN_MESSAGE.APP_ERROR,
+      version: DIGITAL_TWIN_PROTOCOL_VERSION,
       code: sceneErrorCode,
     }, '*')
   } else if (sceneReady) {
     window.parent.postMessage({
-      type: 'decentralabs:digital-twin-ready',
-      version: 1,
-      capabilities: ['playback-rate'],
+      type: DIGITAL_TWIN_MESSAGE.APP_READY,
+      version: DIGITAL_TWIN_PROTOCOL_VERSION,
+      capabilities: [DIGITAL_TWIN_CAPABILITY.PLAYBACK_RATE, DIGITAL_TWIN_CAPABILITY.SAMPLE_ACKNOWLEDGEMENT],
       playbackControlPosition: 'bottom-right',
     }, '*')
   }
 }
 
 window.addEventListener('message', (event) => {
-  if (event.source !== window.parent) return
+  if (!isHostMessageEvent(event)) return
   const data = event.data
-  if (data?.type === 'decentralabs:digital-twin-host-ready' && data.version === 1) {
+  if (data?.type === DIGITAL_TWIN_MESSAGE.HOST_READY) {
     hostHandshakeReady = true
     reportSceneStatus()
     return
   }
-  if (!data || data.version !== 1) return
-  if (data.type === 'decentralabs:fmi-reset') {
-    resetPlayback()
+  if (data.type === DIGITAL_TWIN_MESSAGE.RUN_ACCEPTED && data.requestId === pendingRequestId) {
+    activeRunId = data.runId
+    pendingRequestId = null
     return
   }
-  if (data.type === 'decentralabs:fmi-simulation-state') {
-    playback.simulationRunning = data.state === 'running'
-    lastSimulationState = ['running', 'completed', 'error'].includes(data.state) ? data.state : 'idle'
+  if (data.type === DIGITAL_TWIN_MESSAGE.RUN_REJECTED && data.requestId === pendingRequestId) {
+    pendingRequestId = null
+    lastSimulationState = 'error'
     updateSimulationControls()
     return
   }
-  if (data.type === 'decentralabs:fmi-playback-control') {
+  if (data.type === DIGITAL_TWIN_MESSAGE.RESET) {
+    activeRunId = typeof data.runId === 'string' ? data.runId : null
+    resetPlayback()
+    return
+  }
+  if (data.type === DIGITAL_TWIN_MESSAGE.SIMULATION_STATE) {
+    if (data.runId && activeRunId && data.runId !== activeRunId) return
+    playback.simulationRunning = data.state === 'running'
+    lastSimulationState = ['running', 'completed', 'cancelled', 'error'].includes(data.state) ? data.state : 'idle'
+    updateSimulationControls()
+    return
+  }
+  if (data.type === DIGITAL_TWIN_MESSAGE.PLAYBACK_CONTROL) {
     const rate = Number(data.rate)
     if (
       data.rateUnit === 'model-seconds-per-real-second'
@@ -308,11 +334,13 @@ window.addEventListener('message', (event) => {
     ) playback.rate = rate
     return
   }
-  if (data.type === 'decentralabs:fmi-samples') {
+  if (data.type === DIGITAL_TWIN_MESSAGE.SAMPLES) {
+    if (!isValidSamplesBatch(data) || (data.runId && activeRunId && data.runId !== activeRunId)) return
     appendSamples(data.samples)
+    acknowledgeSampleBatch(data)
     return
   }
-  if (data.type === 'decentralabs:fmi-sample' && data.outputs && typeof data.outputs === 'object' && !Array.isArray(data.outputs)) {
+  if (data.type === DIGITAL_TWIN_MESSAGE.SAMPLE && data.outputs && typeof data.outputs === 'object' && !Array.isArray(data.outputs)) {
     const outputs = {}
     for (const [name, value] of Object.entries(data.outputs)) {
       if (typeof value === 'boolean' || (typeof value === 'number' && Number.isFinite(value))) outputs[name] = value
