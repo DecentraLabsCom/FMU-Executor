@@ -26,6 +26,8 @@ REQUIRED_HOST_PROTOCOL_MESSAGES = (
     "decentralabs:fmi-run-request",
     "decentralabs:fmi-playback-control",
     "playback-rate",
+    "playbackControlPosition",
+    "bottom-right",
 )
 
 

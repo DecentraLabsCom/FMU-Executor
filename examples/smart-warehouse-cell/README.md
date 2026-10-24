@@ -86,7 +86,9 @@ host supplies the model's remaining FMI options. Apps own their input controls
 and presentation; Marketplace does not wrap a Three.js app in the standard FMU
 controls. An app that supports Marketplace playback-rate control advertises
 `capabilities: ["playback-rate"]` in its `decentralabs:digital-twin-ready`
-version 1 message. Marketplace then sends
+version 1 message. It can also set `playbackControlPosition` to `top-left`,
+`top-right`, `bottom-left` or `bottom-right`; this app requests `bottom-right`.
+Marketplace then sends
 `decentralabs:fmi-playback-control` version 1 with `rate` expressed as model
 seconds per real second. The rate changes visual playback only, not FMU
 execution or its output values. This app uses that rate for its existing

@@ -276,6 +276,7 @@ function reportSceneStatus() {
       type: 'decentralabs:digital-twin-ready',
       version: 1,
       capabilities: ['playback-rate'],
+      playbackControlPosition: 'bottom-right',
     }, '*')
   }
 }
