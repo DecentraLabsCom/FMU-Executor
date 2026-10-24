@@ -1,5 +1,5 @@
 export const DIGITAL_TWIN_PROTOCOL_VERSION = 1
-export const DIGITAL_TWIN_APP_ASSET_FILENAME = 'digitalTwinAppProtocol.js'
+export const DIGITAL_TWIN_APP_ASSET_FILENAME = 'index.js'
 export const MAX_RUN_PARAMETERS = 256
 export const MAX_PARAMETER_NAME_LENGTH = 256
 export const MAX_PARAMETER_STRING_LENGTH = 1024
@@ -20,6 +20,7 @@ export const DIGITAL_TWIN_MESSAGE = Object.freeze({
   SAMPLE: 'decentralabs:fmi-sample',
   SAMPLES: 'decentralabs:fmi-samples',
   SAMPLES_ACK: 'decentralabs:fmi-samples-ack',
+  RESULTS_COMPLETE: 'decentralabs:fmi-results-complete',
   RESET: 'decentralabs:fmi-reset',
   SIMULATION_STATE: 'decentralabs:fmi-simulation-state',
   PLAYBACK_CONTROL: 'decentralabs:fmi-playback-control',
@@ -47,6 +48,7 @@ export const HOST_TO_APP_MESSAGE_TYPES = Object.freeze([
   DIGITAL_TWIN_MESSAGE.RUN_CANCELLED,
   DIGITAL_TWIN_MESSAGE.SAMPLE,
   DIGITAL_TWIN_MESSAGE.SAMPLES,
+  DIGITAL_TWIN_MESSAGE.RESULTS_COMPLETE,
   DIGITAL_TWIN_MESSAGE.RESET,
   DIGITAL_TWIN_MESSAGE.SIMULATION_STATE,
   DIGITAL_TWIN_MESSAGE.PLAYBACK_CONTROL,
@@ -275,6 +277,12 @@ export function isValidHostMessage(message) {
         && isValidOutputs(message.outputs)
     case DIGITAL_TWIN_MESSAGE.SAMPLES:
       return isValidSamplesBatch(message)
+    case DIGITAL_TWIN_MESSAGE.RESULTS_COMPLETE:
+      return hasOnlyKeys(message, ['type', 'version', 'runId', 'sampleCount', 'state'])
+        && ['completed', 'cancelled', 'error'].includes(message.state)
+        && (message.runId === undefined || isValidProtocolId(message.runId))
+        && Number.isSafeInteger(message.sampleCount)
+        && message.sampleCount >= 0
     case DIGITAL_TWIN_MESSAGE.RESET:
       return hasOnlyKeys(message, ['type', 'version', 'runId'])
         && (message.runId === undefined || message.runId === null || isValidProtocolId(message.runId))

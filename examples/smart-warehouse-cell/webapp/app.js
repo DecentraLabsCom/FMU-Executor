@@ -2,16 +2,7 @@ import * as THREE from './vendor/three.module.js'
 import { OrbitControls } from './vendor/OrbitControls.js'
 import { RoomEnvironment } from './vendor/RoomEnvironment.js'
 import { createSmartWarehouseScene } from './scene.js'
-import {
-  acknowledgeSampleBatch,
-  createProtocolId,
-  DIGITAL_TWIN_CAPABILITY,
-  DIGITAL_TWIN_MESSAGE,
-  DIGITAL_TWIN_PROTOCOL_VERSION,
-  isHostMessageEvent,
-  isValidSamplesBatch,
-  postToHost,
-} from './digitalTwinAppProtocol.js'
+import { createDigitalTwinAppClient } from './sdk/client.js'
 
 const host = document.querySelector('#scene')
 const canvasRoot = document.querySelector('.viewport')
@@ -52,9 +43,6 @@ let latest = { outputs: {}, time: null }
 const dash = '\u2014'
 let hostHandshakeReady = false
 let sceneReady = false
-let sceneErrorCode = null
-let activeRunId = null
-let pendingRequestId = null
 const playback = {
   samples: [],
   sampleIndex: -1,
@@ -157,7 +145,7 @@ function updateSimulationControls() {
         ? 'Simulation cancelled. You can review the samples already received or start again.'
       : lastSimulationState === 'error'
         ? 'The FMU run failed. Adjust the inputs and try again.'
-        : sceneReady ? 'Choose the inputs and run the FMU.' : 'Preparing the warehouse scene…'
+        : sceneReady ? '' : 'Preparing the warehouse scene…'
   setText('simulation-run-status', status)
 }
 
@@ -178,9 +166,7 @@ function requestSimulation() {
   updateSimulationControls()
   const settings = document.querySelector('.simulation-setup')
   if (settings) settings.open = false
-  pendingRequestId = createProtocolId('request')
-  postToHost(DIGITAL_TWIN_MESSAGE.RUN_REQUEST, {
-    requestId: pendingRequestId,
+  twinClient.run({
     parameters: {
       robotSpeed: Math.max(0, Math.min(1.4, speed)),
       orderQuantity: Math.max(1, Math.min(6, quantity)),
@@ -189,6 +175,9 @@ function requestSimulation() {
       rushOrder: Boolean(document.getElementById('rush-order')?.checked),
     },
     options: { stopTime: Math.max(5, Math.min(300, stopTime)) },
+  }).catch(() => {
+    lastSimulationState = 'error'
+    updateSimulationControls()
   })
 }
 
@@ -275,78 +264,51 @@ function advancePlayback(now) {
   }
 }
 
-function reportSceneStatus() {
-  if (!hostHandshakeReady || window.parent === window) return
-  if (sceneErrorCode) {
-    window.parent.postMessage({
-      type: DIGITAL_TWIN_MESSAGE.APP_ERROR,
-      version: DIGITAL_TWIN_PROTOCOL_VERSION,
-      code: sceneErrorCode,
-    }, '*')
-  } else if (sceneReady) {
-    window.parent.postMessage({
-      type: DIGITAL_TWIN_MESSAGE.APP_READY,
-      version: DIGITAL_TWIN_PROTOCOL_VERSION,
-      capabilities: [DIGITAL_TWIN_CAPABILITY.PLAYBACK_RATE, DIGITAL_TWIN_CAPABILITY.SAMPLE_ACKNOWLEDGEMENT],
-      playbackControlPosition: 'bottom-right',
-    }, '*')
-  }
+function handleSimulationState(state) {
+  playback.simulationRunning = state === 'running'
+  lastSimulationState = ['running', 'completed', 'cancelled', 'error'].includes(state) ? state : 'idle'
+  updateSimulationControls()
 }
 
-window.addEventListener('message', (event) => {
-  if (!isHostMessageEvent(event)) return
-  const data = event.data
-  if (data?.type === DIGITAL_TWIN_MESSAGE.HOST_READY) {
+const twinClient = createDigitalTwinAppClient({
+  onHostReady() {
     hostHandshakeReady = true
-    reportSceneStatus()
-    return
-  }
-  if (data.type === DIGITAL_TWIN_MESSAGE.RUN_ACCEPTED && data.requestId === pendingRequestId) {
-    activeRunId = data.runId
-    pendingRequestId = null
-    return
-  }
-  if (data.type === DIGITAL_TWIN_MESSAGE.RUN_REJECTED && data.requestId === pendingRequestId) {
-    pendingRequestId = null
-    lastSimulationState = 'error'
     updateSimulationControls()
-    return
-  }
-  if (data.type === DIGITAL_TWIN_MESSAGE.RESET) {
-    activeRunId = typeof data.runId === 'string' ? data.runId : null
+  },
+  onReset() {
     resetPlayback()
-    return
-  }
-  if (data.type === DIGITAL_TWIN_MESSAGE.SIMULATION_STATE) {
-    if (data.runId && activeRunId && data.runId !== activeRunId) return
-    playback.simulationRunning = data.state === 'running'
-    lastSimulationState = ['running', 'completed', 'cancelled', 'error'].includes(data.state) ? data.state : 'idle'
-    updateSimulationControls()
-    return
-  }
-  if (data.type === DIGITAL_TWIN_MESSAGE.PLAYBACK_CONTROL) {
-    const rate = Number(data.rate)
+  },
+  onSimulationState(state) {
+    if (state !== 'completed') handleSimulationState(state)
+  },
+  onResultsComplete({ state }) {
+    handleSimulationState(state)
+
+  },
+  onPlaybackRate(rate, message) {
     if (
-      data.rateUnit === 'model-seconds-per-real-second'
-      && Number.isFinite(rate)
-      && rate >= 0.01
-      && rate <= 100000
-    ) playback.rate = rate
-    return
-  }
-  if (data.type === DIGITAL_TWIN_MESSAGE.SAMPLES) {
-    if (!isValidSamplesBatch(data) || (data.runId && activeRunId && data.runId !== activeRunId)) return
-    appendSamples(data.samples)
-    acknowledgeSampleBatch(data)
-    return
-  }
-  if (data.type === DIGITAL_TWIN_MESSAGE.SAMPLE && data.outputs && typeof data.outputs === 'object' && !Array.isArray(data.outputs)) {
+      message.rateUnit === 'model-seconds-per-real-second'
+      && Number.isFinite(Number(rate))
+      && Number(rate) > 0
+      && Number(rate) >= 0.01
+      && Number(rate) <= 100000
+    ) playback.rate = Number(rate)
+  },
+  onSamples(samples) {
+    appendSamples(samples)
+  },
+  onSample(sample) {
+    if (!sample.outputs || typeof sample.outputs !== 'object' || Array.isArray(sample.outputs)) return
     const outputs = {}
-    for (const [name, value] of Object.entries(data.outputs)) {
+    for (const [name, value] of Object.entries(sample.outputs)) {
       if (typeof value === 'boolean' || (typeof value === 'number' && Number.isFinite(value))) outputs[name] = value
     }
-    applySample({ time: Number.isFinite(data.time) ? data.time : null, outputs })
-  }
+    applySample({ time: Number.isFinite(sample.time) ? sample.time : null, outputs })
+  },
+  onError(error) {
+    console.error('Digital twin app bridge error.', error)
+  },
+  playbackControlPosition: 'bottom-right',
 })
 
 playbackButton?.addEventListener('click', togglePlayback)
@@ -374,11 +336,10 @@ try {
   setText('connection', 'PROCEDURAL SCENE READY - WAITING FOR FMI')
   sceneReady = true
   updateSimulationControls()
-  reportSceneStatus()
+  twinClient.reportReady()
 } catch (error) {
-  sceneErrorCode = 'SCENE_INIT_FAILED'
   document.getElementById('load-error').hidden = false
-  reportSceneStatus()
+  twinClient.reportError('SCENE_INIT_FAILED')
   console.error('Could not build the procedural Smart Warehouse scene.', error)
 }
 

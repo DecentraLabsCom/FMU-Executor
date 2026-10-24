@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import posixpath
 import re
 import shutil
@@ -17,28 +16,6 @@ from archive_utils import write_reproducible_zip
 ROOT = Path(__file__).resolve().parent
 WEBAPP_ROOT = ROOT / "webapp"
 OUTPUT = ROOT / "SmartWarehouseCell.webapp.zip"
-REQUIRED_HOST_PROTOCOL_MESSAGES = (
-    "decentralabs:digital-twin-host-ready",
-    "decentralabs:digital-twin-ready",
-    "decentralabs:digital-twin-error",
-    "decentralabs:fmi-sample",
-    "decentralabs:fmi-reset",
-    "decentralabs:fmi-simulation-state",
-    "decentralabs:fmi-samples",
-    "decentralabs:fmi-run-request",
-    "decentralabs:fmi-run-accepted",
-    "decentralabs:fmi-run-rejected",
-    "decentralabs:fmi-run-cancel",
-    "decentralabs:fmi-run-cancelled",
-    "decentralabs:fmi-playback-control",
-    "decentralabs:fmi-samples-ack",
-    "playback-rate",
-    "sample-acknowledgement",
-    "MAX_SAMPLE_BATCH_JSON_CHARS",
-    "playbackControlPosition",
-    "bottom-right",
-    "isHostMessageEvent",
-)
 
 
 def find_protocol_source() -> Path:
@@ -99,12 +76,10 @@ def build(three_root: Path) -> None:
         shutil.copyfile(source, destination)
 
     protocol_source = find_protocol_source()
-    package_metadata = json.loads((protocol_source.parent / "package.json").read_text(encoding="utf-8"))
-    protocol_filename = package_metadata.get("browserBundleFile")
-    if not isinstance(protocol_filename, str) or Path(protocol_filename).name != protocol_filename or not protocol_filename.endswith(".js"):
-        raise ValueError("Marketplace protocol SDK has an invalid browser bundle filename")
-    protocol_target = WEBAPP_ROOT / protocol_filename
-    shutil.copyfile(protocol_source, protocol_target)
+    sdk_root = WEBAPP_ROOT / "sdk"
+    sdk_root.mkdir(exist_ok=True)
+    for filename in ("index.js", "client.js"):
+        shutil.copyfile(protocol_source.parent / filename, sdk_root / filename)
 
     # These examples import the package specifier `three`. Rewrite only that
     # import to the vendored module so the ZIP runs without an import map/CDN.
@@ -151,14 +126,6 @@ def build(three_root: Path) -> None:
         raise ValueError("The Three.js demo app must build its own scene without loading the companion GLB")
     if "createSmartWarehouseScene" not in app_script or "scene.js" not in bundle_files:
         raise ValueError("The Three.js demo app is missing its procedural warehouse scene module")
-    protocol_surface = app_script + protocol_target.read_text(encoding="utf-8")
-    missing_protocol_messages = [message for message in REQUIRED_HOST_PROTOCOL_MESSAGES if message not in protocol_surface]
-    if missing_protocol_messages:
-        raise ValueError(
-            "Three.js app is missing Marketplace host protocol messages: "
-            + ", ".join(missing_protocol_messages)
-        )
-
     write_reproducible_zip(WEBAPP_ROOT, OUTPUT)
     print(f"Built {OUTPUT} ({OUTPUT.stat().st_size:,} bytes)")
 

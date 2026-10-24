@@ -34,7 +34,7 @@ button { font: inherit; }
 .simulation-setup summary { display: grid; min-height: 29px; place-items: center; padding: 0 10px; border: 1px solid rgba(93,231,205,.4); border-radius: 6px; color: #b9fff0; background: rgba(14,62,58,.78); font-family: 'DM Mono', monospace; font-size: 7px; font-weight: 700; letter-spacing: .09em; cursor: pointer; list-style: none; }
 .simulation-setup summary::-webkit-details-marker { display: none; }
 .simulation-setup summary:hover, .simulation-setup summary:focus-visible, .simulation-setup[open] summary { border-color: #8bffe4; color: #fff; background: rgba(22,91,81,.92); outline: none; }
-.simulation-panel { position: absolute; z-index: 5; top: calc(100% + 10px); right: 0; display: grid; width: 284px; max-height: min(72vh, 520px); gap: 8px; overflow: auto; padding: 12px; border: 1px solid rgba(132,191,185,.27); border-radius: 10px; background: linear-gradient(145deg, rgba(9,27,33,.97), rgba(8,21,27,.96)); box-shadow: 0 18px 48px rgba(0,0,0,.42), inset 0 1px rgba(255,255,255,.035); backdrop-filter: blur(16px); }
+.simulation-panel { position: absolute; z-index: 5; top: calc(100% + 10px); right: 0; display: grid; width: 284px; max-height: min(72vh, 520px); gap: 6px; overflow: auto; padding: 10px; border: 1px solid rgba(132,191,185,.27); border-radius: 10px; background: linear-gradient(145deg, rgba(9,27,33,.97), rgba(8,21,27,.96)); box-shadow: 0 18px 48px rgba(0,0,0,.42), inset 0 1px rgba(255,255,255,.035); backdrop-filter: blur(16px); }
 .simulation-panel-heading { display: flex; justify-content: space-between; padding-bottom: 5px; border-bottom: 1px solid rgba(151,198,191,.13); color: #8ee4d1; font-family: 'DM Mono', monospace; font-size: 7px; font-weight: 700; letter-spacing: .15em; }
 .simulation-panel-heading span + span { color: #668a88; font-size: 6px; }
 .input-control, .input-toggle { display: flex; min-height: 47px; align-items: center; justify-content: space-between; gap: 9px; padding: 8px 9px; border: 1px solid rgba(151,198,191,.12); border-radius: 7px; background: rgba(13,34,39,.86); }
@@ -47,6 +47,7 @@ button { font: inherit; }
 .run-simulation:hover:not(:disabled), .run-simulation:focus-visible:not(:disabled) { filter: brightness(1.12); outline: 2px solid rgba(93,231,205,.36); }
 .run-simulation:disabled { cursor: not-allowed; opacity: .45; }
 .simulation-run-status { min-height: 12px; margin: 0; color: #7fa5a0; font-family: 'DM Mono', monospace; font-size: 7px; line-height: 1.5; }
+.simulation-run-status:empty { display: none; }
 .scene-title { position: absolute; z-index: 1; top: 26%; left: 28px; max-width: 225px; pointer-events: none; transform: translateY(-24px); }
 .eyebrow { color: #7bd8c5; font-family: 'DM Mono', monospace; font-size: 7px; letter-spacing: .18em; }
 .eyebrow b { padding: 0 5px; color: #4b8d87; font-weight: 400; }

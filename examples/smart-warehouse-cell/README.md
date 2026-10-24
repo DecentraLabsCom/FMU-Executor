@@ -120,9 +120,10 @@ Build the browser app bundle from the installed Marketplace Three.js package:
 python build_webapp.py --three-root ../../../Marketplace/node_modules/three
 ```
 
-The builder copies `digitalTwinAppProtocol.js` from the canonical Marketplace
-SDK package and checks that the app's local module and asset references are
-present in the generated ZIP.
+The builder copies the low-level protocol (`sdk/index.js`) and optional client
+(`sdk/client.js`) from the canonical Marketplace SDK package and checks that
+the app's local module and asset references are present in the generated ZIP.
+The browser contract also accepts apps that implement its messages directly.
 
 Both FMU builds embed the default Three.js-exported GLB in `resources/` and ship
 a same-stem companion `.glb` for Gateway/Station asset import. The optional
