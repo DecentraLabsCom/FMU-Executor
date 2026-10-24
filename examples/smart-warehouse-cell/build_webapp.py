@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import posixpath
 import re
 import shutil
@@ -42,10 +43,10 @@ REQUIRED_HOST_PROTOCOL_MESSAGES = (
 
 def find_protocol_source() -> Path:
     for parent in (ROOT, *ROOT.parents):
-        candidate = parent / "Marketplace" / "src" / "components" / "simulation" / "digitalTwinAppProtocol.js"
+        candidate = parent / "Marketplace" / "packages" / "digital-twin-app-protocol" / "index.js"
         if candidate.is_file():
             return candidate
-    raise FileNotFoundError("Marketplace digital-twin protocol source was not found")
+    raise FileNotFoundError("Marketplace digital-twin protocol SDK source was not found")
 
 
 def build(three_root: Path) -> None:
@@ -98,7 +99,11 @@ def build(three_root: Path) -> None:
         shutil.copyfile(source, destination)
 
     protocol_source = find_protocol_source()
-    protocol_target = WEBAPP_ROOT / "digitalTwinAppProtocol.js"
+    package_metadata = json.loads((protocol_source.parent / "package.json").read_text(encoding="utf-8"))
+    protocol_filename = package_metadata.get("browserBundleFile")
+    if not isinstance(protocol_filename, str) or Path(protocol_filename).name != protocol_filename or not protocol_filename.endswith(".js"):
+        raise ValueError("Marketplace protocol SDK has an invalid browser bundle filename")
+    protocol_target = WEBAPP_ROOT / protocol_filename
     shutil.copyfile(protocol_source, protocol_target)
 
     # These examples import the package specifier `three`. Rewrite only that

@@ -1,4 +1,5 @@
 export const DIGITAL_TWIN_PROTOCOL_VERSION = 1
+export const DIGITAL_TWIN_APP_ASSET_FILENAME = 'digitalTwinAppProtocol.js'
 export const MAX_RUN_PARAMETERS = 256
 export const MAX_PARAMETER_NAME_LENGTH = 256
 export const MAX_PARAMETER_STRING_LENGTH = 1024
@@ -29,6 +30,27 @@ export const DIGITAL_TWIN_CAPABILITY = Object.freeze({
   PLAYBACK_RATE: 'playback-rate',
   SAMPLE_ACKNOWLEDGEMENT: 'sample-acknowledgement',
 })
+
+export const APP_TO_HOST_MESSAGE_TYPES = Object.freeze([
+  DIGITAL_TWIN_MESSAGE.APP_READY,
+  DIGITAL_TWIN_MESSAGE.APP_ERROR,
+  DIGITAL_TWIN_MESSAGE.RUN_REQUEST,
+  DIGITAL_TWIN_MESSAGE.RUN_CANCEL,
+  DIGITAL_TWIN_MESSAGE.SAMPLES_ACK,
+  DIGITAL_TWIN_MESSAGE.MODEL_CHANGE,
+])
+
+export const HOST_TO_APP_MESSAGE_TYPES = Object.freeze([
+  DIGITAL_TWIN_MESSAGE.HOST_READY,
+  DIGITAL_TWIN_MESSAGE.RUN_ACCEPTED,
+  DIGITAL_TWIN_MESSAGE.RUN_REJECTED,
+  DIGITAL_TWIN_MESSAGE.RUN_CANCELLED,
+  DIGITAL_TWIN_MESSAGE.SAMPLE,
+  DIGITAL_TWIN_MESSAGE.SAMPLES,
+  DIGITAL_TWIN_MESSAGE.RESET,
+  DIGITAL_TWIN_MESSAGE.SIMULATION_STATE,
+  DIGITAL_TWIN_MESSAGE.PLAYBACK_CONTROL,
+])
 
 const RUN_OPTIONS = new Set(['startTime', 'stopTime', 'stepSize'])
 
@@ -149,6 +171,26 @@ export function isValidModelChangeRequest(message) {
     && typeof message.modelId === 'string'
     && message.modelId.length > 0
     && message.modelId.length <= 128
+}
+
+export function isValidAppMessage(message) {
+  if (!isProtocolEnvelope(message)) return false
+  switch (message.type) {
+    case DIGITAL_TWIN_MESSAGE.APP_READY:
+      return isValidAppReadyMessage(message)
+    case DIGITAL_TWIN_MESSAGE.APP_ERROR:
+      return isValidAppErrorMessage(message)
+    case DIGITAL_TWIN_MESSAGE.RUN_REQUEST:
+      return isValidRunRequest(message)
+    case DIGITAL_TWIN_MESSAGE.RUN_CANCEL:
+      return isValidRunCancellation(message)
+    case DIGITAL_TWIN_MESSAGE.SAMPLES_ACK:
+      return isValidSamplesAcknowledgement(message)
+    case DIGITAL_TWIN_MESSAGE.MODEL_CHANGE:
+      return isValidModelChangeRequest(message)
+    default:
+      return false
+  }
 }
 
 export function isValidSample(sample) {
