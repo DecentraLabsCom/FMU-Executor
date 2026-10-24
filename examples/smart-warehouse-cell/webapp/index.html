@@ -28,11 +28,11 @@
         </div>
         <details class="simulation-setup">
           <summary>RUN CONTROLS</summary>
-          <form class="simulation-panel" id="simulation-form">
+          <div class="simulation-panel" id="simulation-form" role="group" aria-label="Run controls">
             <div class="simulation-panel-heading"><span>MODEL INPUTS</span><span>FMU</span></div>
             <label class="input-control" for="simulation-duration">
-              <span><strong>Simulation duration</strong><small><output id="duration-value">220</output> seconds</small></span>
-              <input id="simulation-duration" name="stopTime" type="range" min="5" max="300" step="5" value="220">
+              <span><strong>Simulation duration</strong><small><output id="duration-value">250</output> seconds</small></span>
+              <input id="simulation-duration" name="stopTime" type="range" min="5" max="300" step="5" value="250">
             </label>
             <label class="input-control" for="robot-speed">
               <span><strong>AGV travel speed</strong><small>Robot speed (m/s)</small></span>
@@ -58,9 +58,9 @@
               <span><strong>Start operations</strong><small>Allow the warehouse to process the order</small></span>
               <input id="start-stop" name="startStop" type="checkbox" checked>
             </label>
-            <button class="run-simulation" id="run-simulation" type="submit" disabled>RUN SIMULATION</button>
+            <button class="run-simulation" id="run-simulation" type="button" disabled>RUN SIMULATION</button>
             <p class="simulation-run-status" id="simulation-run-status" role="status">Connect to the FMU to begin.</p>
-          </form>
+          </div>
         </details>
         <div class="view-actions" aria-label="Scene controls">
           <button type="button" data-view="reset" title="Reset camera">RESET</button>

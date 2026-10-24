@@ -148,9 +148,9 @@ loopback; it does not upload the scene or contact an external asset server.
    the entire process and raises the safety alarm.
 5. Choose a simulation duration from 5 to 300 seconds in the Three.js app and
    run the FMU. The app sends that duration through the standard
-   `options.stopTime` field; shorter runs stop part-way through the cycle. Run
-   for about 200 seconds to see the full default six-package order at the
-   default speed. The GLB option
+   `options.stopTime` field; shorter runs stop part-way through the cycle. The
+   default 250-second run completes the six-package order at the default speed
+   (the model finishes loading at about 245 seconds). The GLB option
    presents the authored asset through Marketplace's generic viewer; the
    Three.js option presents its separate native scene from the same FMI stream.
 

@@ -54,7 +54,6 @@ const playback = {
   rate: 1,
 }
 const playbackButton = document.getElementById('playback-toggle')
-const simulationForm = document.getElementById('simulation-form')
 const simulationRunButton = document.getElementById('run-simulation')
 let lastSimulationState = 'idle'
 
@@ -150,11 +149,10 @@ function updateSimulationControls() {
 
 function updateDurationLabel() {
   const duration = Number(document.getElementById('simulation-duration')?.value)
-  setText('duration-value', Number.isFinite(duration) ? String(duration) : '220')
+  setText('duration-value', Number.isFinite(duration) ? String(duration) : '250')
 }
 
-function requestSimulation(event) {
-  event?.preventDefault()
+function requestSimulation() {
   if (!hostHandshakeReady || !sceneReady || lastSimulationState === 'running') return
 
   const speed = Number(document.getElementById('robot-speed')?.value)
@@ -324,7 +322,7 @@ window.addEventListener('message', (event) => {
 })
 
 playbackButton?.addEventListener('click', togglePlayback)
-simulationForm?.addEventListener('submit', requestSimulation)
+simulationRunButton?.addEventListener('click', requestSimulation)
 document.getElementById('simulation-duration')?.addEventListener('input', updateDurationLabel)
 updateDurationLabel()
 updatePlaybackButton()

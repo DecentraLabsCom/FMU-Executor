@@ -7,6 +7,7 @@ import argparse
 import posixpath
 import re
 import shutil
+import xml.etree.ElementTree as ET
 from pathlib import Path, PurePosixPath
 
 from archive_utils import write_reproducible_zip
@@ -33,6 +34,36 @@ REQUIRED_HOST_PROTOCOL_MESSAGES = (
 
 def build(three_root: Path) -> None:
     three_root = three_root.resolve(strict=True)
+    index = (WEBAPP_ROOT / "index.html").read_text(encoding="utf-8")
+    required_interface_markers = (
+        'role="group" aria-label="Run controls"',
+        'id="duration-value">250</output>',
+        'id="simulation-duration" name="stopTime" type="range" min="5" max="300" step="5" value="250"',
+        'id="run-simulation" type="button" disabled',
+    )
+    missing_interface = [marker for marker in required_interface_markers if marker not in index]
+    if missing_interface:
+        raise ValueError("Smart Warehouse app is missing its run-controls contract: " + ", ".join(missing_interface))
+    if re.search(r"<form\b", index, re.IGNORECASE):
+        raise ValueError("The sandboxed Smart Warehouse app must use explicit controls instead of form submission")
+
+    default_experiment = ET.parse(ROOT / "modelDescription.xml").getroot().find("{*}DefaultExperiment")
+    try:
+        default_stop_time = float(default_experiment.attrib["stopTime"]) if default_experiment is not None else None
+    except (KeyError, ValueError):
+        default_stop_time = None
+    if default_stop_time != 250:
+        raise ValueError("The default FMU stop time must allow the six-package order to finish at 250 seconds")
+
+    app_script_path = WEBAPP_ROOT / "app.js"
+    if not app_script_path.is_file():
+        raise FileNotFoundError("Three.js app is missing its root app.js entry point")
+    app_script = app_script_path.read_text(encoding="utf-8")
+    if "simulationRunButton?.addEventListener('click', requestSimulation)" not in app_script:
+        raise ValueError("The sandboxed Smart Warehouse app must start simulations from a button click")
+    if "simulationForm?.addEventListener('submit', requestSimulation)" in app_script:
+        raise ValueError("The sandboxed Smart Warehouse app must not depend on form submission")
+
     vendor = WEBAPP_ROOT / "vendor"
     if vendor.exists():
         shutil.rmtree(vendor)
@@ -81,7 +112,6 @@ def build(three_root: Path) -> None:
             if target.startswith("../") or target not in bundle_files:
                 raise FileNotFoundError(f"Three.js app module import is missing from the bundle: {relative_path}: {specifier}")
 
-    index = (WEBAPP_ROOT / "index.html").read_text(encoding="utf-8")
     for match in re.finditer(r"(?:src|href)\s*=\s*['\"]([^'\"]+)['\"]", index, re.IGNORECASE):
         specifier = match.group(1)
         if specifier.startswith(("data:", "#")):
@@ -92,10 +122,6 @@ def build(three_root: Path) -> None:
         if target.startswith("../") or target not in bundle_files:
             raise FileNotFoundError(f"Three.js app index asset is missing from the bundle: {specifier}")
 
-    app_script_path = WEBAPP_ROOT / "app.js"
-    if not app_script_path.is_file():
-        raise FileNotFoundError("Three.js app is missing its root app.js entry point")
-    app_script = app_script_path.read_text(encoding="utf-8")
     if "GLTFLoader" in app_script or "warehouse.glb" in app_script:
         raise ValueError("The Three.js demo app must build its own scene without loading the companion GLB")
     if "createSmartWarehouseScene" not in app_script or "scene.js" not in bundle_files:

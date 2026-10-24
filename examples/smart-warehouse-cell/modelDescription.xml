@@ -22,7 +22,7 @@
     <Unit name="m_per_s"><BaseUnit m="1" s="-1" /></Unit>
     <Unit name="percent"><BaseUnit /></Unit>
   </UnitDefinitions>
-  <DefaultExperiment startTime="0" stopTime="220" stepSize="0.05" tolerance="1e-6" />
+  <DefaultExperiment startTime="0" stopTime="250" stepSize="0.05" tolerance="1e-6" />
   <ModelVariables>
     <ScalarVariable name="robotSpeed" valueReference="0" description="AGV travel speed for outbound and return trips." causality="input" variability="continuous" initial="exact"><Real start="0.68" min="0" max="1.4" unit="m_per_s" /></ScalarVariable>
     <ScalarVariable name="startStop" valueReference="1" description="Start or pause warehouse operations." causality="input" variability="discrete" initial="exact"><Boolean start="true" /></ScalarVariable>
