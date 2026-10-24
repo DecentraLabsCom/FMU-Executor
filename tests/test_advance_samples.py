@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -13,8 +14,10 @@ def session_with_outputs(outputs):
     session._stop_time = 10
     session._step_size = 0.1
     session._read_outputs = lambda refs=None: outputs
-    def step(_slave, size):
-        return session._time + size, {"terminateSimulation": False, "eventOccurred": False}
+
+    def step(slave: Any, step_size: float) -> tuple[float, dict[str, Any]]:
+        return session._time + step_size, {"terminateSimulation": False, "eventOccurred": False}
+
     session._do_step = step
     return session
 

@@ -4,10 +4,11 @@ from pathlib import Path
 import json
 import struct
 import sys
+import zipfile
 
 import numpy as np
 import pytest
-from fmpy import simulate_fmu
+from fmpy import read_model_description, simulate_fmu
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -17,6 +18,7 @@ FMU_PATH = EXAMPLE_ROOT / (
 )
 SCENE_PATH = EXAMPLE_ROOT / "smart-warehouse-cell.glb"
 STEP_SIZE = 0.05
+AGV_ROUTE_LENGTH = 9.65
 OUTPUTS = [
     "agvPosition",
     "robotAngle",
@@ -35,10 +37,11 @@ OUTPUTS = [
     "transferPackageY",
     "transferPackageZ",
     "loaderAngle",
+    "loaderReach",
 ]
 
 
-def simulate(*, order_quantity=6, speed=0.68, rush_order=False, jam=False, stop_time=180):
+def simulate(*, order_quantity=6, speed=0.68, rush_order=False, jam=False, stop_time=250):
     inputs = np.array(
         [
             (0.0, speed, True, jam, rush_order, order_quantity),
@@ -58,6 +61,8 @@ def simulate(*, order_quantity=6, speed=0.68, rush_order=False, jam=False, stop_
         start_time=0,
         stop_time=stop_time,
         step_size=STEP_SIZE,
+        # FMPy uses output_interval as the Co-Simulation communication step.
+        output_interval=STEP_SIZE,
         input=inputs,
         output=OUTPUTS,
     )
@@ -67,37 +72,49 @@ def simulate(*, order_quantity=6, speed=0.68, rush_order=False, jam=False, stop_
 def test_default_order_loads_six_packages_then_stops_at_the_truck():
     result = simulate()
 
+    np.testing.assert_allclose(np.diff(result["time"]), STEP_SIZE, atol=1e-10)
     assert int(result["truckLoadCount"][-1]) == 6
     assert int(result["ordersPicked"][-1]) == 1
     assert bool(result["orderComplete"][-1])
     assert result["inventoryLevel"][-1] == pytest.approx(76)
-    assert result["agvPosition"][-1] == pytest.approx(8.4)
+    assert result["agvPosition"][-1] == pytest.approx(AGV_ROUTE_LENGTH)
     assert int(result["truckLoadCount"].max()) == 6
+    assert np.allclose(result["agvPosition"][result["orderComplete"]], AGV_ROUTE_LENGTH)
 
 
 @pytest.mark.skipif(not FMU_PATH.is_file(), reason="Built Smart Warehouse FMU is unavailable")
-def test_requested_order_quantity_completes_without_overfilling_the_truck():
-    result = simulate(order_quantity=3)
+@pytest.mark.parametrize("order_quantity", [1, 3])
+def test_requested_order_quantity_completes_without_overfilling_the_truck(order_quantity):
+    result = simulate(order_quantity=order_quantity)
 
-    assert int(result["truckLoadCount"][-1]) == 3
+    assert int(result["truckLoadCount"][-1]) == order_quantity
     assert int(result["ordersPicked"][-1]) == 1
     assert bool(result["orderComplete"][-1])
-    assert int(result["truckLoadCount"].max()) == 3
-    assert result["agvPosition"][-1] == pytest.approx(8.4)
+    assert int(result["truckLoadCount"].max()) == order_quantity
+    assert result["inventoryLevel"][-1] == pytest.approx(100 - 4 * order_quantity)
+    assert result["agvPosition"][-1] == pytest.approx(AGV_ROUTE_LENGTH)
 
 
 @pytest.mark.skipif(not FMU_PATH.is_file(), reason="Built Smart Warehouse FMU is unavailable")
 def test_packages_are_picked_transferred_and_agv_returns_for_the_next_pick():
-    result = simulate(order_quantity=3, stop_time=55)
+    # The second parcel uses a side slot, exercising loader rotation as well
+    # as extension; the first parcel goes into the center slot without turning.
+    result = simulate(order_quantity=3, stop_time=90)
 
     assert np.any(result["pickupPackageVisible"])
     assert np.any((result["pickupProgress"] > 0.2) & (result["pickupProgress"] < 0.9))
     assert np.any(result["transferPackageVisible"])
     assert np.max(result["transferPackageZ"][result["transferPackageVisible"]]) > 5.2
     assert np.min(result["loaderAngle"]) < -0.2 or np.max(result["loaderAngle"]) > 0.2
-    assert result["agvPosition"].max() == pytest.approx(8.4)
-    assert np.any(result["agvPosition"] < 8.3)
-    assert int(result["truckLoadCount"][-1]) >= 1
+    assert result["loaderReach"].max() > 2.0
+    assert result["agvPosition"].max() == pytest.approx(AGV_ROUTE_LENGTH)
+    deliveries = np.flatnonzero(np.diff(result["truckLoadCount"]) > 0) + 1
+    assert len(deliveries) == 2
+    between_deliveries = result["agvPosition"][deliveries[0]:deliveries[1]]
+    assert np.any(np.diff(between_deliveries) < 0)
+    assert between_deliveries.min() == pytest.approx(0)
+    assert np.any(np.diff(between_deliveries) > 0)
+    assert int(result["truckLoadCount"][-1]) == 2
     assert int(result["ordersPicked"][-1]) == 0
 
 
@@ -113,16 +130,16 @@ def test_jam_freezes_the_cycle_and_raises_the_alarm():
 
 @pytest.mark.skipif(not FMU_PATH.is_file(), reason="Built Smart Warehouse FMU is unavailable")
 def test_rush_order_speeds_up_only_the_next_outbound_delivery():
-    normal = simulate(order_quantity=2, speed=0.68, stop_time=60)
-    rush = simulate(order_quantity=2, speed=0.68, rush_order=True, stop_time=60)
+    normal = simulate(order_quantity=2, speed=0.68, stop_time=100)
+    rush = simulate(order_quantity=2, speed=0.68, rush_order=True, stop_time=100)
 
     normal_deliveries = normal["time"][np.diff(np.r_[0, normal["truckLoadCount"]]) > 0]
     rush_deliveries = rush["time"][np.diff(np.r_[0, rush["truckLoadCount"]]) > 0]
-    assert len(normal_deliveries) >= 2
-    assert len(rush_deliveries) >= 2
+    assert len(normal_deliveries) == 2
+    assert len(rush_deliveries) == 2
     assert rush_deliveries[0] < normal_deliveries[0] - 2.0
     assert rush_deliveries[1] - rush_deliveries[0] == pytest.approx(
-        normal_deliveries[1] - normal_deliveries[0], abs=0.15
+        normal_deliveries[1] - normal_deliveries[0], abs=2 * STEP_SIZE
     )
 
 
@@ -134,23 +151,59 @@ def test_scene_binds_pickup_conveyor_loader_and_six_truck_slots():
     assert magic == b"glTF" and version == 2 and total_length == len(content)
     assert chunk_type == 0x4E4F534A
     document = json.loads(content[20 : 20 + chunk_length].decode("utf-8").rstrip(" \t\r\n\0"))
-    nodes = {node["name"]: node for node in document["nodes"] if "name" in node}
+    bindings = [
+        binding
+        for node in document["nodes"]
+        for binding in node.get("extras", {}).get("fmiBindings", [])
+    ]
+    # Procedural GLB nodes can be unnamed. The FMI bindings are the viewer's
+    # public contract, independent of internal object names and hierarchy.
+    required_bindings = {
+        ("agvPosition", "position.x"),
+        ("forkHeight", "position.y"),
+        ("pickupArmX", "position.x"),
+        ("pickupArmY", "position.y"),
+        ("pickupArmZ", "position.z"),
+        ("pickupDropProgress", "position.y"),
+        ("pickupArmReachProgress", "scale.z"),
+        ("pickupGripperGap", "position.x"),
+        ("pickupPackageVisible", "visible"),
+        ("packageOnAgv", "visible"),
+        ("trayPackageX", "position.x"),
+        ("trayBeltPhase", "rotation.y"),
+        ("beltPhase", "rotation.y"),
+        ("transferPackageVisible", "visible"),
+        ("transferPackageX", "position.x"),
+        ("transferPackageY", "position.y"),
+        ("transferPackageZ", "position.z"),
+        ("loaderAngle", "rotation.y"),
+        ("loaderReach", "scale.z"),
+        ("alarm", "material.color"),
+    }
+    required_bindings.update((f"shelfPackage{index}Visible", "visible") for index in range(1, 7))
+    assert required_bindings <= {(b["variable"], b["target"]) for b in bindings}
 
-    assert "OutboundTransferConveyor" in nodes
-    assert "TruckLoaderArm" in nodes
-    assert "OutboundDeliveryTruck_trailer_rear" not in nodes
-    assert any(b["variable"] == "pickupProgress" for b in nodes["PickArmEndEffector"]["extras"]["fmiBindings"])
-    assert any(b["variable"] == "transferPackageZ" for b in nodes["TruckTransferPackage"]["extras"]["fmiBindings"])
-    assert any(b["variable"] == "loaderAngle" for b in nodes["TruckLoaderArm"]["extras"]["fmiBindings"])
-    assert any(b["variable"] == "shelfPackage2Visible" for b in nodes["ShelfPackage_2"]["extras"]["fmiBindings"])
-
-    truck = nodes["OutboundDeliveryTruck"]
-    cargo_nodes = [document["nodes"][index] for index in truck["children"] if document["nodes"][index]["name"].startswith("TruckCargo_")]
-    assert len(cargo_nodes) == 6
+    cargo_bindings = [b for b in bindings if b["variable"] == "truckLoadCount" and b["target"] == "visible"]
+    assert len(cargo_bindings) == 6
     thresholds = {
         binding["visibleWhenGreaterThanOrEqual"]
-        for node in cargo_nodes
-        for binding in node["extras"]["fmiBindings"]
-        if binding["variable"] == "truckLoadCount"
+        for binding in cargo_bindings
     }
     assert thresholds == {1, 2, 3, 4, 5, 6}
+
+
+@pytest.mark.skipif(not FMU_PATH.is_file() or not SCENE_PATH.is_file(), reason="Built Smart Warehouse assets are unavailable")
+def test_fmu_embeds_the_companion_scene_and_declares_all_bound_outputs():
+    with zipfile.ZipFile(FMU_PATH) as archive:
+        assert archive.read("resources/smart-warehouse-cell.glb") == SCENE_PATH.read_bytes()
+    content = SCENE_PATH.read_bytes()
+    chunk_length = struct.unpack_from("<I", content, 12)[0]
+    document = json.loads(content[20:20 + chunk_length])
+    bound_outputs = {
+        binding["variable"]
+        for node in document["nodes"]
+        for binding in node.get("extras", {}).get("fmiBindings", [])
+    }
+    description = read_model_description(str(FMU_PATH))
+    declared_outputs = {variable.name for variable in description.modelVariables if variable.causality == "output"}
+    assert bound_outputs <= declared_outputs

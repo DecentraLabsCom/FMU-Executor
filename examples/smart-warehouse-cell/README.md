@@ -22,8 +22,9 @@ The example ships with these companion artifacts:
   alarm lamp, and is embedded in the distributed FMUs.
 - `SmartWarehouseCell.webapp.zip`: optional static Three.js application with
   its own procedural warehouse scene. It bundles its viewer modules and does
-  not include or load the companion GLB. Marketplace sends it the same live FMI
-  samples as the GLB viewer; it needs no separate asset server or CDN.
+  not include or load the companion GLB. Marketplace grants it a reservation-
+  scoped Gateway session, and the app receives FMI samples directly over WS.
+  It needs no separate asset server or CDN.
 
 The scene includes high-bay racks, roof structure, loading docks, a centered
 animated roller conveyor and an outbound truck with an open loading door. The
@@ -70,35 +71,25 @@ that full presentation. Both visualizations receive the same FMU outputs, but
 GLB bindings are declared in the model asset while the Three.js app maps those
 outputs directly to its own scene.
 
-The FMU describes its own inputs and outputs in `modelDescription.xml`. The
-visual bindings live with the scene nodes in the GLB. A static Three.js app
-receives initial FMI values from Marketplace through the public
-`decentralabs:fmi-sample` version 1 `postMessage` event, then receives newly
-streamed timeline samples through `decentralabs:fmi-samples`. The host also
-sends `decentralabs:fmi-reset` when a new run replaces the timeline and
-`decentralabs:fmi-simulation-state` to indicate whether samples are still
-arriving. A complete app can request a run by sending
-`decentralabs:fmi-run-request` version 1 with a `parameters` object whose keys
-are FMU input names. Marketplace validates each name against the FMU metadata,
-then runs the model and streams its samples back to the app. The duration
-control sends `options.stopTime` (5-300 s) with that request; the Marketplace
-host supplies the model's remaining FMI options. Apps own their input controls
-and presentation; Marketplace does not wrap a Three.js app in the standard FMU
-controls. An app that supports Marketplace playback-rate control advertises
-`capabilities: ["playback-rate"]` in its `decentralabs:digital-twin-ready`
-version 1 message. It can also set `playbackControlPosition` to `top-left`,
-`top-right`, `bottom-left` or `bottom-right`; this app requests `bottom-right`.
-Marketplace then sends
-`decentralabs:fmi-playback-control` version 1 with `rate` expressed as model
-seconds per real second. The rate changes visual playback only, not FMU
-execution or its output values. This app uses that rate for its existing
-play/pause replay control. Apps that do not advertise the capability keep
-their own playback behavior. The app never receives an FMU, access key or
-reservation credential. It reports `decentralabs:digital-twin-error` version 1
-if scene construction fails.
-Marketplace sends `decentralabs:digital-twin-host-ready` version 1 after the
-iframe document loads; the app retains its startup result until that handshake
-arrives.
+The FMU declares its inputs and outputs in `modelDescription.xml`; GLB visual
+bindings live in the scene nodes. The Three.js app implements Marketplace host
+integration version 2 to announce readiness and request a one-use connection
+grant for the active reservation. It opens the provider Gateway's FMU session
+WebSocket, initializes the model, and reads bounded `sim.advance` batches
+directly from the session. The app owns its FMU controls and presentation, so
+it can build its HMI around the warehouse scene without generated simulation
+controls being placed over it.
+
+The app's duration control supplies `options.stopTime` (5-300 s). Its input
+controls send declared FMU values during initialization. Marketplace can add
+the optional input schedule editor and the Speed menu; the latter advertises
+`playback-rate` and uses `playbackControlPosition: "bottom-right"`. Playback
+rate changes visual replay speed only. The app reports execution state so the
+host can offer cancellation and Fit to run duration. It receives no FMU binary,
+access key, Gateway credential or Station secret. On startup, the app announces
+itself to Marketplace and receives host readiness before reporting its scene
+ready. The SDK client and low-level FMU WebSocket client are optional; this
+bundle includes both to simplify the connection and playback integration.
 
 ## Build
 
