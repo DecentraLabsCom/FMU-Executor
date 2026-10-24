@@ -15,6 +15,13 @@ from app import process_runner
 from tests.fmu_fixture import write_test_fmu
 
 
+def test_realtime_model_description_is_cached_for_the_immutable_session():
+    session = process_runner.RealtimeSession.__new__(process_runner.RealtimeSession)
+    session._rpc = Mock(return_value={"modelName": "snapshot", "modelVariables": []})
+    assert session.load() == session.load()
+    session._rpc.assert_called_once_with("load")
+
+
 class FakeQueue:
     def __init__(self, *items):
         self.items = list(items)
@@ -71,7 +78,7 @@ def install_run_fakes(monkeypatch, messages, tmp_path, *, alive=False):
     worker_directory = tmp_path / "worker"
     worker_directory.mkdir()
     monkeypatch.setattr(process_runner.mp, "get_context", lambda method: SimpleNamespace(Queue=lambda **kwargs: output))
-    monkeypatch.setattr(process_runner, "_new_process", lambda *args, **kwargs: (process, None, None, worker_directory))
+    monkeypatch.setattr(process_runner, "_new_process", lambda *args, **kwargs: (process, None, None, worker_directory, None))
     monkeypatch.setattr(process_runner.config, "execution_timeout_seconds", lambda: 20)
     return output, process
 
@@ -80,7 +87,7 @@ def install_stream_fakes(monkeypatch, tmp_path, output, process):
     worker_directory = tmp_path / "worker"
     worker_directory.mkdir()
     monkeypatch.setattr(process_runner.mp, "get_context", lambda _method: SimpleNamespace(Queue=lambda **_kwargs: output))
-    monkeypatch.setattr(process_runner, "_new_process", lambda *args, **kwargs: (process, None, None, worker_directory))
+    monkeypatch.setattr(process_runner, "_new_process", lambda *args, **kwargs: (process, None, None, worker_directory, None))
     monkeypatch.setattr(process_runner.config, "execution_timeout_seconds", lambda: 20)
     return worker_directory
 
@@ -333,7 +340,7 @@ def test_execute_worker_streams_snapshots_and_completion(monkeypatch, tmp_path):
 
         def load(self): pass
         def initialize(self, **_kwargs): pass
-        def run_until_streaming(self, _stop, step_size=None): return iter([{"type": "sim.outputs", "time": 0.5, "outputs": {}}])
+        def run_until_streaming(self, _stop, step_size=None, input_schedule=None): return iter([{"type": "sim.outputs", "time": 0.5, "outputs": {}}])
         def terminate(self): self.terminated = True
 
     monkeypatch.setitem(sys.modules, "app.engine", SimpleNamespace(FmuSession=Session))
@@ -394,7 +401,7 @@ def test_new_process_uses_spawn_and_starts_named_worker(monkeypatch, tmp_path):
     write_test_fmu(tmp_path / "model.fmu")
     output = FakeQueue()
 
-    process, returned_context, job, worker_directory = process_runner._new_process(
+    process, returned_context, job, worker_directory, _start_gate = process_runner._new_process(
         tmp_path / "model.fmu", "model.fmu", {}, {}, output, True,
     )
 

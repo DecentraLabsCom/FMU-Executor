@@ -121,7 +121,8 @@ python build_webapp.py --three-root ../../../Marketplace/node_modules/three
 ```
 
 The builder copies the low-level protocol (`sdk/index.js`) and optional client
-(`sdk/client.js`) from the canonical Marketplace SDK package and checks that
+(`sdk/client.js`) and direct FMU transport (`sdk/fmu-client.js`) from the
+canonical Marketplace SDK package and checks that
 the app's local module and asset references are present in the generated ZIP.
 The browser contract also accepts apps that implement its messages directly.
 
@@ -163,3 +164,9 @@ loopback; it does not upload the scene or contact an external asset server.
 
 The model, Three.js scene and app code are provided under the MIT license in
 `LICENSE.txt`. The app bundle also includes the upstream Three.js license.
+
+The app uses host integration v2 to obtain a one-use connection grant, then
+executes directly over the provider Gateway WebSocket with the same session
+authorization as proxy.fmu. Marketplace does not relay model samples. The app
+bundle can also run independently when its SDK client is configured with a
+`getConnection` callback supplied by the hosting service.

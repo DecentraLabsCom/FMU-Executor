@@ -1,307 +1,227 @@
 import {
-  acknowledgeSampleBatch,
-  createProtocolId,
-  DIGITAL_TWIN_CAPABILITY,
-  DIGITAL_TWIN_MESSAGE,
-  isHostMessageEvent,
-  isRecord,
-  isValidAppMessage,
-  isValidAppReadyMessage,
-  isValidProtocolId,
-  makeProtocolMessage,
-  postToHost,
+  createProtocolId, DIGITAL_TWIN_CAPABILITY, DIGITAL_TWIN_MESSAGE as MESSAGE,
+  isHostMessageEvent, isValidOptions, isValidParameters, isValidInputSchedule,
+  isValidSample, postToHost, MAX_SAMPLES_PER_BATCH,
 } from './index.js'
+import { connectFmuSession } from './fmu-client.js'
 
-function createClientError(message, code) {
-  const error = new Error(message)
-  if (code) error.code = code
-  return error
-}
+const errorWithCode = (message, code) => Object.assign(new Error(message), { code })
+const wait = (ms, signal) => new Promise((resolve, reject) => {
+  const aborted = () => { clearTimeout(timer); reject(signal.reason) }
+  const timer = setTimeout(() => { signal.removeEventListener('abort', aborted); resolve() }, ms)
+  signal.addEventListener('abort', aborted, { once: true })
+  if (signal.aborted) aborted()
+})
 
+/** Optional host UI integration composed with the independent direct FMU client. */
 export function createDigitalTwinAppClient({
-  onHostReady,
-  onSample,
-  onSamples,
-  onReset,
-  onSimulationState,
-  onResultsComplete,
-  onPlaybackRate,
-  onRunAccepted,
-  onRunRejected,
-  onRunCancelled,
-  onError,
-  capabilities = [],
-  defaultPlaybackRate,
-  playbackControlPosition,
-  runRequestTimeoutMs = 30_000,
+  getConnection, onHostReady, onSample, onSamples, onReset, onSimulationState,
+  onResultsComplete, onPlaybackRate, onRunAccepted, onRunRejected, onRunCancelled, onError,
+  defaultPlaybackRate, playbackControlPosition, runRequestTimeoutMs = 30_000,
 } = {}) {
-  if (typeof window === 'undefined') {
-    throw new Error('The digital twin app client can only be created in a browser.')
-  }
-
   let disposed = false
-  let hostReady = false
+  let hostReady = typeof getConnection === 'function'
   let sceneReady = false
   let readySent = false
-  let startupError = null
-  let activeRunId = null
-  let reception = createReception()
-  const pendingRequests = new Map()
-  const appCapabilities = new Set(Array.isArray(capabilities)
-    ? capabilities.filter((capability) => (
-      isValidAppReadyMessage(makeProtocolMessage(DIGITAL_TWIN_MESSAGE.APP_READY, { capabilities: [capability] }))
-      && !Object.values(DIGITAL_TWIN_CAPABILITY).includes(capability)
-    )).slice(0, 30)
-    : [])
-  if (typeof onPlaybackRate === 'function') appCapabilities.add(DIGITAL_TWIN_CAPABILITY.PLAYBACK_RATE)
-  if (typeof onSamples === 'function' || typeof onSample === 'function') {
-    appCapabilities.add(DIGITAL_TWIN_CAPABILITY.SAMPLE_ACKNOWLEDGEMENT)
-  }
-  const requestTimeoutMs = Number.isFinite(runRequestTimeoutMs) && runRequestTimeoutMs > 0
-    ? runRequestTimeoutMs
-    : 30_000
+  let startupError
+  let active = null
+  const grants = new Map()
+  const capabilities = [DIGITAL_TWIN_CAPABILITY.EXECUTION_CONTROL]
+  if (typeof onPlaybackRate === 'function') capabilities.push(DIGITAL_TWIN_CAPABILITY.PLAYBACK_RATE)
+  const report = (error) => { try { onError?.(error) } catch { /* The app owns its error presentation. */ } }
 
-  function reportCallbackError(error) {
-    if (typeof onError !== 'function') return
-    try {
-      onError(error instanceof Error ? error : new Error(String(error)))
-    } catch {
-      // An application error handler must not break the bridge listener.
+  function sendReady() {
+    if (!disposed && hostReady && sceneReady && !readySent && !startupError) {
+      readySent = postToHost(MESSAGE.APP_READY, {
+        capabilities,
+        ...(defaultPlaybackRate === undefined ? {} : { defaultPlaybackRate }),
+        ...(playbackControlPosition === undefined ? {} : { playbackControlPosition }),
+      })
     }
   }
-
-  function invoke(callback, ...args) {
-    if (typeof callback !== 'function') return undefined
-    try {
-      return callback(...args)
-    } catch (error) {
-      reportCallbackError(error)
-      return undefined
-    }
-  }
-
-  function createReception() {
-    return { controller: new AbortController(), queue: Promise.resolve(), failed: false }
-  }
-
-  function resetReception(runId) {
-    reception.controller.abort()
-    reception = createReception()
-    activeRunId = runId
-  }
-
-  function processInOrder(callback) {
-    const current = reception
-    const context = { runId: activeRunId ?? undefined, signal: current.controller.signal }
-    current.queue = current.queue.then(async () => {
-      if (context.signal.aborted || current.failed) return
-      await callback(context)
-    }).catch((error) => {
-      if (context.signal.aborted) return
-      current.failed = true
-      reportCallbackError(error)
-    })
-  }
-
-  function isCurrentRun(message) {
-    return !message.runId || message.runId === activeRunId
-  }
-
-  function sendReadyIfPossible() {
-    if (disposed || !hostReady || !sceneReady || readySent || startupError) return false
-    const payload = {
-      capabilities: [...appCapabilities],
-      ...(Number.isFinite(defaultPlaybackRate) && defaultPlaybackRate > 0 && defaultPlaybackRate <= 100_000
-        ? { defaultPlaybackRate }
-        : {}),
-      ...(['top-left', 'top-right', 'bottom-left', 'bottom-right'].includes(playbackControlPosition)
-        ? { playbackControlPosition }
-        : {}),
-    }
-    readySent = postToHost(DIGITAL_TWIN_MESSAGE.APP_READY, payload)
-    return readySent
-  }
-
-  function sendStartupErrorIfPossible() {
-    if (disposed || !hostReady || !startupError || readySent) return false
-    readySent = postToHost(DIGITAL_TWIN_MESSAGE.APP_ERROR, { code: startupError })
-    return readySent
-  }
-
-  function clearPendingRequest(requestId, error, result) {
-    const pending = pendingRequests.get(requestId)
-    if (!pending) return null
-    window.clearTimeout(pending.timeout)
-    pendingRequests.delete(requestId)
+  function finishGrant(requestId, error, value) {
+    const pending = grants.get(requestId)
+    if (!pending) return
+    grants.delete(requestId)
+    clearTimeout(pending.timer)
+    pending.signal.removeEventListener('abort', pending.abort)
     if (error) pending.reject(error)
-    else pending.resolve(result)
-    return pending
+    else pending.resolve(value)
   }
-
-  function handleHostMessage(event) {
+  function receive(event) {
     if (disposed || !isHostMessageEvent(event)) return
     const message = event.data
-
-    if (message.type === DIGITAL_TWIN_MESSAGE.HOST_READY) {
-      if (!hostReady) {
-        hostReady = true
-        invoke(onHostReady, message.extensions || {})
-      }
-      if (startupError) sendStartupErrorIfPossible()
-      else sendReadyIfPossible()
-      return
-    }
-
-    if (message.type === DIGITAL_TWIN_MESSAGE.RUN_ACCEPTED) {
-      const pending = clearPendingRequest(message.requestId, null, {
-        requestId: message.requestId,
-        runId: message.runId,
-      })
-      if (!pending) return
-      if (activeRunId !== message.runId) resetReception(message.runId)
-      invoke(onRunAccepted, { requestId: message.requestId, runId: message.runId })
-      return
-    }
-
-    if (message.type === DIGITAL_TWIN_MESSAGE.RUN_REJECTED) {
-      const error = createClientError('Marketplace rejected the simulation request.', message.code)
-      const pending = message.requestId
-        ? clearPendingRequest(message.requestId, error)
-        : null
-      if (pending || !message.requestId) invoke(onRunRejected, { requestId: message.requestId, code: message.code })
-      return
-    }
-
-    if (message.type === DIGITAL_TWIN_MESSAGE.RUN_CANCELLED) {
-      if (message.runId !== activeRunId) return
-      invoke(onRunCancelled, message.runId)
-      return
-    }
-
-    if (message.type === DIGITAL_TWIN_MESSAGE.SAMPLE) {
-      if (!isCurrentRun(message)) return
-      processInOrder(async (context) => {
-        await onSample?.({ time: message.time, outputs: message.outputs }, context)
-      })
-      return
-    }
-
-    if (message.type === DIGITAL_TWIN_MESSAGE.SAMPLES) {
-      if (!isCurrentRun(message)) return
-      processInOrder(async (context) => {
-        if (typeof onSamples === 'function') {
-          await onSamples(message.samples, message, context)
-        } else if (typeof onSample === 'function') {
-          for (const sample of message.samples) {
-            if (context.signal.aborted) return
-            await onSample(sample, context)
-          }
-        }
-        if (!context.signal.aborted) acknowledgeSampleBatch(message)
-      })
-      return
-    }
-
-    if (message.type === DIGITAL_TWIN_MESSAGE.RESULTS_COMPLETE) {
-      if (!isCurrentRun(message)) return
-      processInOrder(async (context) => {
-        await onResultsComplete?.(message, context)
-      })
-      return
-    }
-
-    if (message.type === DIGITAL_TWIN_MESSAGE.RESET) {
-      resetReception(message.runId ?? null)
-      invoke(onReset, message.runId ?? null)
-      return
-    }
-
-    if (message.type === DIGITAL_TWIN_MESSAGE.SIMULATION_STATE) {
-      if (!isCurrentRun(message)) return
-      invoke(onSimulationState, message.state, message)
-      return
-    }
-
-    if (message.type === DIGITAL_TWIN_MESSAGE.PLAYBACK_CONTROL) {
-      invoke(onPlaybackRate, message.rate, message)
-    }
+    if (message.type === MESSAGE.HOST_READY) {
+      if (!hostReady) { hostReady = true; try { onHostReady?.(message.extensions || {}) } catch (error) { report(error) } }
+      readySent = false
+      if (startupError) postToHost(MESSAGE.APP_ERROR, { code: startupError })
+      else sendReady()
+    } else if (message.type === MESSAGE.CONNECTION_READY) {
+      finishGrant(message.requestId, null, { connection: message.connection, inputSchedule: message.inputSchedule || [] })
+    } else if (message.type === MESSAGE.CONNECTION_ERROR) {
+      finishGrant(message.requestId, errorWithCode('The provider connection could not be authorized.', message.code))
+    } else if (message.type === MESSAGE.PLAYBACK_CONTROL) {
+      try { onPlaybackRate?.(message.rate, message) } catch (error) { report(error) }
+    } else if (message.type === MESSAGE.EXECUTION_CANCEL && active?.runId === message.runId) cancel(message.runId)
   }
+  globalThis.window?.addEventListener('message', receive)
+  // Async apps (e.g. a React app loading its config) may mount after iframe load.
+  postToHost(MESSAGE.APP_HELLO)
+  if (getConnection) queueMicrotask(() => { if (!disposed) { try { onHostReady?.({}) } catch (error) { report(error) } } })
 
-  window.addEventListener('message', handleHostMessage)
-
-  function reportReady() {
-    if (disposed || startupError) return false
-    sceneReady = true
-    return sendReadyIfPossible()
-  }
-
-  function reportError(code = 'APP_STARTUP_FAILED') {
-    if (disposed || readySent) return false
-    const normalizedCode = typeof code === 'string' && code.length > 0
-      ? code.slice(0, 128)
-      : 'APP_STARTUP_FAILED'
-    startupError = normalizedCode
-    return sendStartupErrorIfPossible()
-  }
-
-  function run(request = {}) {
-    if (disposed) return Promise.reject(createClientError('The digital twin app client has been disposed.'))
-    if (!hostReady || !readySent || startupError) {
-      return Promise.reject(createClientError('The Marketplace host is not ready to run the FMU.'))
-    }
-    if (!isRecord(request)) return Promise.reject(createClientError('The FMU run request is invalid.'))
-
-    const { parameters = {}, options = {} } = request
-
-    const requestId = createProtocolId('request')
-    const message = makeProtocolMessage(DIGITAL_TWIN_MESSAGE.RUN_REQUEST, { requestId, parameters, options })
-    if (!isValidAppMessage(message)) return Promise.reject(createClientError('The FMU run request is invalid.'))
-
+  function requestConnection(options, signal) {
+    if (getConnection) return Promise.resolve(getConnection({ options, signal })).then((grant) => grant.connection ? grant : { connection: grant, inputSchedule: [] })
+    if (!hostReady || !readySent) return Promise.reject(errorWithCode('The host is not ready to authorize an FMU connection.', 'HOST_NOT_READY'))
+    const requestId = createProtocolId('grant')
     return new Promise((resolve, reject) => {
-      const timeout = window.setTimeout(() => {
-        clearPendingRequest(requestId, createClientError('Marketplace did not answer the FMU run request.', 'REQUEST_TIMEOUT'))
-      }, requestTimeoutMs)
-      pendingRequests.set(requestId, { resolve, reject, timeout })
-      try {
-        if (!postToHost(DIGITAL_TWIN_MESSAGE.RUN_REQUEST, { requestId, parameters, options })) {
-          clearPendingRequest(requestId, createClientError('The digital twin app is not hosted by Marketplace.'))
-        }
-      } catch (error) {
-        clearPendingRequest(requestId, error)
-      }
+      const abort = () => finishGrant(requestId, signal.reason)
+      const timer = setTimeout(() => finishGrant(requestId, errorWithCode('The connection grant timed out.', 'REQUEST_TIMEOUT')), runRequestTimeoutMs)
+      grants.set(requestId, { resolve, reject, timer, signal, abort })
+      signal.addEventListener('abort', abort, { once: true })
+      postToHost(MESSAGE.CONNECTION_REQUEST, { requestId, options })
     })
   }
 
-  function cancel(runId = activeRunId) {
-    if (disposed || !isValidProtocolId(runId)) return false
-    return postToHost(DIGITAL_TWIN_MESSAGE.RUN_CANCEL, { runId })
-  }
-
-  function requestModelChange(modelId) {
-    if (disposed) return false
-    const message = makeProtocolMessage(DIGITAL_TWIN_MESSAGE.MODEL_CHANGE, { modelId })
-    if (!isValidAppMessage(message)) return false
-    return postToHost(DIGITAL_TWIN_MESSAGE.MODEL_CHANGE, { modelId })
-  }
-
-  function dispose() {
+  function state(run, value) {
     if (disposed) return
-    disposed = true
-    reception.controller.abort()
-    window.removeEventListener('message', handleHostMessage)
-    for (const requestId of pendingRequests.keys()) {
-      clearPendingRequest(requestId, createClientError('The digital twin app client has been disposed.'))
+    try { onSimulationState?.(value, { runId: run.runId, state: value }) } catch (error) { report(error) }
+    postToHost(MESSAGE.EXECUTION_STATE, { runId: run.runId, state: value, options: run.options })
+  }
+  async function deliver(run, samples) {
+    run.controller.signal.throwIfAborted()
+    if (!samples.length || samples.length > MAX_SAMPLES_PER_BATCH || !samples.every(isValidSample)) throw errorWithCode('Invalid FMU samples.', 'INVALID_FMU_RESPONSE')
+    const context = { runId: run.runId, signal: run.controller.signal }
+    const batch = { runId: run.runId, samples, firstSampleIndex: run.sampleCount, lastSampleIndex: run.sampleCount + samples.length - 1 }
+    if (onSamples) await onSamples(samples, batch, context)
+    else for (const sample of samples) { context.signal.throwIfAborted(); await onSample?.(sample, context) }
+    run.controller.signal.throwIfAborted()
+    run.sampleCount += samples.length
+  }
+  async function operation(run, type, expected, payload) {
+    while (true) {
+      run.controller.signal.throwIfAborted()
+      try {
+        const readsOutputs = ['sim.getOutputs', 'sim.advance'].includes(type)
+        if (readsOutputs && run.nextOutputAt > performance.now()) await wait(Math.ceil(run.nextOutputAt - performance.now()), run.controller.signal)
+        const response = await run.session.request(type, expected, payload)
+        if (readsOutputs) run.nextOutputAt = performance.now() + run.outputIntervalMs
+        return response
+      }
+      catch (error) {
+        if (error.code !== 'OUTPUT_READ_RATE_LIMITED' || !Number.isFinite(error.retryAfterMs) || error.retryAfterMs < 1 || error.retryAfterMs > 10_000) throw error
+        await wait(error.retryAfterMs, run.controller.signal)
+      }
     }
   }
+  async function finish(run, outcome, error) {
+    if (run.finished) return
+    run.finished = true
+    run.session?.close()
+    if (disposed) { if (active === run) active = null; return }
+    if (error && outcome === 'error') report(error)
+    state(run, outcome)
+    if (outcome === 'cancelled') { try { onRunCancelled?.(run.runId) } catch (callbackError) { report(callbackError) } }
+    try {
+      await onResultsComplete?.({ runId: run.runId, state: outcome, sampleCount: run.sampleCount }, { runId: run.runId, signal: run.controller.signal })
+    } catch (callbackError) { report(callbackError) }
+    finally { if (active === run) active = null }
+  }
+  async function updateController(run, sample) {
+    if (!run.inputController) return
+    const values = await run.inputController(sample, { runId: run.runId, signal: run.controller.signal })
+    run.controller.signal.throwIfAborted()
+    if (values && Object.keys(values).length) {
+      if (!isValidParameters(values)) throw errorWithCode('Invalid controller inputs.', 'INVALID_INPUT')
+      await operation(run, 'sim.setInputs', 'sim.inputs.updated', { values })
+    }
+  }
+  async function pump(run) {
+    try {
+      let time = run.options.startTime
+      let eventIndex = 0
+      while (time < run.options.stopTime - 1e-12) {
+        run.controller.signal.throwIfAborted()
+        while (eventIndex < run.schedule.length && run.schedule[eventIndex].time <= time + 1e-12) {
+          await operation(run, 'sim.setInputs', 'sim.inputs.updated', { values: run.schedule[eventIndex++].values })
+        }
+        const targetTime = Math.min(run.options.stopTime, run.schedule[eventIndex]?.time ?? Infinity)
+        const result = await operation(run, 'sim.advance', 'sim.samples', { targetTime, maxSamples: run.inputController ? 1 : MAX_SAMPLES_PER_BATCH, stepSize: run.options.stepSize })
+        if (!Array.isArray(result.samples) || !result.samples.length || !Number.isFinite(result.simTime) || result.simTime <= time || result.simTime > targetTime + 1e-9) throw errorWithCode('The FMU did not advance as requested.', 'INVALID_FMU_RESPONSE')
+        let previous = time
+        for (const sample of result.samples) {
+          if (!Number.isFinite(sample.time) || sample.time <= previous || sample.time > result.simTime) throw errorWithCode('The FMU returned an unordered timeline.', 'INVALID_FMU_RESPONSE')
+          previous = sample.time
+        }
+        if (previous !== result.simTime) throw errorWithCode('The FMU returned an incomplete timeline.', 'INVALID_FMU_RESPONSE')
+        await deliver(run, result.samples)
+        time = result.simTime
+        if (result.finished) break
+        await updateController(run, result.samples.at(-1))
+      }
+      await finish(run, 'completed')
+    } catch (error) { await finish(run, run.controller.signal.aborted ? 'cancelled' : 'error', error) }
+  }
 
+  async function run({ parameters = {}, options = {}, inputSchedule, inputController } = {}) {
+    if (disposed || active) throw errorWithCode('The app cannot start another FMU run.', 'RUN_UNAVAILABLE')
+    if (!isValidParameters(parameters) || !isValidOptions(options)) throw errorWithCode('Invalid FMU run parameters.', 'INVALID_RUN_REQUEST')
+    parameters = { ...parameters }
+    options = { ...options }
+    if (inputController !== undefined && typeof inputController !== 'function') throw errorWithCode('Invalid input controller.', 'INVALID_INPUT')
+    const current = { runId: createProtocolId('run'), controller: new AbortController(), sampleCount: 0, options, inputController }
+    active = current
+    try {
+      const grant = await requestConnection(options, current.controller.signal)
+      current.controller.signal.throwIfAborted()
+      current.session = await connectFmuSession(grant.connection, { signal: current.controller.signal })
+      if (current.session.capabilities.advanceSamples !== true) throw errorWithCode('The provider FMU runtime needs batched WebSocket support.', 'UNSUPPORTED_FMU_RUNTIME')
+      const outputHz = current.session.capabilities.maxOutputHz
+      current.outputIntervalMs = Number.isFinite(outputHz) && outputHz >= 1 && outputHz <= 1000 ? 1000 / outputHz : 0
+      const model = await current.session.request('model.describe', 'model.description', { includeVariables: false })
+      current.options = {
+        startTime: options.startTime ?? model.defaultStartTime ?? 0,
+        stopTime: options.stopTime ?? model.defaultStopTime ?? 1,
+        stepSize: options.stepSize ?? model.defaultStepSize ?? 0.001,
+      }
+      const { startTime, stopTime, stepSize } = current.options
+      if (!isValidOptions(current.options) || stopTime <= startTime || stepSize <= 0) throw errorWithCode('Invalid simulation interval.', 'INVALID_RUN_REQUEST')
+      const schedule = inputSchedule ?? grant.inputSchedule ?? []
+      if (!isValidInputSchedule(schedule) || schedule.some((event) => event.time < startTime || event.time > stopTime)) throw errorWithCode('Invalid input schedule.', 'INVALID_INPUT_SCHEDULE')
+      current.schedule = [...schedule].sort((a, b) => a.time - b.time)
+      await current.session.request('sim.initialize', 'sim.state', { parameters, options: { ...current.options, timeMode: 'simtime' } })
+      onReset?.(current.runId)
+      state(current, 'running')
+      const initial = await operation(current, 'sim.getOutputs', 'sim.outputs', {})
+      const initialSample = { time: initial.simTime, outputs: initial.values }
+      if (onSamples && onSample) await onSample(initialSample, { runId: current.runId, signal: current.controller.signal })
+      await deliver(current, [initialSample])
+      await updateController(current, initialSample)
+      onRunAccepted?.({ runId: current.runId })
+      void pump(current).catch(report)
+      return { runId: current.runId }
+    } catch (error) {
+      await finish(current, current.controller.signal.aborted ? 'cancelled' : 'error', error)
+      onRunRejected?.({ code: error.code || 'FMU_CONNECTION_FAILED' })
+      throw error
+    }
+  }
+  function cancel(runId = active?.runId) {
+    if (!active || runId !== active.runId) return false
+    active.controller.abort(new DOMException('Cancelled', 'AbortError'))
+    return true
+  }
   return {
-    reportReady,
-    reportError,
-    run,
-    cancel,
-    requestModelChange,
-    dispose,
+    reportReady() { sceneReady = true; sendReady(); return typeof getConnection === 'function' || readySent },
+    reportError(code = 'APP_STARTUP_FAILED') { startupError = code; return hostReady && postToHost(MESSAGE.APP_ERROR, { code }) },
+    run, cancel,
+    requestModelChange(modelId) { return !disposed && postToHost(MESSAGE.MODEL_CHANGE, { modelId }) },
+    dispose() {
+      disposed = true
+      cancel()
+      for (const requestId of grants.keys()) finishGrant(requestId, errorWithCode('The client was disposed.', 'DISPOSED'))
+      globalThis.window?.removeEventListener('message', receive)
+    },
     get hostReady() { return hostReady },
-    get activeRunId() { return activeRunId },
+    get activeRunId() { return active?.runId || null },
   }
 }

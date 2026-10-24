@@ -7,6 +7,7 @@ import binascii
 import copy
 import logging
 import math
+import json
 from functools import reduce
 from operator import mul
 import shutil
@@ -398,6 +399,38 @@ class FmuSession:
     def _ensure_step_budget(self, additional_steps: int) -> None:
         if self._step_count + additional_steps > self._max_simulation_steps:
             raise ValueError("MAX_SIMULATION_STEPS_EXCEEDED")
+
+    def advance(self, target_time: float, max_samples: int = 256, step_size: float | None = None) -> dict[str, Any]:
+        """Advance a bounded batch without dropping intermediate output samples.
+
+        One request is one flow-control window. Reserve space for the worst-case
+        scalar values, timestamps and response envelope before doing any steps.
+        The existing streaming iterator owns FMI stepping and termination rules.
+        """
+        if type(max_samples) is not int or not 1 <= max_samples <= 256:
+            raise ValueError("maxSamples must be an integer between 1 and 256")
+        outputs = self.get_outputs()["outputs"]
+        if any(not isinstance(value, (bool, int, float)) for value in outputs.values()):
+            raise ValueError("Batched samples require scalar FMI outputs")
+        sample_bound = 128 + sum(len(json.dumps(name)) + 64 for name in outputs)
+        safe_count = min(max_samples, 900_000 // sample_bound)
+        if safe_count < 1:
+            raise ValueError("One output sample exceeds the WebSocket frame budget")
+        samples = []
+        snapshots = self.run_until_streaming(target_time, step_size=step_size)
+        try:
+            for snapshot in snapshots:
+                samples.append({"time": snapshot["time"], "outputs": snapshot["outputs"]})
+                if len(samples) >= safe_count:
+                    break
+        finally:
+            snapshots.close()
+        return {
+            "samples": samples,
+            "simTime": self._time,
+            "finished": self._state == "stopped",
+            "finishReason": self._finished_reason,
+        }
 
     def set_inputs(self, values: dict[str, Any]) -> None:
         self._ensure_live()

@@ -64,6 +64,7 @@ _REALTIME_METHODS = {
     "validate_initial_values",
     "step",
     "run_until",
+    "advance",
     "validate_inputs",
     "set_inputs",
     "get_outputs",
@@ -188,18 +189,18 @@ def _stage_windows_fmu(source: Path, worker_directory: Path) -> Path:
         raise
 
 
-def _realtime_snapshot(session: Any) -> dict[str, Any]:
+def _realtime_snapshot(session: Any, *, include_model: bool = True) -> dict[str, Any]:
     model = getattr(session, "_md", None)
     default_experiment = getattr(model, "defaultExperiment", None)
     variables = []
-    for variable in getattr(model, "modelVariables", ()) or ():
+    for variable in (getattr(model, "modelVariables", ()) or ()) if include_model else ():
         variables.append({
             "name": str(getattr(variable, "name", "")),
             "valueReference": int(getattr(variable, "valueReference", 0)),
             "type": str(getattr(variable, "type", "")),
             "causality": str(getattr(variable, "causality", "")),
         })
-    return {
+    snapshot = {
         "state": session.state,
         "time": float(session._time),
         "startTime": float(session._start_time),
@@ -210,11 +211,15 @@ def _realtime_snapshot(session: Any) -> dict[str, Any]:
         "finishedReason": getattr(session, "_finished_reason", None),
         "initialised": bool(session._initialised),
         "terminated": bool(session._terminated),
-        "modelVariables": variables,
-        "defaultExperiment": {
-            "stepSize": getattr(default_experiment, "stepSize", None),
-        } if default_experiment is not None else None,
     }
+    if include_model:
+        snapshot.update({
+            "modelVariables": variables,
+            "defaultExperiment": {
+                "stepSize": getattr(default_experiment, "stepSize", None),
+            } if default_experiment is not None else None,
+        })
+    return snapshot
 
 
 def _realtime_session_worker(
@@ -264,7 +269,7 @@ def _realtime_session_worker(
                     "requestId": request_id,
                     "ok": False,
                     "error": "FMU worker request is invalid",
-                    "snapshot": _realtime_snapshot(session),
+                    "snapshot": _realtime_snapshot(session, include_model=method == "load"),
                 })
                 continue
             if method == "terminate":
@@ -273,7 +278,7 @@ def _realtime_session_worker(
                     "requestId": request_id,
                     "ok": True,
                     "result": None,
-                    "snapshot": _realtime_snapshot(session),
+                    "snapshot": _realtime_snapshot(session, include_model=method == "load"),
                 })
                 return
             if method not in _REALTIME_METHODS:
@@ -281,7 +286,7 @@ def _realtime_session_worker(
                     "requestId": request_id,
                     "ok": False,
                     "error": "FMU worker command is not allowlisted",
-                    "snapshot": _realtime_snapshot(session),
+                    "snapshot": _realtime_snapshot(session, include_model=method == "load"),
                 })
                 continue
             try:
@@ -290,14 +295,14 @@ def _realtime_session_worker(
                     "requestId": request_id,
                     "ok": True,
                     "result": result,
-                    "snapshot": _realtime_snapshot(session),
+                    "snapshot": _realtime_snapshot(session, include_model=method == "load"),
                 })
             except Exception as exc:
                 connection.send({
                     "requestId": request_id,
                     "ok": False,
                     "error": str(exc) or "FMU worker command failed",
-                    "snapshot": _realtime_snapshot(session),
+                    "snapshot": _realtime_snapshot(session, include_model=method == "load"),
                 })
     except (EOFError, OSError):
         pass
@@ -453,7 +458,7 @@ class RealtimeSession:
         self._finished_reason = snapshot.get("finishedReason", self._finished_reason)
         self._initialised = bool(snapshot.get("initialised", self._initialised))
         self._terminated = bool(snapshot.get("terminated", self._terminated))
-        variables = snapshot.get("modelVariables", [])
+        variables = snapshot.get("modelVariables")
         default_experiment = snapshot.get("defaultExperiment")
         if isinstance(variables, list):
             self._md = SimpleNamespace(modelVariables=[
@@ -569,7 +574,9 @@ class RealtimeSession:
         return None
 
     def load(self) -> dict[str, Any]:
-        return self._rpc("load")
+        if not hasattr(self, "_description"):
+            self._description = self._rpc("load")
+        return self._description
 
     def initialize(self, **kwargs: Any) -> dict[str, Any]:
         return self._rpc("initialize", **kwargs)
@@ -586,6 +593,13 @@ class RealtimeSession:
         if step_size is None:
             return self._rpc("run_until", target_time)
         return self._rpc("run_until", target_time, step_size=step_size)
+
+    def advance(self, target_time: float, max_samples: int = 256, step_size: float | None = None) -> dict[str, Any]:
+        self._acquire_output_read_or_raise()
+        try:
+            return self._rpc("advance", target_time, max_samples=max_samples, step_size=step_size)
+        finally:
+            self._finish_output_read()
 
     def set_inputs(self, values: dict[str, Any]) -> None:
         self._rpc("set_inputs", values)

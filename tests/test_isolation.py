@@ -126,7 +126,7 @@ def test_apply_worker_limits_sets_rlimits_and_fails_closed(monkeypatch, tmp_path
     )
     assert limits.setrlimit.call_count == 5
     landlock.assert_called_once()
-    seccomp.assert_called_once_with()
+    seccomp.assert_called_once_with(allow_spawn=False)
 
     with pytest.raises(isolation.WorkerIsolationError, match="no private work directory"):
         isolation.apply_worker_limits({}, None, "model.fmu")

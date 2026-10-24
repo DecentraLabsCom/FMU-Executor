@@ -23,7 +23,7 @@ class FakeSlot:
     def initialize(self, **kwargs): self.calls.append(("initialize", kwargs))
     def run_until(self, target, step_size=None): return {"time": target}
     def get_outputs(self): return {"outputs": {"result": 12}}
-    def run_until_streaming(self, target, step_size=None):
+    def run_until_streaming(self, target, step_size=None, input_schedule=None):
         self._time = target
         return iter([{"type": "sim.outputs", "simTime": 0.5}])
     def terminate(self): self.calls.append(("terminate",))

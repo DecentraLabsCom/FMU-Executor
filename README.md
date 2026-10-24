@@ -502,3 +502,24 @@ cd fmu-executor
 pip install pytest httpx
 python -m pytest tests/ -v
 ```
+
+## Dense browser-session output
+
+The shared WS executor supports `sim.advance` in addition to native proxy.fmu
+step operations. A request specifies `targetTime`, optional `stepSize` and
+`maxSamples` (1 to 256). The response is `sim.samples` with all intermediate
+samples, `simTime`, `finished` and `finishReason`. The engine reduces the batch
+size when long output names require more space, keeping a conservative frame
+budget below 1 MB. The existing streaming stepping rules, process isolation,
+scenario quota, step budget, output rate and reservation deadline still apply.
+Session capabilities advertise `advanceSamples` and `maxOutputHz`.
+
+`model.describe` accepts `includeVariables: false`. Model descriptions use the
+loaded immutable snapshot, and worker RPC state updates transfer the variable
+catalogue only when loading the model, rather than on every sample batch.
+
+Complete provider apps use the same Gateway session-ticket flow as proxy.fmu.
+Marketplace grants temporary access; input commands and results go directly to
+Gateway. The host integration schema is v2 in Marketplace's optional SDK; the
+native FMU session protocol remains 1.0. Keep the deployed Station Executor
+snapshot current when using the browser client's batch operation.

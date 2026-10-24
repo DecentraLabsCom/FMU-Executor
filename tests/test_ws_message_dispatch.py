@@ -34,7 +34,7 @@ class Session:
     _pending_samples = []
     seq = 0
 
-    def load(self): self.loaded = True
+    def load(self): self.loaded = True; return {"modelName": "demo"}
     def validate_initial_values(self, values):
         return values
     def validate_inputs(self, values):
@@ -98,6 +98,17 @@ def test_live_session_commands_cover_state_model_and_data_operations(dispatch, m
     assert call({"type": "sim.unsubscribeOutputs"})["type"] == "sim.unsubscribed"
     assert session.subscription is None and session._pending_samples == []
     assert call({"type": "sim.getState"})["state"] == "initialized"
+
+
+def test_advance_batches_use_the_same_authorized_session_and_validate_before_execution(dispatch):
+    session, call = dispatch
+    session.advance = Mock(return_value={"samples": [{"time": 0.1, "outputs": {"x": 1}}], "simTime": 0.1, "finished": False})
+    result = call({"type": "sim.advance", "targetTime": 2, "maxSamples": 256, "stepSize": 0.1})
+    assert result["type"] == "sim.samples" and result["sessionId"] == session.session_id
+    session.advance.assert_called_once_with(2.0, max_samples=256, step_size=0.1)
+    with pytest.raises(HTTPException):
+        call({"type": "sim.advance", "targetTime": 2, "maxSamples": 257})
+    assert session.advance.call_count == 1
     assert call({"type": "ping"})["type"] == "session.pong"
     assert call({"type": "session.terminate"})["reason"] == "client_terminated"
     assert session._terminated

@@ -59,7 +59,7 @@ from .reproducibility import (
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="FMU Executor", version="0.3.1", docs_url=None, redoc_url=None)
+app = FastAPI(title="FMU Executor", version="0.3.2", docs_url=None, redoc_url=None)
 MAX_COMPANION_ASSET_BYTES = 50 * 1024 * 1024
 MAX_COMPANION_APP_FILES = 332
 _COMPANION_APP_MEDIA_TYPES = {
@@ -1466,6 +1466,8 @@ async def _handle_ws_message(
                 "step": True,
                 "setInputs": True,
                 "streamOutputs": True,
+                "advanceSamples": True,
+                "maxOutputHz": config.MAX_OUTPUT_SUBSCRIPTION_HZ,
                 "timeMode": ["simtime", "realtime", "external"],
             },
             "_session": new_session,
@@ -1533,7 +1535,12 @@ async def _handle_ws_message(
         auth.validate_gateway_context(command_context, access_key)
 
     if msg_type == "model.describe":
-        desc = fmu_storage.describe(session.access_key)
+        include_variables = msg.get("includeVariables", True)
+        if type(include_variables) is not bool:
+            raise HTTPException(400, "INVALID_COMMAND - includeVariables must be boolean")
+        desc = await asyncio.to_thread(session.load)
+        if not include_variables:
+            desc = {key: value for key, value in desc.items() if key != "modelVariables"}
         return {"type": "model.description", "sessionId": session.session_id, **desc}
 
     if msg_type == "sim.initialize":
@@ -1701,6 +1708,24 @@ async def _handle_ws_message(
         except RuntimeError as exc:
             raise HTTPException(409, f"INVALID_SESSION_STATE - {exc}") from exc
         return _sim_outputs_payload(session, outputs["outputs"], step_result)
+
+    if msg_type == "sim.advance":
+        try:
+            target_time = _strict_number(msg.get("targetTime"), "targetTime")
+            step_size = _strict_number(msg["stepSize"], "stepSize") if msg.get("stepSize") is not None else None
+            max_samples = msg.get("maxSamples", 256)
+            if type(max_samples) is not int or not 1 <= max_samples <= 256:
+                raise ValueError("maxSamples must be an integer between 1 and 256")
+            if session._time_mode == "external":
+                raise ValueError("sim.advance requires simtime or realtime mode")
+            result = await asyncio.to_thread(session.advance, target_time, max_samples=max_samples, step_size=step_size)
+        except process_runner.OutputReadRateLimitError as exc:
+            raise _output_read_rate_limit_exception(exc) from exc
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(400, f"INVALID_ADVANCE - {exc}") from exc
+        except RuntimeError as exc:
+            raise HTTPException(409, f"INVALID_SESSION_STATE - {exc}") from exc
+        return {"type": "sim.samples", "sessionId": session.session_id, **result}
 
     if msg_type == "sim.runUntil":
         target = msg.get("time", msg.get("targetTime"))
