@@ -380,9 +380,10 @@ runs, streams, async jobs, batch cases, realtime `sim.initialize`/`sim.reset`
 operations, and each non-empty realtime `sim.setInputs` update consume this
 budget. Direct legacy calls that omit the Gateway context are available only on
 the private token-protected channel and do not create history.
-Each initialization is limited to 10,000 communication steps, and one batch
-may use at most 20,000 steps across its scenarios. The limits are configurable
-with the environment variables below. They constrain automated parameter
+Each initialization defaults to 10,000 communication steps; its configurable
+limit is bounded at 1,000,000. One batch may use at most twice the configured
+per-initialization limit across its scenarios. The limits are configurable with
+the environment variables below. They constrain automated parameter
 sweeps; they do not make a black-box model impossible to study through its
 authorized inputs and outputs.
 
@@ -396,7 +397,9 @@ available until retention or storage pruning removes their output data.
 |---|---:|---:|
 | `FMU_MAX_BATCH_CASES` | 8 | 1–20 |
 | `FMU_MAX_SCENARIOS_PER_RESERVATION_PER_DAY` | 100 | 1–10,000 |
-| `FMU_MAX_SIMULATION_STEPS` | 10,000 | 100–100,000 |
+| `FMU_MAX_SIMULATION_STEPS` | 10,000 | 100–1,000,000 |
+| `FMU_MAX_INPUT_SCHEDULE_EVENTS` | 128 | 1–200,000 |
+| `FMU_MAX_INPUT_SCHEDULE_BYTES` | 16 KiB | 1 KiB–16 MiB |
 | `FMU_MAX_SIMULATION_PARAMETERS` | 32 | 1–256 |
 | `FMU_HISTORY_RETENTION_DAYS` | 7 | 1–30 |
 | `FMU_MAX_HISTORY_RECORDS` | 10,000 | 100–100,000 |

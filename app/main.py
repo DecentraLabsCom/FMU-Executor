@@ -447,7 +447,10 @@ class SimulationBody(BaseModel):
     reservationKey: str | None = None
     parameters: dict = Field(default_factory=dict)
     options: dict = Field(default_factory=dict)
-    inputSchedule: list[dict] = Field(default_factory=list, max_length=128)
+    inputSchedule: list[dict] = Field(
+        default_factory=list,
+        max_length=config.MAX_INPUT_SCHEDULE_EVENTS,
+    )
 
 
 class BatchScenario(BaseModel):
@@ -575,8 +578,15 @@ def _validate_input_schedule(
 ) -> list[dict[str, Any]]:
     if not input_schedule:
         return []
-    if len(input_schedule) > 128:
+    if len(input_schedule) > config.MAX_INPUT_SCHEDULE_EVENTS:
         raise HTTPException(status_code=422, detail="INPUT_SCHEDULE_LIMIT_EXCEEDED")
+
+    try:
+        encoded = json.dumps(input_schedule, separators=(",", ":"), allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="INVALID_INPUT_SCHEDULE") from exc
+    if len(encoded.encode("utf-8")) > config.MAX_INPUT_SCHEDULE_BYTES:
+        raise HTTPException(status_code=413, detail="INPUT_SCHEDULE_TOO_LARGE")
 
     try:
         start = float(options.get("startTime", 0.0))
@@ -635,12 +645,6 @@ def _validate_input_schedule(
     finally:
         validator.terminate()
 
-    try:
-        encoded = json.dumps(normalized_schedule, separators=(",", ":"), allow_nan=False)
-    except (TypeError, ValueError) as exc:
-        raise HTTPException(status_code=422, detail="INVALID_INPUT_SCHEDULE") from exc
-    if len(encoded.encode("utf-8")) > 16 * 1024:
-        raise HTTPException(status_code=413, detail="INPUT_SCHEDULE_TOO_LARGE")
     return normalized_schedule
 
 
