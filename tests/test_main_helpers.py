@@ -135,3 +135,41 @@ def test_active_reservation_deadline_validation(monkeypatch):
         with pytest.raises(HTTPException) as invalid:
             main._validate_active_reservation_deadline(context)
         assert invalid.value.detail == expected
+
+
+@pytest.mark.parametrize("version", ["2.0", "3.0"])
+def test_runtime_schedule_accepts_tunable_parameters_for_fmi_cosimulation(monkeypatch, version):
+    class Validator:
+        def __init__(self, *_args, **_kwargs):
+            self.terminated = False
+
+        def load(self):
+            pass
+
+        def validate_runtime_input_values(self, values):
+            return values
+
+        def terminate(self):
+            self.terminated = True
+
+    monkeypatch.setattr(main.engine, "FmuSession", Validator)
+    metadata = {
+        "fmiVersion": version,
+        "simulationType": "CoSimulation",
+        "defaultStepSize": 0.1,
+        "modelVariables": [{
+            "name": "gain",
+            "causality": "parameter",
+            "variability": "tunable",
+        }],
+    }
+
+    result = main._validate_input_schedule(
+        [{"time": 0.5, "values": {"gain": 2.0}}],
+        options={"startTime": 0.0, "stopTime": 1.0, "stepSize": 0.1},
+        model_metadata=metadata,
+        fmu_path=object(),
+        access_key="demo.fmu",
+    )
+
+    assert result == [{"time": 0.5, "values": {"gain": 2.0}}]

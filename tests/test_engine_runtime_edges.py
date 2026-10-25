@@ -236,6 +236,25 @@ def test_value_validation_and_output_reads_cover_fmi_types(tmp_path):
         session.get_outputs()
 
 
+@pytest.mark.parametrize("version", ["2.0", "3.0"])
+def test_runtime_tunable_parameters_are_allowed_at_cosimulation_points(tmp_path, version):
+    session = make_live_session(tmp_path, version=version)
+    tunable = SimpleNamespace(
+        name="tunableGain", type="Real", causality="parameter", variability="tunable",
+        valueReference=1, min=None, max=None, declaredType=None, shape=None, dimensions=[],
+    )
+    fixed = SimpleNamespace(
+        name="fixedGain", type="Real", causality="parameter", variability="fixed",
+        valueReference=2, min=None, max=None, declaredType=None, shape=None, dimensions=[],
+    )
+    cast(Any, session._md).modelVariables = [tunable, fixed]
+    session._initialised = True
+
+    assert session.validate_inputs({"tunableGain": 2.5}) == {"tunableGain": 2.5}
+    with pytest.raises(ValueError, match="cannot be modified during runtime"):
+        session.validate_inputs({"fixedGain": 1.5})
+
+
 def test_attach_and_lifecycle_guards_cover_expiry_reset_and_termination(tmp_path, monkeypatch):
     session = make_live_session(tmp_path)
     session.mark_detached(10)

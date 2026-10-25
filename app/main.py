@@ -597,10 +597,25 @@ def _validate_input_schedule(
     if not all(math.isfinite(value) for value in (start, stop, step)) or step <= 0 or stop <= start:
         raise HTTPException(status_code=422, detail="INVALID_INPUT_SCHEDULE")
 
-    input_names = {
+    try:
+        fmi_major = int(str(model_metadata.get("fmiVersion") or "").split(".", 1)[0])
+    except (TypeError, ValueError):
+        fmi_major = 0
+    simulation_type = str(
+        model_metadata.get("simulationType") or model_metadata.get("simulationKind") or ""
+    ).lower().replace("_", "").replace("-", "")
+    supports_runtime_tunable_parameters = (
+        fmi_major in {2, 3} and simulation_type.replace(" ", "") == "cosimulation"
+    )
+    schedulable_names = {
         item.get("name")
         for item in model_metadata.get("modelVariables", [])
         if item.get("causality") == "input"
+        or (
+            supports_runtime_tunable_parameters
+            and item.get("causality") == "parameter"
+            and item.get("variability") == "tunable"
+        )
     }
     normalized_schedule: list[dict[str, Any]] = []
     seen_values: set[tuple[float, str]] = set()
@@ -620,12 +635,12 @@ def _validate_input_schedule(
             raise HTTPException(status_code=422, detail="INPUT_SCHEDULE_TIME_MUST_ALIGN_TO_STEP")
         values = event["values"]
         _validate_parameters(values)
-        if not values or any(name not in input_names for name in values):
-            raise HTTPException(status_code=422, detail="INPUT_SCHEDULE_CONTAINS_UNKNOWN_INPUT")
+        if not values or any(name not in schedulable_names for name in values):
+            raise HTTPException(status_code=422, detail="INPUT_SCHEDULE_CONTAINS_UNSUPPORTED_VARIABLE")
         for name in values:
             identity = (event_time, name)
             if identity in seen_values:
-                raise HTTPException(status_code=422, detail="DUPLICATE_SCHEDULED_INPUT")
+                raise HTTPException(status_code=422, detail="DUPLICATE_SCHEDULED_VARIABLE")
             seen_values.add(identity)
         normalized_schedule.append({"time": event_time, "values": values})
         previous_time = event_time

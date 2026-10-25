@@ -448,7 +448,7 @@ class FmuSession:
         return self._validate_values(values, phase="initialization")
 
     def validate_inputs(self, values: dict[str, Any]) -> dict[str, Any]:
-        """Validate and normalize runtime inputs without changing FMU state."""
+        """Validate and normalize runtime variable writes without changing FMU state."""
         self._ensure_live()
         if self._state in {"stopped", "error"}:
             raise RuntimeError(f"Session cannot accept inputs from state {self._state}")
@@ -775,8 +775,7 @@ class FmuSession:
             normalized[name] = values if self._is_array(var) else values[0]
         return normalized
 
-    @staticmethod
-    def _validate_write_access(var: Any, *, phase: str) -> None:
+    def _validate_write_access(self, var: Any, *, phase: str) -> None:
         causality = str(getattr(var, "causality", ""))
         variability = str(getattr(var, "variability", ""))
         if phase == "initialization":
@@ -785,7 +784,9 @@ class FmuSession:
                 or (causality == "parameter" and variability != "constant")
             )
         elif phase == "runtime":
-            allowed = causality == "input"
+            allowed = causality == "input" or (
+                causality == "parameter" and variability == "tunable"
+            )
         else:
             raise ValueError(f"Unknown variable write phase '{phase}'")
         if not allowed:
