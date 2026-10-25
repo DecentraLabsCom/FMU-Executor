@@ -144,6 +144,21 @@ class TestDescribeWithFmu:
         md.defaultExperiment.startTime = "0.0"
         md.defaultExperiment.stopTime = "1.0"
         md.defaultExperiment.stepSize = "0.01"
+        md.defaultExperiment.tolerance = None
+        md.description = None
+        md.author = None
+        md.version = None
+        md.license = None
+        md.generationTool = None
+        for capability in (
+            "canGetAndSetFMUstate",
+            "canSerializeFMUstate",
+            "canHandleVariableCommunicationStepSize",
+            "providesDirectionalDerivative",
+            "providesAdjointDerivatives",
+            "fixedInternalStepSize",
+        ):
+            setattr(md.coSimulation, capability, None)
 
         var1 = MagicMock()
         var1.name = "x"
@@ -155,6 +170,12 @@ class TestDescribeWithFmu:
         var1.unit = "m"
         var1.min = None
         var1.max = None
+        var1.initial = "exact"
+        var1.nominal = 2.0
+        var1.quantity = "Length"
+        var1.declaredType = None
+        var1.displayName = None
+        var1.dimensions = []
 
         var2 = MagicMock()
         var2.name = "u"
@@ -166,6 +187,12 @@ class TestDescribeWithFmu:
         var2.unit = None
         var2.min = None
         var2.max = None
+        var2.initial = None
+        var2.nominal = None
+        var2.quantity = None
+        var2.declaredType = None
+        var2.displayName = None
+        var2.dimensions = []
 
         md.modelVariables = [var1, var2]
         return md
@@ -192,6 +219,9 @@ class TestDescribeWithFmu:
         assert body["defaultStartTime"] == 0.0
         assert body["defaultStopTime"] == 1.0
         assert body["defaultStepSize"] == 0.01
+        assert body["modelVariables"][0]["initial"] == "exact"
+        assert body["modelVariables"][0]["nominal"] == 2.0
+        assert body["modelVariables"][0]["quantity"] == "Length"
 
     def test_describe_serializes_fmi3_binary_start_as_base64(self, client, auth_headers, _isolate_config):
         dummy_fmu = _isolate_config / "BinaryModel.fmu"
@@ -215,6 +245,12 @@ class TestDescribeWithFmu:
         binary.unit = None
         binary.min = None
         binary.max = None
+        binary.initial = None
+        binary.nominal = None
+        binary.quantity = None
+        binary.declaredType = None
+        binary.displayName = None
+        binary.dimensions = []
         md.modelVariables = [binary]
 
         with patch("fmpy.read_model_description", return_value=md):

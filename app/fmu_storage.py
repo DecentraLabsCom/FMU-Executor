@@ -656,6 +656,10 @@ def describe_model_description(
                 value_reference = getattr(dimension, "valueReference", None)
                 if value_reference is not None:
                     dimension_entry["valueReference"] = int(value_reference)
+                dimension_variable = getattr(dimension, "variable", None)
+                dimension_variable_name = getattr(dimension_variable, "name", None)
+                if isinstance(dimension_variable_name, str) and dimension_variable_name:
+                    dimension_entry["variableName"] = dimension_variable_name[:256]
                 if dimension_entry:
                     dimension_entries.append(dimension_entry)
             if dimension_entries:
@@ -665,9 +669,24 @@ def describe_model_description(
                 entry["start"] = base64.b64encode(bytes(var.start)).decode("ascii")
             else:
                 entry["start"] = var.start
+        initial = getattr(var, "initial", None)
+        if initial is not None:
+            entry["initial"] = str(initial)
+        nominal = finite_number(
+            getattr(var, "nominal", None),
+            integer=var.type in integer_types,
+        )
+        if nominal is not None:
+            entry["nominal"] = nominal
         unit = getattr(var, "unit", None) or getattr(declared_type, "unit", None)
         if unit:
             entry["unit"] = unit
+        quantity = getattr(var, "quantity", None) or getattr(declared_type, "quantity", None)
+        if quantity:
+            entry["quantity"] = str(quantity)[:256]
+        display_name = getattr(var, "displayName", None)
+        if isinstance(display_name, str) and display_name.strip():
+            entry["displayName"] = display_name.strip()[:256]
         description = getattr(var, "description", None)
         if isinstance(description, str) and description.strip():
             entry["description"] = description.strip()[:4096]
@@ -700,6 +719,39 @@ def describe_model_description(
                 items.append(option)
             if items and len(items) <= 256:
                 entry["enumItems"] = items
+        if declared_type is not None:
+            declared_type_entry: dict[str, Any] = {}
+            for field in ("name", "type", "description", "unit", "quantity", "displayUnit"):
+                value = getattr(declared_type, field, None)
+                if value is not None and value != "":
+                    declared_type_entry[field] = str(value)[:4096]
+            declared_minimum = getattr(declared_type, "min", None)
+            declared_maximum = getattr(declared_type, "max", None)
+            if declared_minimum is not None:
+                declared_type_entry["min"] = finite_number(
+                    declared_minimum,
+                    integer=var.type in integer_types,
+                )
+            if declared_maximum is not None:
+                declared_type_entry["max"] = finite_number(
+                    declared_maximum,
+                    integer=var.type in integer_types,
+                )
+            declared_items = []
+            for item in getattr(declared_type, "items", []) or []:
+                value = finite_number(getattr(item, "value", None), integer=True)
+                name = getattr(item, "name", None)
+                if value is None or not isinstance(name, str) or not name.strip():
+                    continue
+                item_entry = {"value": value, "name": name.strip()[:256]}
+                item_description = getattr(item, "description", None)
+                if isinstance(item_description, str) and item_description.strip():
+                    item_entry["description"] = item_description.strip()[:1024]
+                declared_items.append(item_entry)
+            if declared_items and len(declared_items) <= 256:
+                declared_type_entry["items"] = declared_items
+            if declared_type_entry:
+                entry["declaredType"] = declared_type_entry
         variables.append(entry)
 
     cs = md.coSimulation
@@ -713,6 +765,36 @@ def describe_model_description(
         "supportsModelExchange": me is not None,
         "modelVariables": variables,
     }
+
+    for field, maximum_length in (
+        ("description", 4096),
+        ("author", 256),
+        ("version", 128),
+        ("license", 256),
+        ("generationTool", 256),
+    ):
+        value = getattr(md, field, None)
+        if isinstance(value, str) and value.strip():
+            result[field] = value.strip()[:maximum_length]
+
+    capabilities: dict[str, Any] = {}
+    interface = cs or me
+    if interface is not None:
+        for attribute in (
+            "canGetAndSetFMUstate",
+            "canSerializeFMUstate",
+            "canHandleVariableCommunicationStepSize",
+            "providesDirectionalDerivative",
+            "providesAdjointDerivatives",
+        ):
+            value = getattr(interface, attribute, None)
+            if value is not None:
+                capabilities[attribute] = bool(value)
+        fixed_step = finite_number(getattr(interface, "fixedInternalStepSize", None))
+        if fixed_step is not None:
+            capabilities["fixedInternalStepSize"] = fixed_step
+    if capabilities:
+        result["capabilities"] = capabilities
 
     if cs is not None:
         result["fmiType"] = "CoSimulation"
@@ -731,5 +813,7 @@ def describe_model_description(
             result["defaultStopTime"] = float(exp.stopTime)
         if exp.stepSize is not None:
             result["defaultStepSize"] = float(exp.stepSize)
+        if exp.tolerance is not None:
+            result["defaultTolerance"] = float(exp.tolerance)
 
     return result
