@@ -73,6 +73,27 @@ def test_fmi3_cosimulation_uses_generic_instantiation_and_arrays(tmp_path: Path)
     assert outputs["payload"] == "AQI="
 
 
+def test_fmi3_event_mode_enters_step_mode_after_initialization(tmp_path: Path):
+    from app import engine
+
+    model = _fmi3_model_description()
+    model.coSimulation.hasEventMode = True
+    fmu = MagicMock()
+
+    session = engine.FmuSession("fmi3-event-mode-test", tmp_path / "model.fmu")
+    session._extract_dir = tmp_path
+    session._md = model
+    with patch("app.engine.fmpy_instantiate_fmu", return_value=fmu) as instantiate:
+        session.initialize(start_time=0.0, stop_time=1.0, step_size=0.1)
+
+    instantiate.assert_called_once_with(
+        str(tmp_path), model, fmi_type="CoSimulation",
+        early_return_allowed=False, event_mode_used=True,
+    )
+    fmu.exitInitializationMode.assert_called_once_with()
+    fmu.enterStepMode.assert_called_once_with()
+
+
 def test_fmi_session_lifecycle_supports_pause_resume_and_reset(tmp_path: Path):
     from app import engine
 

@@ -18,6 +18,10 @@ PLATFORM_BINARY = {
 }
 
 
+def _normalized_member_name(name: str) -> str:
+    return name.replace("\\", "/")
+
+
 def package(platform: str, binary: Path) -> None:
     platform_directory, suffix = PLATFORM_BINARY[platform]
     if binary.suffix != suffix or not binary.is_file():
@@ -28,9 +32,12 @@ def package(platform: str, binary: Path) -> None:
     if FMU_PATH.is_file():
         with zipfile.ZipFile(FMU_PATH) as archive:
             for info in archive.infolist():
-                if info.filename in {"modelDescription.xml", binary_entry}:
+                original_name = info.filename
+                normalized_name = _normalized_member_name(original_name)
+                if normalized_name in {"modelDescription.xml", binary_entry}:
                     continue
-                entries.append((info, archive.read(info.filename)))
+                info.filename = normalized_name
+                entries.append((info, archive.read(original_name)))
 
     fd, temporary_name = tempfile.mkstemp(prefix=".BinaryClockTest-", suffix=".fmu", dir=FMU_PATH.parent)
     os.close(fd)

@@ -187,6 +187,10 @@ class FmuSession:
             self._apply_validated_values(validated_parameters)
 
         slave.exitInitializationMode()
+        if self._fmi_major() == "3" and self._fmi3_event_mode_used:
+            # FMI 3 Co-Simulation enters Event Mode when Event Mode is enabled.
+            # Transition into Step Mode before the first fmi3DoStep call.
+            slave.enterStepMode()
         self._initialised = True
         self._terminated = False
         self._state = "initialized"
