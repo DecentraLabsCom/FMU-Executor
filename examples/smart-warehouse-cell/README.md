@@ -90,6 +90,10 @@ access key, Gateway credential or Station secret. On startup, the app announces
 itself to Marketplace and receives host readiness before reporting its scene
 ready. The SDK client and low-level FMU WebSocket client are optional; this
 bundle includes both to simplify the connection and playback integration.
+The app opts into adaptive advance batches and acknowledges the next rendered
+frame, so the SDK can size requests from model cost, transport, payload size and
+presentation delay without changing the FMI step. The provider runtime must
+advertise compute-bounded advances and sequenced samples for this mode.
 
 ## Build
 

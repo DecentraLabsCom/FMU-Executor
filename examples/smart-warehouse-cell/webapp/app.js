@@ -167,6 +167,7 @@ function requestSimulation() {
   const settings = document.querySelector('.simulation-setup')
   if (settings) settings.open = false
   twinClient.run({
+    batchPolicy: 'adaptive',
     parameters: {
       robotSpeed: Math.max(0, Math.min(1.4, speed)),
       orderQuantity: Math.max(1, Math.min(6, quantity)),
@@ -296,6 +297,19 @@ const twinClient = createDigitalTwinAppClient({
   },
   onSamples(samples) {
     appendSamples(samples)
+  },
+  onBatchRendered() {
+    return new Promise((resolve) => {
+      let frameId = 0
+      const timeoutId = window.setTimeout(() => {
+        if (frameId) cancelAnimationFrame(frameId)
+        resolve()
+      }, 100)
+      frameId = requestAnimationFrame(() => {
+        window.clearTimeout(timeoutId)
+        resolve()
+      })
+    })
   },
   onSample(sample) {
     if (!sample.outputs || typeof sample.outputs !== 'object' || Array.isArray(sample.outputs)) return
