@@ -1,6 +1,6 @@
 import {
   createProtocolId, DIGITAL_TWIN_CAPABILITY, DIGITAL_TWIN_MESSAGE as MESSAGE,
-  isHostMessageEvent, isValidOptions, isValidParameters, isValidInputSchedule,
+  isHostMessageEvent, isValidOptions, isValidParameters,
   isValidSample, isRecord, postToHost, MAX_SAMPLES_PER_BATCH,
 } from './index.js'
 import { connectFmuSession } from './fmu-client.js'
@@ -10,14 +10,64 @@ import {
   observeAdaptiveBatch,
 } from './batch-controller.js'
 import {
+  getInputUpdateQuota,
   getInputUpdateIntervalMs,
   getInputUpdateRetryDelayMs,
 } from './input-update-quota.js'
 
 const errorWithCode = (message, code) => Object.assign(new Error(message), { code })
+const MAX_RUN_INPUT_SCHEDULE_EVENTS = 200_000
+const ADVANCE_INPUT_SCHEDULE_TOLERANCE = 1e-12
+const UTF8_ENCODER = new TextEncoder()
 const VALID_ADVANCE_STOP_REASONS = new Set([
   'target_reached', 'max_samples', 'compute_budget', 'early_return', 'simulation_finished',
 ])
+
+function isValidRunInputSchedule(value) {
+  return Array.isArray(value) && value.length <= MAX_RUN_INPUT_SCHEDULE_EVENTS
+    && value.every((event) => isRecord(event)
+      && Object.keys(event).every((key) => ['time', 'values'].includes(key))
+      && Number.isFinite(event.time)
+      && isValidParameters(event.values))
+}
+
+function isValidAdvanceOptions(value) {
+  return isRecord(value) && Object.entries(value).every(([key, option]) => {
+    if (key === 'outputSampleEverySteps') return Number.isSafeInteger(option) && option >= 1 && option <= 100_000
+    if (key === 'outputVariables') {
+      return Array.isArray(option) && option.length <= 512
+        && option.every((name) => typeof name === 'string' && name.length > 0 && name.length <= 256)
+        && new Set(option).size === option.length
+    }
+    return false
+  })
+}
+
+function createScheduledInputBatch(run, eventIndex, latestTime) {
+  if (eventIndex >= run.schedule.length || run.schedule[eventIndex].time > latestTime + ADVANCE_INPUT_SCHEDULE_TOLERANCE) {
+    return { events: [] }
+  }
+  const quota = run.scheduleQuota
+  const events = []
+  let encodedBytes = 2 // JSON array brackets
+  let nextIndex = eventIndex
+  while (nextIndex < run.schedule.length && events.length < quota.maxScheduledEventsPerAdvance) {
+    const event = run.schedule[nextIndex]
+    if (event.time > latestTime + ADVANCE_INPUT_SCHEDULE_TOLERANCE) break
+    const eventBytes = UTF8_ENCODER.encode(JSON.stringify(event)).length
+    const candidateBytes = encodedBytes + (events.length ? 1 : 0) + eventBytes
+    if (candidateBytes > quota.maxScheduleBytesPerAdvance) {
+      if (!events.length) {
+        throw errorWithCode('A scheduled input event exceeds the FMU runtime advance limit.', 'INPUT_SCHEDULE_EVENT_TOO_LARGE')
+      }
+      break
+    }
+    events.push(event)
+    encodedBytes = candidateBytes
+    nextIndex += 1
+  }
+  return { events }
+}
 
 function hasValidAdvanceMetrics(response, samples) {
   return Number.isFinite(response?.computeMs) && response.computeMs >= 0
@@ -181,8 +231,28 @@ export function createDigitalTwinAppClient({
     } catch (callbackError) { report(callbackError) }
     finally { if (active === run) active = null }
   }
-  async function updateController(run, sample) {
+  async function updateController(run, sample, { initial = false } = {}) {
     if (!run.inputController) return
+    const sampleTime = Number(sample?.time)
+    const tolerance = Math.max(1e-9, Math.abs(run.options.stepSize) * 1e-7)
+    if (!initial && run.inputControllerInterval) {
+      const intervalReached = sampleTime >= run.nextControllerTime - tolerance
+      const scheduledTime = run.inputControllerTimes[run.inputControllerTimeIndex]
+      const scheduledTimeReached = Number.isFinite(scheduledTime) && sampleTime >= scheduledTime - tolerance
+      if (!intervalReached && !scheduledTimeReached) return
+      if (intervalReached) {
+        while (run.nextControllerTime <= sampleTime + tolerance) run.nextControllerTime += run.inputControllerInterval
+      }
+      while (run.inputControllerTimes[run.inputControllerTimeIndex] <= sampleTime + tolerance) {
+        run.inputControllerTimeIndex += 1
+      }
+    } else if (!initial && run.inputControllerTimes.length) {
+      const scheduledTime = run.inputControllerTimes[run.inputControllerTimeIndex]
+      if (!Number.isFinite(scheduledTime) || sampleTime < scheduledTime - tolerance) return
+      while (run.inputControllerTimes[run.inputControllerTimeIndex] <= sampleTime + tolerance) {
+        run.inputControllerTimeIndex += 1
+      }
+    }
     const values = await run.inputController(sample, { runId: run.runId, signal: run.controller.signal })
     run.controller.signal.throwIfAborted()
     if (values && Object.keys(values).length) {
@@ -196,17 +266,39 @@ export function createDigitalTwinAppClient({
       let eventIndex = 0
       while (time < run.options.stopTime - 1e-12) {
         run.controller.signal.throwIfAborted()
-        while (eventIndex < run.schedule.length && run.schedule[eventIndex].time <= time + 1e-12) {
+        const scheduleTolerance = Math.max(1e-9, Math.abs(run.options.stepSize) * 1e-7)
+        while (eventIndex < run.schedule.length && run.schedule[eventIndex].time <= time + scheduleTolerance) {
           await operation(run, 'sim.setInputs', 'sim.inputs.updated', { values: run.schedule[eventIndex++].values })
         }
-        const targetTime = Math.min(run.options.stopTime, run.schedule[eventIndex]?.time ?? Infinity)
+        const nextControllerTime = run.inputController
+          ? Math.min(
+            run.nextControllerTime ?? Infinity,
+            run.inputControllerTimes[run.inputControllerTimeIndex] ?? Infinity,
+          )
+          : Infinity
+        const scheduleBatch = run.schedule.length
+          ? createScheduledInputBatch(run, eventIndex, Math.min(run.options.stopTime, nextControllerTime))
+          : { events: [] }
+        const scheduledTargetTime = scheduleBatch.events.length
+          ? scheduleBatch.events.at(-1).time
+          : Infinity
+        let targetTime = Math.min(run.options.stopTime, nextControllerTime, scheduledTargetTime)
+        if (!Number.isFinite(targetTime)) targetTime = run.options.stopTime
+        if (targetTime <= time + scheduleTolerance) targetTime = Math.min(run.options.stopTime, time + run.options.stepSize)
+        const controllerSampleLimit = run.inputController && run.inputControllerInterval
+          ? Math.max(1, Math.ceil((targetTime - time) / run.options.stepSize) + 1)
+          : 1
         const maxSamples = run.batchPolicy === 'adaptive'
           ? getAdaptiveBatchSize(run.batchController)
-          : run.inputController ? 1 : run.maxBatchSamples
+          : run.inputController
+            ? Math.min(run.maxBatchSamples, controllerSampleLimit)
+            : run.maxBatchSamples
         const result = await operation(run, 'sim.advance', 'sim.samples', {
           targetTime,
           maxSamples,
           stepSize: run.options.stepSize,
+          ...(scheduleBatch.events.length ? { inputSchedule: scheduleBatch.events } : {}),
+          ...run.advanceOptions,
           ...(run.batchPolicy === 'adaptive' ? { maxComputeMs: run.batchController.maxComputeMs } : {}),
         })
         const batchReceivedAt = run.batchPolicy === 'adaptive' ? performance.now() : null
@@ -245,6 +337,17 @@ export function createDigitalTwinAppClient({
           && (!Number.isSafeInteger(previousSequence) || previousSequence <= (run.lastSampleSequence ?? 0))) {
           throw errorWithCode('The FMU returned no new step or event.', 'INVALID_FMU_RESPONSE')
         }
+        if (scheduleBatch.events.length) {
+          const appliedEvents = result.inputEventsApplied
+          if (!Number.isSafeInteger(appliedEvents) || appliedEvents < 0 || appliedEvents > scheduleBatch.events.length) {
+            throw errorWithCode('The FMU returned an invalid scheduled input count.', 'INVALID_FMU_RESPONSE')
+          }
+          const firstUnappliedEvent = run.schedule[eventIndex + appliedEvents]
+          if (firstUnappliedEvent && firstUnappliedEvent.time < result.simTime - tolerance) {
+            throw errorWithCode('The FMU advanced past a scheduled input that it did not apply.', 'INVALID_FMU_RESPONSE')
+          }
+          eventIndex += appliedEvents
+        }
         run.lastSampleSequence = Number.isSafeInteger(previousSequence) ? previousSequence : null
         const batch = await deliver(run, result.samples)
         time = result.simTime
@@ -264,30 +367,56 @@ export function createDigitalTwinAppClient({
             stopReason: result.stopReason,
           })
         }
-        if (result.finished) break
+        if (result.finished) {
+          if (eventIndex < run.schedule.length) throw errorWithCode('The FMU finished before applying the complete input schedule.', 'FMU_FINISHED_BEFORE_INPUT_SCHEDULE')
+          break
+        }
         await updateController(run, result.samples.at(-1))
       }
+      if (eventIndex < run.schedule.length) throw errorWithCode('The FMU finished before applying the complete input schedule.', 'FMU_FINISHED_BEFORE_INPUT_SCHEDULE')
       await finish(run, 'completed')
     } catch (error) { await finish(run, run.controller.signal.aborted ? 'cancelled' : 'error', error) }
   }
 
   async function run({
     parameters = {}, options = {}, inputSchedule, inputController, batchPolicy = 'fixed',
-    maxBatchSamples = MAX_SAMPLES_PER_BATCH, adaptiveBatchOptions = {},
+    maxBatchSamples = MAX_SAMPLES_PER_BATCH, adaptiveBatchOptions = {}, advanceOptions = {},
+    includeModelVariables = false, validateModel, parametersFromModel,
+    inputControllerInterval, inputControllerTimes = [],
   } = {}) {
     if (disposed || active) throw errorWithCode('The app cannot start another FMU run.', 'RUN_UNAVAILABLE')
     if (!isValidParameters(parameters) || !isValidOptions(options)) throw errorWithCode('Invalid FMU run parameters.', 'INVALID_RUN_REQUEST')
     parameters = { ...parameters }
     options = { ...options }
     if (inputController !== undefined && typeof inputController !== 'function') throw errorWithCode('Invalid input controller.', 'INVALID_INPUT')
+    if (inputControllerInterval !== undefined
+      && (!Number.isFinite(inputControllerInterval) || inputControllerInterval <= 0)) {
+      throw errorWithCode('inputControllerInterval must be a positive number of seconds.', 'INVALID_INPUT')
+    }
+    if (inputControllerTimes !== undefined
+      && (!Array.isArray(inputControllerTimes) || inputControllerTimes.length > MAX_RUN_INPUT_SCHEDULE_EVENTS
+        || inputControllerTimes.some((time) => !Number.isFinite(time)))) {
+      throw errorWithCode('inputControllerTimes must be a bounded list of finite simulation times.', 'INVALID_INPUT')
+    }
+    if ((inputControllerInterval !== undefined || inputControllerTimes.length) && !inputController) {
+      throw errorWithCode('Input controller timing requires an input controller.', 'INVALID_INPUT')
+    }
+    if (typeof includeModelVariables !== 'boolean'
+      || (validateModel !== undefined && typeof validateModel !== 'function')
+      || (parametersFromModel !== undefined && typeof parametersFromModel !== 'function')) {
+      throw errorWithCode('Invalid model validation options.', 'INVALID_INPUT')
+    }
     if (!['fixed', 'adaptive'].includes(batchPolicy)) throw errorWithCode('Invalid batch policy.', 'INVALID_INPUT')
     if (!isRecord(adaptiveBatchOptions)) throw errorWithCode('Invalid adaptive batch options.', 'INVALID_INPUT')
+    if (!isValidAdvanceOptions(advanceOptions)) throw errorWithCode('Invalid FMU advance options.', 'INVALID_INPUT')
     if (!Number.isInteger(maxBatchSamples) || maxBatchSamples < 1 || maxBatchSamples > MAX_SAMPLES_PER_BATCH) throw errorWithCode(`maxBatchSamples must be an integer from 1 to ${MAX_SAMPLES_PER_BATCH}.`, 'INVALID_INPUT')
     if (batchPolicy === 'adaptive' && inputController) throw errorWithCode('Adaptive batching cannot be combined with a per-sample input controller.', 'INVALID_INPUT')
-    if (inputController && maxBatchSamples !== MAX_SAMPLES_PER_BATCH && maxBatchSamples !== 1) throw errorWithCode('maxBatchSamples must be 1 when using a per-sample input controller.', 'INVALID_INPUT')
+    if (inputController && !inputControllerInterval && maxBatchSamples !== MAX_SAMPLES_PER_BATCH && maxBatchSamples !== 1) throw errorWithCode('maxBatchSamples must be 1 when using a per-sample input controller without an update interval.', 'INVALID_INPUT')
     const current = {
       runId: createProtocolId('run'), controller: new AbortController(), sampleCount: 0,
-      options, inputController, batchPolicy, maxBatchSamples, adaptiveBatchOptions,
+      options, inputController, inputControllerInterval, inputControllerTimes: [...inputControllerTimes].sort((a, b) => a - b),
+      inputControllerTimeIndex: 0, advanceOptions: { ...advanceOptions }, includeModelVariables, validateModel, parametersFromModel,
+      batchPolicy, maxBatchSamples, adaptiveBatchOptions,
       lastSampleSequence: null, lastInputUpdateAt: null,
     }
     active = current
@@ -304,7 +433,15 @@ export function createDigitalTwinAppClient({
       }
       const outputHz = current.session.capabilities.maxOutputHz
       current.outputIntervalMs = Number.isFinite(outputHz) && outputHz >= 1 && outputHz <= 1000 ? 1000 / outputHz : 0
-      const model = await current.session.request('model.describe', 'model.description', { includeVariables: false })
+      const model = await current.session.request('model.describe', 'model.description', { includeVariables: includeModelVariables })
+      if (validateModel) {
+        const validModel = await validateModel(model)
+        if (validModel === false) throw errorWithCode('The connected FMU does not match this application.', 'FMU_MODEL_MISMATCH')
+      }
+      const modelParameters = parametersFromModel ? await parametersFromModel(model) : {}
+      if (!isValidParameters(modelParameters)) throw errorWithCode('The FMU model produced invalid initialization parameters.', 'INVALID_INPUT')
+      const runParameters = { ...modelParameters, ...parameters }
+      if (!isValidParameters(runParameters)) throw errorWithCode('The FMU initialization parameters exceed the supported limits.', 'INVALID_INPUT')
       current.options = {
         startTime: options.startTime ?? model.defaultStartTime ?? 0,
         stopTime: options.stopTime ?? model.defaultStopTime ?? 1,
@@ -312,22 +449,35 @@ export function createDigitalTwinAppClient({
       }
       const { startTime, stopTime, stepSize } = current.options
       if (!isValidOptions(current.options) || stopTime <= startTime || stepSize <= 0) throw errorWithCode('Invalid simulation interval.', 'INVALID_RUN_REQUEST')
+      if (current.inputControllerTimes.some((time) => time < startTime || time > stopTime)) {
+        throw errorWithCode('An input controller time is outside the simulation interval.', 'INVALID_INPUT')
+      }
+      current.nextControllerTime = inputControllerInterval === undefined ? Infinity : startTime + inputControllerInterval
       if (batchPolicy === 'adaptive') {
         current.batchController = createAdaptiveBatchController({
           startTime, stopTime, stepSize, maxSamples: maxBatchSamples, ...adaptiveBatchOptions,
         })
       }
       const schedule = inputSchedule ?? grant.inputSchedule ?? []
-      if (!isValidInputSchedule(schedule) || schedule.some((event) => event.time < startTime || event.time > stopTime)) throw errorWithCode('Invalid input schedule.', 'INVALID_INPUT_SCHEDULE')
+      if (!isValidRunInputSchedule(schedule) || schedule.some((event) => event.time < startTime || event.time > stopTime)) throw errorWithCode('Invalid input schedule.', 'INVALID_INPUT_SCHEDULE')
+      if (schedule.length && current.session.capabilities.advanceInputValues !== true) {
+        throw errorWithCode('The provider FMU runtime cannot apply scheduled inputs during advance.', 'UNSUPPORTED_SCHEDULED_INPUTS')
+      }
+      current.scheduleQuota = schedule.length ? getInputUpdateQuota(current.session.capabilities) : null
       current.schedule = [...schedule].sort((a, b) => a.time - b.time)
-      await current.session.request('sim.initialize', 'sim.state', { parameters, options: { ...current.options, timeMode: 'simtime' } })
+      await current.session.request('sim.initialize', 'sim.state', { parameters: runParameters, options: { ...current.options, timeMode: 'simtime' } })
       onReset?.(current.runId)
       state(current, 'running')
-      const initial = await operation(current, 'sim.getOutputs', 'sim.outputs', {})
+      const initial = await operation(current, 'sim.getOutputs', 'sim.outputs', {
+        ...(current.advanceOptions.outputVariables ? { variables: current.advanceOptions.outputVariables } : {}),
+      })
       const initialSample = { time: initial.simTime, outputs: initial.values }
       if (onSamples && onSample) await onSample(initialSample, { runId: current.runId, signal: current.controller.signal })
       await deliver(current, [initialSample])
-      await updateController(current, initialSample)
+      if (current.inputControllerTimes.length && current.inputControllerTimes[0] <= startTime + 1e-12) {
+        while (current.inputControllerTimes[current.inputControllerTimeIndex] <= startTime + 1e-12) current.inputControllerTimeIndex += 1
+      }
+      await updateController(current, initialSample, { initial: true })
       onRunAccepted?.({ runId: current.runId })
       void pump(current).catch(report)
       return { runId: current.runId }

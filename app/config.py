@@ -85,6 +85,11 @@ MAX_INPUT_SCHEDULE_BYTES: int = _bounded_int(
     "FMU_MAX_INPUT_SCHEDULE_BYTES", 16 * 1024, 1024, 16 * 1024 * 1024
 )
 MAX_SIMULATION_PARAMETERS: int = _bounded_int("FMU_MAX_SIMULATION_PARAMETERS", 32, 1, 256)
+NATIVE_THREAD_LIMIT_ACCESS_KEYS: frozenset[str] = frozenset(
+    value.strip()
+    for value in (_env("FMU_NATIVE_THREAD_LIMIT_ACCESS_KEYS", "") or "").split(",")
+    if value.strip()
+)
 MAX_OUTPUT_SAMPLE_EVERY_STEPS: int = _bounded_int("FMU_MAX_OUTPUT_SAMPLE_EVERY_STEPS", 10000, 1, 100000)
 HISTORY_RETENTION_DAYS: int = _bounded_int("FMU_HISTORY_RETENTION_DAYS", 7, 1, 30)
 MAX_STORED_HISTORY_RECORDS: int = _bounded_int("FMU_MAX_HISTORY_RECORDS", 10000, 100, 100000)

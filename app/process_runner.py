@@ -79,6 +79,15 @@ _SECRET_ENV_MARKERS = (
     "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "PRIVATE_KEY", "API_KEY",
     "AWS_", "AZURE_", "GOOGLE_APPLICATION_CREDENTIALS",
 )
+_NATIVE_THREAD_ENVIRONMENT = (
+    "OPENBLAS_NUM_THREADS",
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+    "BLIS_NUM_THREADS",
+)
+_WORKER_ENVIRONMENT_LOCK = threading.Lock()
 _WORKER_OWNER_MARKER = ".worker-pid"
 
 
@@ -142,24 +151,36 @@ def _worker_process(
     return context.Process(target=target, args=args, name=name)
 
 
-def _sanitize_worker_environment() -> None:
+def _sanitize_worker_environment(access_key: str) -> None:
     for name in list(os.environ):
         upper_name = name.upper()
         if any(marker in upper_name for marker in _SECRET_ENV_MARKERS):
             os.environ.pop(name, None)
-    # Native math runtimes may size their worker pools from the host's CPU
-    # count rather than the constrained FMU worker allocation. Keep those
-    # pools single-threaded so large FMUs cannot exhaust their memory budget
-    # before simulation starts.
-    for name in (
-        "OPENBLAS_NUM_THREADS",
-        "OMP_NUM_THREADS",
-        "MKL_NUM_THREADS",
-        "NUMEXPR_NUM_THREADS",
-        "VECLIB_MAXIMUM_THREADS",
-        "BLIS_NUM_THREADS",
-    ):
-        os.environ[name] = "1"
+    if access_key in config.NATIVE_THREAD_LIMIT_ACCESS_KEYS:
+        for name in _NATIVE_THREAD_ENVIRONMENT:
+            os.environ[name] = "1"
+
+
+def _start_worker_process(process: Any, access_key: str) -> None:
+    """Pass per-model native thread limits to a spawned worker before Python imports its target."""
+    if access_key not in config.NATIVE_THREAD_LIMIT_ACCESS_KEYS:
+        process.start()
+        return
+
+    # multiprocessing inherits the parent environment at process creation.
+    # Serialize these short snapshots and restore the API process immediately.
+    with _WORKER_ENVIRONMENT_LOCK:
+        previous = {name: os.environ.get(name) for name in _NATIVE_THREAD_ENVIRONMENT}
+        try:
+            for name in _NATIVE_THREAD_ENVIRONMENT:
+                os.environ[name] = "1"
+            process.start()
+        finally:
+            for name, value in previous.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
 
 
 def _stage_windows_fmu(source: Path, worker_directory: Path) -> Path:
@@ -243,7 +264,7 @@ def _realtime_session_worker(
         if start_gate is not None:
             start_gate.wait()
         apply_worker_limits(resource_policy, worker_directory, str(fmu_path), access_key)
-        _sanitize_worker_environment()
+        _sanitize_worker_environment(access_key)
         if worker_directory:
             os.chdir(worker_directory)
             os.environ["TMP"] = worker_directory
@@ -403,7 +424,7 @@ class RealtimeSession:
             worker_directory=self._worker_directory,
         )
         try:
-            self._process.start()
+            _start_worker_process(self._process, self.access_key)
             worker_pid = self._process.pid
             if worker_pid is None:
                 raise ProcessExecutionError(
@@ -851,7 +872,7 @@ def _execute_worker(
         if start_gate is not None:
             start_gate.wait()
         apply_worker_limits(resource_policy, worker_directory, fmu_path, access_key)
-        _sanitize_worker_environment()
+        _sanitize_worker_environment(access_key)
         if worker_directory:
             os.chdir(worker_directory)
             os.environ["TMP"] = worker_directory
@@ -1074,7 +1095,7 @@ def _new_process(
         worker_directory=worker_directory,
     )
     try:
-        process.start()
+        _start_worker_process(process, access_key)
         worker_pid = process.pid
         if worker_pid is None:
             raise RuntimeError("FMU worker did not receive a process ID")
