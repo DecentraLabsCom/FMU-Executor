@@ -1,7 +1,25 @@
 import { createProtocolId, isValidConnectionConfig, MAX_SAMPLE_BATCH_JSON_CHARS } from './index.js'
-import { getInputUpdateQuota } from './input-update-quota.js'
+import { getInputUpdateQuota, getInputUpdateRetryDelayMs } from './input-update-quota.js'
 
 const failure = (message, code = 'FMU_CONNECTION_FAILED') => Object.assign(new Error(message), { code })
+
+function waitForRetry(delayMs, signal) {
+  signal?.throwIfAborted()
+  return new Promise((resolve, reject) => {
+    let timeout
+    const onAbort = () => {
+      clearTimeout(timeout)
+      signal.removeEventListener('abort', onAbort)
+      reject(signal.reason || new DOMException('FMU request cancelled.', 'AbortError'))
+    }
+    timeout = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort)
+      resolve()
+    }, delayMs)
+    signal?.addEventListener('abort', onAbort, { once: true })
+    if (signal?.aborted) onAbort()
+  })
+}
 
 /** Connect directly to the provider's existing proxy.fmu WebSocket service.
  * The one-use ticket is sent only in session.create, never in a URL or storage.
@@ -15,6 +33,7 @@ export async function connectFmuSession(connection, { signal, timeoutMs = 120_00
   const socket = new WebSocket(connection.gatewayWsUrl)
   const pending = new Map()
   let sessionId
+  let capabilities = {}
   let closed = false
   let openResolve
   let openReject
@@ -63,19 +82,36 @@ export async function connectFmuSession(connection, { signal, timeoutMs = 120_00
   })
 
   async function request(type, expected, payload = {}) {
-    if (closed) throw failure('The FMU session is closed.')
-    signal?.throwIfAborted()
-    const requestId = createProtocolId('rpc')
-    return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        pending.delete(requestId)
-        reject(failure('The FMU operation timed out.', 'FMU_REQUEST_TIMEOUT'))
-        close()
-      }, timeoutMs)
-      pending.set(requestId, { resolve, reject, timeout, expected })
-      try { socket.send(JSON.stringify({ ...payload, type, requestId, ...(sessionId ? { sessionId } : {}) })) }
-      catch (error) { close(error) }
-    })
+    const hasInputUpdates = type === 'sim.setInputs'
+      ? Boolean(payload.values && Object.keys(payload.values).length)
+      : type === 'sim.advance' && (
+        (Array.isArray(payload.inputSchedule) && payload.inputSchedule.length > 0)
+        || Boolean(payload.inputValues && Object.keys(payload.inputValues).length)
+      )
+
+    while (true) {
+      if (closed) throw failure('The FMU session is closed.')
+      signal?.throwIfAborted()
+      const requestId = createProtocolId('rpc')
+      try {
+        return await new Promise((resolve, reject) => {
+          const timeout = setTimeout(() => {
+            pending.delete(requestId)
+            reject(failure('The FMU operation timed out.', 'FMU_REQUEST_TIMEOUT'))
+            close()
+          }, timeoutMs)
+          pending.set(requestId, { resolve, reject, timeout, expected })
+          try { socket.send(JSON.stringify({ ...payload, type, requestId, ...(sessionId ? { sessionId } : {}) })) }
+          catch (error) { close(error) }
+        })
+      } catch (error) {
+        if (!hasInputUpdates) throw error
+        const retryAfterMs = getInputUpdateRetryDelayMs(error, capabilities)
+        if (retryAfterMs === null) throw error
+        // The provider rejects over-quota writes before applying their inputs or advancing the FMU.
+        await waitForRetry(retryAfterMs, signal)
+      }
+    }
   }
 
   try {
@@ -85,10 +121,11 @@ export async function connectFmuSession(connection, { signal, timeoutMs = 120_00
     })
     if (typeof created.sessionId !== 'string' || !created.sessionId) throw failure('Missing FMU session identifier.')
     getInputUpdateQuota(created.capabilities || {})
+    capabilities = created.capabilities || {}
     sessionId = created.sessionId
     return {
       sessionId,
-      capabilities: created.capabilities || {},
+      capabilities,
       request,
       close() {
         if (!closed && socket.readyState === WebSocket.OPEN) {
