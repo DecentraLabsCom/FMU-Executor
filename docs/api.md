@@ -146,7 +146,7 @@ including `exp` when provided by Gateway).
 | `sim.reset` | `sim.state` | Recreates the FMU instance with the original initialization options. |
 | `sim.step` | `sim.outputs` | Advances by `deltaT`; legacy `stepSize` is accepted. The response includes FMI event/early-return/termination flags and a step `sequence` for ordering same-time event samples. |
 | `sim.runUntil` | `sim.outputs` | Advances to `time`; legacy `targetTime` is accepted. Optional `stepSize`. |
-| `sim.advance` | `sim.samples` | Advances toward `targetTime` and returns bounded intermediate samples; optional `stepSize`, `maxSamples` (1–256), `maxComputeMs` (1–1000, soft), `outputSampleEverySteps`, `outputVariables` and `inputSchedule`. |
+| `sim.advance` | `sim.samples` | Advances toward `targetTime` and returns bounded intermediate samples; optional `stepSize`, `maxSamples` (1–256), `maxComputeMs` (1–1000, soft), `outputSampleEverySteps`, `outputVariables`, `inputValues` and `inputSchedule`. Supports `external` mode when `currentCommunicationPoint` matches the current simulation time and the target does not exceed `stopTime`. |
 | `sim.setInputs` | `sim.inputs.updated` | `values` map keyed by model variable name. |
 | `sim.getOutputs` | `sim.outputs` | Optional `variables` array; legacy `valueReferences` accepted. |
 | `sim.subscribeOutputs` | `sim.subscribed` | Optional `variables`, `periodMs`, `maxBatchSize` and `maxHz`. |
@@ -170,7 +170,7 @@ adds `maxComputeMs` and `computeBudgetOverrunMs`. Its frame size remains below a
 conservative 1 MB budget; the Executor can reduce the returned batch size when
 output names are long. Session capabilities advertise `advanceSamples`,
 `advanceComputeBudget`, `advanceSampleSequences`, `maxOutputHz`, and
-`inputUpdateQuota`. The latter reports the sliding-window and daily write
+`advanceInputValues` and `inputUpdateQuota`. The latter reports the sliding-window and daily write
 limits, maximum payload size, and maximum scheduled events and bytes accepted
 per `sim.advance`.
 
@@ -187,11 +187,15 @@ integration sample while still executing each FMI step. The final sample,
 event/early-return samples and a sample at a compute-budget stop are also
 included. The request must still fit within `maxSamples` and the frame budget.
 `outputVariables` can select named FMU outputs to reduce each sample.
-`inputSchedule` can carry up to the advertised `maxScheduledEventsPerAdvance`
-ordered, step-aligned timed writes (bounded by 256 KiB encoded) for that
-advance window; the Executor validates every write against the session's
-variable permissions and applies it at its scheduled model time while
-advancing. Scheduled writes share the session's realtime input quotas.
+`inputValues` applies a runtime write set at the current simulation time before
+the first step. It counts as one input update and does not need to align with
+the global step grid, which lets FMI clients couple inputs to their chosen
+communication points. `inputSchedule` can carry up to the advertised
+`maxScheduledEventsPerAdvance` ordered, step-aligned timed writes for that
+advance window. `inputValues` and `inputSchedule` share the event and encoded
+byte bounds; the Executor validates every write against the session's variable
+permissions and applies it at its scheduled model time while advancing. These
+writes share the session's realtime input quotas.
 `inputEventsApplied` reports the consumed prefix; only that prefix consumes
 quota, so clients can resend the remaining events without charging them twice.
 Each sample has a monotonically increasing `sequence` and may share its

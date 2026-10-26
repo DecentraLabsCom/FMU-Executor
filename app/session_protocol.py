@@ -31,6 +31,7 @@ def _session_capabilities() -> dict[str, Any]:
         "setInputs": True,
         "streamOutputs": True,
         "advanceSamples": True,
+        "advanceInputValues": True,
         "advanceComputeBudget": True,
         "advanceSampleSequences": True,
         "maxOutputHz": config.MAX_OUTPUT_SUBSCRIPTION_HZ,
@@ -427,22 +428,30 @@ async def handle_ws_message(
                 or not 1 <= max_compute_ms <= MAX_ADVANCE_COMPUTE_MS
             ):
                 raise ValueError(f"maxComputeMs must be between 1 and {MAX_ADVANCE_COMPUTE_MS} milliseconds")
-            if session._time_mode == "external":
-                raise ValueError("sim.advance requires simtime or realtime mode")
-
             input_schedule = msg.get("inputSchedule", [])
-            if not isinstance(input_schedule, list) or len(input_schedule) > MAX_ADVANCE_INPUT_EVENTS:
-                raise ValueError("inputSchedule exceeds the event limit")
-            try:
-                encoded_schedule = json.dumps(input_schedule, separators=(",", ":"), allow_nan=False)
-            except (TypeError, ValueError) as exc:
-                raise ValueError("inputSchedule is invalid") from exc
-            if len(encoded_schedule.encode("utf-8")) > MAX_ADVANCE_INPUT_BYTES:
-                raise ValueError("inputSchedule exceeds the byte limit")
+            input_values = msg.get("inputValues", {})
+            if not isinstance(input_values, dict):
+                raise ValueError("inputValues must be an object")
+            if (
+                not isinstance(input_schedule, list)
+                or len(input_schedule) + bool(input_values) > MAX_ADVANCE_INPUT_EVENTS
+            ):
+                raise ValueError("Advance input updates exceed the event limit")
 
             effective_step_size = step_size if step_size is not None else session._step_size
             if effective_step_size <= 0:
                 raise ValueError("stepSize must be positive")
+            if session._time_mode == "external":
+                current_point = msg.get("currentCommunicationPoint")
+                if current_point is None:
+                    raise ValueError("currentCommunicationPoint is required in external-advance mode")
+                current_point = services.strict_number(current_point, "currentCommunicationPoint")
+                current_tolerance = max(1e-12, abs(session._time) * 1e-12)
+                if abs(current_point - session._time) > current_tolerance:
+                    raise ValueError("currentCommunicationPoint does not match simulation time")
+                tolerance = max(1e-12, abs(session._stop_time) * 1e-12)
+                if target_time > session._stop_time + tolerance:
+                    raise ValueError("targetTime would advance past stopTime")
             schedule_start = session._time
             previous_time = schedule_start
             normalized_schedule = []
@@ -464,6 +473,16 @@ async def handle_ws_message(
                 previous_time = event_time
             if normalized_schedule:
                 normalized_schedule = await asyncio.to_thread(session.validate_input_schedule, normalized_schedule)
+
+            if input_values:
+                normalized_input_values = await asyncio.to_thread(session.validate_inputs, input_values)
+                normalized_schedule.insert(0, {"time": schedule_start, "values": normalized_input_values})
+            try:
+                encoded_schedule = json.dumps(normalized_schedule, separators=(",", ":"), allow_nan=False)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("Advance input updates are invalid") from exc
+            if len(encoded_schedule.encode("utf-8")) > MAX_ADVANCE_INPUT_BYTES:
+                raise ValueError("Advance input updates exceed the byte limit")
 
             output_refs = None
             output_variables = msg.get("outputVariables")

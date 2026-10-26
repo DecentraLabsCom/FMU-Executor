@@ -87,7 +87,7 @@ options or initial inputs.
 |---|---|
 | `simtime` | Automatic sessions advance as fast as the FMU can run. |
 | `realtime` | Model time is paced against wall-clock time using `playbackSpeed` (default `1`, allowed range `0.1–100`). |
-| `external` | Automatic start, resume and `runUntil` are disabled. The client advances with `sim.step` and provides the current `currentCommunicationPoint`. |
+| `external` | Automatic start, resume and `runUntil` are disabled. The client advances with `sim.step` or `sim.advance` and chooses each communication point. |
 
 Start time, stop time and step size come from the request or the FMU's declared
 default experiment where available. Requests must have a finite stop time
@@ -99,6 +99,9 @@ Executor before returning a step. Step responses include the last successful
 simulation time, early-return and termination flags, and whether an event
 occurred. `sim.advance` returns a bounded set of intermediate samples in one
 request; see the [WebSocket API reference](api.md#realtime-websocket-protocol).
+In `external` mode, `sim.advance` may not target a time beyond `stopTime`.
+`inputValues` applies one write set at the current communication point before
+the advance, without requiring it to align to the model's default step grid.
 Apps with high-rate timed inputs can send a bounded `inputSchedule` with each
 advance and use `outputSampleEverySteps` to keep integration steps separate
 from the rate at which results cross the WebSocket.
@@ -106,7 +109,7 @@ from the rate at which results cross the WebSocket.
 Automatic progress messages are throttled independently of `stepSize`.
 Realtime output reads share the configured per-session rate cap across output
 subscriptions, direct `sim.getOutputs` calls, and output responses from
-`sim.step` and `sim.runUntil`. A subscription may request a lower `periodMs` or
+`sim.step`, `sim.advance` and `sim.runUntil`. A subscription may request a lower `periodMs` or
 `maxHz`, but cannot exceed the configured cap. A read that arrives too soon
 returns a retryable `OUTPUT_READ_RATE_LIMITED` error with `retryAfterMs`. After
 that delay, retry through Gateway with a new `requestId`; Gateway replays

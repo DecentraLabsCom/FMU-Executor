@@ -473,9 +473,11 @@ class FmuSession:
             raise ValueError("ADVANCE_SAMPLE_LIMIT_EXCEEDED")
 
         outputs = self.get_outputs(output_refs)["outputs"]
-        if any(not isinstance(value, (bool, int, float)) for value in outputs.values()):
-            raise ValueError("Batched samples require scalar FMI outputs")
-        sample_bound = 256 + sum(len(json.dumps(name)) + 64 for name in outputs)
+        try:
+            encoded_outputs = json.dumps(outputs, separators=(",", ":"), allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Batched outputs must be JSON-compatible FMI values") from exc
+        sample_bound = 256 + len(encoded_outputs.encode("utf-8"))
         safe_count = min(max_samples, 900_000 // sample_bound)
         if safe_count < 1:
             raise ValueError("One output sample exceeds the WebSocket frame budget")
