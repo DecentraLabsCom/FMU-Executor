@@ -23,7 +23,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Iterator
 from uuid import uuid4
 
-from . import config
+from . import config, engine
 from .isolation import (
     WindowsWorkerJob,
     WorkerIsolationError,
@@ -300,12 +300,17 @@ def _realtime_session_worker(
                     "snapshot": _realtime_snapshot(session, include_model=method == "load"),
                 })
             except Exception as exc:
-                connection.send({
+                failure = {
                     "requestId": request_id,
                     "ok": False,
                     "error": str(exc) or "FMU worker command failed",
+                    "errorType": type(exc).__name__,
                     "snapshot": _realtime_snapshot(session, include_model=method == "load"),
-                })
+                }
+                applied_events = getattr(exc, "input_events_applied", None)
+                if type(applied_events) is int and applied_events >= 0:
+                    failure["inputEventsApplied"] = applied_events
+                connection.send(failure)
     except (EOFError, OSError):
         pass
     except WorkerIsolationError:
@@ -540,7 +545,18 @@ class RealtimeSession:
                     raise ProcessExecutionError("FMU realtime worker returned an invalid response", retryable=True)
                 self._apply_snapshot(response.get("snapshot"))
                 if not response.get("ok"):
-                    raise RuntimeError(str(response.get("error") or "FMU realtime command failed"))
+                    error = str(response.get("error") or "FMU realtime command failed")
+                    if method == "advance" and response.get("errorType") in {
+                        "AdvancePreExecutionError",
+                        "AdvanceExecutionError",
+                    }:
+                        applied_events = response.get("inputEventsApplied", 0)
+                        if type(applied_events) is int and applied_events >= 0:
+                            error_type = response.get("errorType")
+                            if error_type == "AdvancePreExecutionError":
+                                raise engine.AdvancePreExecutionError(error, applied_events)
+                            raise engine.AdvanceExecutionError(error, applied_events)
+                    raise RuntimeError(error)
                 return response.get("result")
             except (EOFError, OSError) as exc:
                 self._stop_process()

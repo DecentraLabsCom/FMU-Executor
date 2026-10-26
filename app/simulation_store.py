@@ -232,18 +232,43 @@ class SimulationStore:
             )
             return used + count
 
-    def reserve_input_update(self, scope_key: str, access_key: str, payload_bytes: int) -> dict[str, int]:
+    def reserve_input_update(
+        self,
+        scope_key: str,
+        access_key: str,
+        payload_bytes: int,
+        *,
+        maximum_window_count: int | None = None,
+        window_seconds: int | None = None,
+    ) -> dict[str, int]:
         """Debit input update budgets independently from simulation scenarios."""
-        return self._reserve_input_updates(scope_key, access_key, [payload_bytes], reserve_for_schedule=False)
+        return self._reserve_input_updates(
+            scope_key,
+            access_key,
+            [payload_bytes],
+            reserve_for_schedule=False,
+            maximum_window_count=maximum_window_count,
+            window_seconds=window_seconds,
+        )
 
     def reserve_input_updates(
         self,
         scope_key: str,
         access_key: str,
         payload_sizes: list[int],
+        *,
+        maximum_window_count: int | None = None,
+        window_seconds: int | None = None,
     ) -> dict[str, Any]:
         """Reserve quota for timed writes until an advance reports its applied prefix."""
-        return self._reserve_input_updates(scope_key, access_key, payload_sizes, reserve_for_schedule=True)
+        return self._reserve_input_updates(
+            scope_key,
+            access_key,
+            payload_sizes,
+            reserve_for_schedule=True,
+            maximum_window_count=maximum_window_count,
+            window_seconds=window_seconds,
+        )
 
     def _reserve_input_updates(
         self,
@@ -252,17 +277,33 @@ class SimulationStore:
         payload_sizes: list[int],
         *,
         reserve_for_schedule: bool,
+        maximum_window_count: int | None,
+        window_seconds: int | None,
     ) -> dict[str, Any]:
         if not isinstance(payload_sizes, list) or not payload_sizes:
             raise ValueError("At least one input update is required")
         if any(type(size) is not int or size < 0 for size in payload_sizes):
             raise ValueError("Input payload sizes must be non-negative integers")
         update_count = len(payload_sizes)
-        if reserve_for_schedule and update_count > config.MAX_INPUT_UPDATES_PER_WINDOW:
+        effective_window_count = (
+            config.MAX_INPUT_UPDATES_PER_WINDOW
+            if maximum_window_count is None
+            else maximum_window_count
+        )
+        effective_window_seconds = (
+            config.INPUT_UPDATE_WINDOW_SECONDS
+            if window_seconds is None
+            else window_seconds
+        )
+        if type(effective_window_count) is not int or not 1 <= effective_window_count <= config.MAX_INPUT_UPDATES_PER_WINDOW:
+            raise ValueError("Maximum input updates per window is outside the platform range")
+        if type(effective_window_seconds) is not int or effective_window_seconds != config.INPUT_UPDATE_WINDOW_SECONDS:
+            raise ValueError("Input update window must match the platform window")
+        if reserve_for_schedule and update_count > effective_window_count:
             raise InputUpdateQuotaExceededError(
                 "INPUT_UPDATE_BATCH_LIMIT",
-                config.MAX_INPUT_UPDATES_PER_WINDOW,
-                max_batch_size=config.MAX_INPUT_UPDATES_PER_WINDOW,
+                effective_window_count,
+                max_batch_size=effective_window_count,
             )
         for payload_bytes in payload_sizes:
             if payload_bytes > config.MAX_INPUT_UPDATE_BYTES:
@@ -271,7 +312,7 @@ class SimulationStore:
         model_key = hashlib.sha256(access_key.encode("utf-8")).hexdigest()
         usage_day = datetime.now(timezone.utc).date().isoformat()
         now = time.time()
-        window_start = now - config.INPUT_UPDATE_WINDOW_SECONDS
+        window_start = now - effective_window_seconds
         reservation_id = uuid.uuid4().hex if reserve_for_schedule else None
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -285,9 +326,8 @@ class SimulationStore:
                 "WHERE scope_key=? AND model_key=? AND created_at>=?",
                 (scope_key, model_key, window_start),
             ).fetchone()["count"])
-            maximum_window_count = config.MAX_INPUT_UPDATES_PER_WINDOW
-            if recent + update_count > maximum_window_count:
-                events_to_expire = recent + update_count - maximum_window_count
+            if recent + update_count > effective_window_count:
+                events_to_expire = recent + update_count - effective_window_count
                 earliest_required_expiry = db.execute(
                     "SELECT created_at FROM input_update_events "
                     "WHERE scope_key=? AND model_key=? AND created_at>=? "
@@ -296,11 +336,11 @@ class SimulationStore:
                 ).fetchone()
                 retry_after_ms = max(
                     1,
-                    math.ceil((float(earliest_required_expiry["created_at"]) + config.INPUT_UPDATE_WINDOW_SECONDS - now) * 1000),
+                    math.ceil((float(earliest_required_expiry["created_at"]) + effective_window_seconds - now) * 1000),
                 ) if earliest_required_expiry else None
                 raise InputUpdateQuotaExceededError(
                     "INPUT_UPDATE_RATE_LIMIT",
-                    max(0, maximum_window_count - recent),
+                    max(0, effective_window_count - recent),
                     retry_after_ms=retry_after_ms,
                 )
             row = db.execute(

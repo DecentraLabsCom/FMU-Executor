@@ -155,6 +155,13 @@ including `exp` when provided by Gateway).
 | `session.ping` / `ping` | `session.pong` | Liveness check. |
 | `session.terminate` | `session.closed` | Terminates the session and its temporary state. |
 
+Runtime writes accept JSON integer values for integer FMI variables and
+canonical decimal strings where a client needs lossless 64-bit transport.
+`Binary` values use base64 strings; array variables use arrays of the same
+transport representation. The Executor decodes these values only after
+validating the request and calculates input quotas from the original JSON
+representation.
+
 Subscribed output events use `type: "sim.outputs"` and include `sessionId`,
 monotonic `seq`, `simTime`, `values`, `batchSize` and `dropped`. Errors use
 `type: "error"`, a short `code`, a safe `message` and `retryable`. Temporary
@@ -172,7 +179,8 @@ output names are long. Session capabilities advertise `advanceSamples`,
 `advanceComputeBudget`, `advanceSampleSequences`, `maxOutputHz`, and
 `advanceInputValues` and `inputUpdateQuota`. The latter reports the sliding-window and daily write
 limits, maximum payload size, and maximum scheduled events and bytes accepted
-per `sim.advance`.
+per `sim.advance`. `maxUpdatesPerWindow` reflects the effective signed
+per-resource policy, bounded by the Station hard maximum.
 
 The `maxComputeMs` budget is soft and is checked between FMI steps. It cannot
 interrupt a long-running `doStep()`: the Executor returns after that step and

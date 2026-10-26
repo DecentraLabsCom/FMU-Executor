@@ -124,7 +124,7 @@ secret to Gateway's `FMU_STATION_INTERNAL_TOKEN`.
 | `FMU_MAX_INPUT_UPDATE_BYTES` | `65,536` | `1,024–1 MiB` | One `sim.setInputs` payload or one scheduled event's values. |
 | `FMU_MAX_INPUT_UPDATES_PER_DAY` | `100,000` | `1–1,000,000` | Input writes per reservation and FMU per UTC day, including timed writes. |
 | `FMU_MAX_INPUT_UPDATE_BYTES_PER_DAY` | `64 MiB` | `64 KiB–2 GiB` | Input payload bytes per reservation and FMU per UTC day. |
-| `FMU_MAX_INPUT_UPDATES_PER_WINDOW` | `30` | `1–10,000` | Input write count in the sliding window, including timed writes. |
+| `FMU_MAX_INPUT_UPDATES_PER_WINDOW` | `10,000` | `1–10,000` | Station hard maximum and default for input writes in one sliding window, including timed writes. A signed `fmuExecutionPolicy.maxInputUpdatesPerWindow` can lower it per resource. |
 | `FMU_INPUT_UPDATE_WINDOW_SECONDS` | `10` | `1–3,600` | Sliding window used for input write throttling. |
 | `FMU_MAX_OUTPUT_SUBSCRIPTION_HZ` | `60` | `1–1,000` | Per-session cap for realtime output reads and samples. |
 | `FMU_MAX_OUTPUT_SUBSCRIPTION_BATCH` | `256` | `1–4,096` | Retained samples in one subscription batch. |

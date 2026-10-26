@@ -19,7 +19,7 @@ MAX_ADVANCE_INPUT_BYTES = 256 * 1024
 MAX_ADVANCE_COMPUTE_MS = 1000
 
 
-def _session_capabilities() -> dict[str, Any]:
+def _session_capabilities(max_input_updates_per_window: int) -> dict[str, Any]:
     return {
         "modelDescribe": True,
         "getState": True,
@@ -36,12 +36,12 @@ def _session_capabilities() -> dict[str, Any]:
         "advanceSampleSequences": True,
         "maxOutputHz": config.MAX_OUTPUT_SUBSCRIPTION_HZ,
         "inputUpdateQuota": {
-            "maxUpdatesPerWindow": config.MAX_INPUT_UPDATES_PER_WINDOW,
+            "maxUpdatesPerWindow": max_input_updates_per_window,
             "windowMs": config.INPUT_UPDATE_WINDOW_SECONDS * 1000,
             "maxUpdateBytes": config.MAX_INPUT_UPDATE_BYTES,
             "maxUpdatesPerDay": config.MAX_INPUT_UPDATES_PER_DAY,
             "maxUpdateBytesPerDay": config.MAX_INPUT_UPDATE_BYTES_PER_DAY,
-            "maxScheduledEventsPerAdvance": min(MAX_ADVANCE_INPUT_EVENTS, config.MAX_INPUT_UPDATES_PER_WINDOW),
+            "maxScheduledEventsPerAdvance": min(MAX_ADVANCE_INPUT_EVENTS, max_input_updates_per_window),
             "maxScheduleBytesPerAdvance": MAX_ADVANCE_INPUT_BYTES,
         },
         "timeMode": ["simtime", "realtime", "external"],
@@ -172,7 +172,7 @@ async def handle_ws_message(
             "serverTime": time.time(),
             "expiresAt": new_session.expires_at,
             "fmuSha256": model_sha256,
-            "capabilities": _session_capabilities(),
+            "capabilities": _session_capabilities(policy["maxInputUpdatesPerWindow"]),
             "_session": new_session,
         }
 
@@ -210,13 +210,14 @@ async def handle_ws_message(
         )
         if attach_access_key != attached_session.access_key:
             raise HTTPException(403, "FORBIDDEN – accessKey mismatch")
+        attach_policy = services.model_execution_policy(attached_session.gateway_context)
         return {
             "type": "session.attached",
             "sessionId": attached_session.session_id,
             "serverTime": time.time(),
             "expiresAt": attached_session.expires_at,
             "state": attached_session.state,
-            "capabilities": _session_capabilities(),
+            "capabilities": _session_capabilities(attach_policy["maxInputUpdatesPerWindow"]),
             "_session": attached_session,
         }
 
@@ -441,6 +442,8 @@ async def handle_ws_message(
             effective_step_size = step_size if step_size is not None else session._step_size
             if effective_step_size <= 0:
                 raise ValueError("stepSize must be positive")
+            if target_time <= session._time + 1e-15:
+                raise ValueError("targetTime must be later than the current simulation time")
             if session._time_mode == "external":
                 current_point = msg.get("currentCommunicationPoint")
                 if current_point is None:
@@ -454,6 +457,7 @@ async def handle_ws_message(
                     raise ValueError("targetTime would advance past stopTime")
             schedule_start = session._time
             previous_time = schedule_start
+            wire_schedule = []
             normalized_schedule = []
             for event in input_schedule:
                 if not isinstance(event, dict) or set(event) != {"time", "values"}:
@@ -469,6 +473,7 @@ async def handle_ws_message(
                         or event_time < previous_time - 1e-12
                         or abs(aligned_time - event_time) > tolerance):
                     raise ValueError("inputSchedule times must be ordered, within the advance interval and aligned to the model step")
+                wire_schedule.append({"time": event_time, "values": values})
                 normalized_schedule.append({"time": event_time, "values": values})
                 previous_time = event_time
             if normalized_schedule:
@@ -477,12 +482,25 @@ async def handle_ws_message(
             if input_values:
                 normalized_input_values = await asyncio.to_thread(session.validate_inputs, input_values)
                 normalized_schedule.insert(0, {"time": schedule_start, "values": normalized_input_values})
+                wire_schedule.insert(0, {"time": schedule_start, "values": input_values})
             try:
-                encoded_schedule = json.dumps(normalized_schedule, separators=(",", ":"), allow_nan=False)
+                encoded_schedule = json.dumps(wire_schedule, separators=(",", ":"), allow_nan=False)
             except (TypeError, ValueError) as exc:
                 raise ValueError("Advance input updates are invalid") from exc
             if len(encoded_schedule.encode("utf-8")) > MAX_ADVANCE_INPUT_BYTES:
                 raise ValueError("Advance input updates exceed the byte limit")
+            if normalized_schedule:
+                expected_samples = engine.estimate_advance_samples(
+                    session._time,
+                    target_time,
+                    session._stop_time,
+                    effective_step_size,
+                    output_sample_every_steps,
+                )
+                if expected_samples < 1:
+                    raise ValueError("targetTime must advance at least one model sample")
+                if expected_samples > max_samples:
+                    raise ValueError("ADVANCE_SAMPLE_LIMIT_EXCEEDED")
 
             output_refs = None
             output_variables = msg.get("outputVariables")
@@ -509,7 +527,7 @@ async def handle_ws_message(
                     services.reserve_input_updates,
                     session.gateway_context,
                     access_key,
-                    normalized_schedule,
+                    wire_schedule,
                 )
             try:
                 result = await asyncio.to_thread(
@@ -522,6 +540,16 @@ async def handle_ws_message(
                     output_refs=output_refs,
                     max_compute_ms=max_compute_ms,
                 )
+            except (engine.AdvancePreExecutionError, engine.AdvanceExecutionError) as exc:
+                if reservation:
+                    await asyncio.to_thread(
+                        services.settle_input_updates,
+                        session.gateway_context,
+                        access_key,
+                        reservation["reservationId"],
+                        exc.input_events_applied,
+                    )
+                raise
             except process_runner.OutputReadRateLimitError:
                 if reservation:
                     await asyncio.to_thread(

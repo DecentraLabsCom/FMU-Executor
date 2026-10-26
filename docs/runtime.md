@@ -136,14 +136,18 @@ separately from `reservation_ended`. The short-lived WebSocket ticket does not
 define the reservation end.
 
 The signed Gateway claims may include `fmuExecutionPolicy`. Executor accepts
-only `maxDailyScenarios`, `maxSteps`, `maxCpuSeconds`, `maxMemoryMiB` and
-`maxResultBytes`; values are validated and clamped to Station hard limits.
+`maxDailyScenarios`, `maxSteps`, `maxCpuSeconds`, `maxMemoryMiB`,
+`maxResultBytes` and `maxInputUpdatesPerWindow`; values are validated against
+Station hard limits. The per-resource input-update limit can be set by the
+trusted ticket issuer and cannot exceed `FMU_MAX_INPUT_UPDATES_PER_WINDOW`.
 Omitted values use Station defaults.
 
 Scenario starts and runtime input updates use separate budgets. By default,
 scenario starts are limited per reservation and FMU per UTC day. Realtime
 input updates are tracked by reservation and FMU with daily count and byte
-budgets, a short-window burst limit, and a per-update payload cap. A non-empty
+budgets, a short-window burst limit, and a per-update payload cap. The default
+short-window burst uses the Station maximum; a signed per-resource policy may
+lower it. A non-empty
 `sim.setInputs` requires a reservation scope (`labId` and `reservationKey`) and
 does not spend a simulation scenario. All exact defaults and allowed ranges
 are in the [configuration reference](configuration.md).

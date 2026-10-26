@@ -44,7 +44,14 @@ def model_execution_policy(context: dict[str, Any] | None) -> dict[str, int]:
     raw = claims.get("fmuExecutionPolicy", {}) if isinstance(claims, dict) else {}
     if not isinstance(raw, dict):
         raise HTTPException(status_code=403, detail="INVALID_FMU_EXECUTION_POLICY")
-    allowed = {"maxDailyScenarios", "maxSteps", "maxCpuSeconds", "maxMemoryMiB", "maxResultBytes"}
+    allowed = {
+        "maxDailyScenarios",
+        "maxSteps",
+        "maxCpuSeconds",
+        "maxMemoryMiB",
+        "maxResultBytes",
+        "maxInputUpdatesPerWindow",
+    }
     if set(raw) - allowed:
         raise HTTPException(status_code=403, detail="INVALID_FMU_EXECUTION_POLICY")
     maxima = {
@@ -53,6 +60,7 @@ def model_execution_policy(context: dict[str, Any] | None) -> dict[str, int]:
         "maxCpuSeconds": config.WORKER_CPU_SECONDS,
         "maxMemoryMiB": config.WORKER_MEMORY_BYTES // (1024 * 1024),
         "maxResultBytes": config.MAX_STORED_RESULT_BYTES,
+        "maxInputUpdatesPerWindow": config.MAX_INPUT_UPDATES_PER_WINDOW,
     }
     defaults = {
         "maxDailyScenarios": config.MAX_SCENARIOS_PER_RESERVATION_PER_DAY,
@@ -60,6 +68,7 @@ def model_execution_policy(context: dict[str, Any] | None) -> dict[str, int]:
         "maxCpuSeconds": config.WORKER_CPU_SECONDS,
         "maxMemoryMiB": config.WORKER_MEMORY_BYTES // (1024 * 1024),
         "maxResultBytes": config.MAX_STORED_RESULT_BYTES,
+        "maxInputUpdatesPerWindow": config.MAX_INPUT_UPDATES_PER_WINDOW,
     }
     policy = {}
     for key, default in defaults.items():

@@ -536,7 +536,14 @@ def _reserve_input_update(context: dict[str, Any] | None, access_key: str, value
         payload_bytes = len(
             json.dumps(values, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
         )
-        _simulation_store.reserve_input_update(scope_key, access_key, payload_bytes)
+        policy = model_execution_policy(context)
+        _simulation_store.reserve_input_update(
+            scope_key,
+            access_key,
+            payload_bytes,
+            maximum_window_count=policy["maxInputUpdatesPerWindow"],
+            window_seconds=config.INPUT_UPDATE_WINDOW_SECONDS,
+        )
     except InputUpdateQuotaExceededError as exc:
         raise _input_update_quota_exception(exc) from exc
     except (TypeError, ValueError) as exc:
@@ -556,7 +563,14 @@ def _reserve_input_updates(
             len(json.dumps(event["values"], separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8"))
             for event in events
         ]
-        return _simulation_store.reserve_input_updates(scope_key, access_key, payload_sizes)
+        policy = model_execution_policy(context)
+        return _simulation_store.reserve_input_updates(
+            scope_key,
+            access_key,
+            payload_sizes,
+            maximum_window_count=policy["maxInputUpdatesPerWindow"],
+            window_seconds=config.INPUT_UPDATE_WINDOW_SECONDS,
+        )
     except InputUpdateQuotaExceededError as exc:
         raise _input_update_quota_exception(exc) from exc
     except (KeyError, TypeError, ValueError) as exc:
