@@ -123,25 +123,26 @@ export function observeAdaptiveBatch(controller, {
   const computeCostPerSample = computePerSampleEwmaMs ?? MIN_SAMPLE_COST_MS
   const transferCostPerSample = (transfer.transferMsPerByte || 0) * (bytesPerSampleEwma || 0)
   const totalMarginalSampleCost = Math.max(MIN_SAMPLE_COST_MS, computeCostPerSample + transferCostPerSample)
-  const fixedLatencyMs = Math.max(
-    fixedLatencyEwmaMs ?? transportMs ?? 0,
-    interactionDelayEwmaMs ?? 0,
-  )
+  const fixedLatencyMs = fixedLatencyEwmaMs ?? transportMs ?? 0
   const presentationAllowanceMs = consumerDelayEwmaMs ?? controller.presentationReserveMs
-  const responseBudgetMs = controller.targetResponseMs
+  const targetSampleBudgetMs = controller.targetResponseMs
     - fixedLatencyMs
     - presentationAllowanceMs
     - controller.safetyMarginMs
-  const targetReachable = responseBudgetMs > 0
-  const latencyLimitedSamples = targetReachable
-    ? Math.floor(responseBudgetMs / totalMarginalSampleCost)
-    : 1
+  const targetReachable = targetSampleBudgetMs >= totalMarginalSampleCost
+  const fallbackSampleBudgetMs = Math.max(
+    0,
+    fixedLatencyMs - presentationAllowanceMs - controller.safetyMarginMs,
+  )
+  const latencyLimitedSamples = Math.max(1, Math.floor(
+    (targetReachable ? targetSampleBudgetMs : fallbackSampleBudgetMs) / totalMarginalSampleCost,
+  ))
   const computeLimitedSamples = computeCostPerSample > 0
     ? Math.floor(controller.maxComputeMs / computeCostPerSample)
     : controller.maxSamples
   const desiredSampleCount = Math.max(1, Math.min(
     controller.maxSamples,
-    targetReachable ? latencyLimitedSamples : 1,
+    latencyLimitedSamples,
     Math.max(1, computeLimitedSamples),
   ))
   const nextSampleCount = desiredSampleCount > controller.sampleCount

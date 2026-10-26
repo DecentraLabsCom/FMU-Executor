@@ -1,4 +1,5 @@
 import { createProtocolId, isValidConnectionConfig, MAX_SAMPLE_BATCH_JSON_CHARS } from './index.js'
+import { getInputUpdateQuota } from './input-update-quota.js'
 
 const failure = (message, code = 'FMU_CONNECTION_FAILED') => Object.assign(new Error(message), { code })
 
@@ -49,7 +50,12 @@ export async function connectFmuSession(connection, { signal, timeoutMs = 120_00
       pending.delete(response.requestId)
       clearTimeout(item.timeout)
       if (response.type === 'error') {
-        item.reject(Object.assign(failure(response.message || 'The FMU operation failed.', response.code), { retryAfterMs: response.retryAfterMs }))
+        item.reject(Object.assign(failure(response.message || 'The FMU operation failed.', response.code), {
+          retryAfterMs: response.retryAfterMs,
+          retryable: response.retryable,
+          remaining: response.remaining,
+          maxBatchSize: response.maxBatchSize,
+        }))
       } else if (response.type !== item.expected) {
         item.reject(failure('The FMU returned an unexpected response.', 'INVALID_FMU_RESPONSE'))
       } else item.resolve(response)
@@ -78,6 +84,7 @@ export async function connectFmuSession(connection, { signal, timeoutMs = 120_00
       labId: connection.labId, reservationKey: connection.reservationKey, sessionTicket: connection.sessionTicket,
     })
     if (typeof created.sessionId !== 'string' || !created.sessionId) throw failure('Missing FMU session identifier.')
+    getInputUpdateQuota(created.capabilities || {})
     sessionId = created.sessionId
     return {
       sessionId,

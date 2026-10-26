@@ -28,6 +28,7 @@ from fmpy.fmi1 import FMICallException
 from fmpy.fmi2 import fmi2Discard, fmi2LastSuccessfulTime, fmi2Pending, fmi2Terminated
 
 from . import config
+from .simulation_defaults import DEFAULT_STEP_SIZE, resolve_simulation_time_options
 
 logger = logging.getLogger(__name__)
 
@@ -134,11 +135,11 @@ class FmuSession:
         if self._md.coSimulation is None:
             raise RuntimeError("FMU does not support Co-Simulation")
 
-        self._step_size = step_size if step_size is not None else (
-            float(self._md.defaultExperiment.stepSize)
-            if self._md.defaultExperiment and self._md.defaultExperiment.stepSize
-            else 0.001
-        )
+        default_experiment = self._md.defaultExperiment
+        default_step_size = getattr(default_experiment, "stepSize", None)
+        self._step_size = step_size if step_size is not None else resolve_simulation_time_options(
+            {"defaultStepSize": default_step_size},
+        )["stepSize"]
         self._start_time = float(start_time)
         self._stop_time = float(stop_time)
         if not all(math.isfinite(value) for value in (self._start_time, self._stop_time, self._step_size)):

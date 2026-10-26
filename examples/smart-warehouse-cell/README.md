@@ -111,10 +111,11 @@ Build the browser app bundle from the installed Marketplace Three.js package:
 python build_webapp.py --three-root ../../../Marketplace/node_modules/three
 ```
 
-The builder copies the low-level protocol (`sdk/index.js`) and optional client
-(`sdk/client.js`) and direct FMU transport (`sdk/fmu-client.js`) from the
-canonical Marketplace SDK package and checks that
-the app's local module and asset references are present in the generated ZIP.
+The builder refreshes every JavaScript module in `webapp/sdk/` from the canonical
+Marketplace package, including the adaptive batch controller and its input
+quota helper, before packaging. It removes stale JavaScript modules and checks
+that the app's local module and asset references are present in the generated
+ZIP. Rebuild the webapp bundle after updating the Marketplace SDK.
 The browser contract also accepts apps that implement its messages directly.
 
 Both FMU builds embed the default Three.js-exported GLB in `resources/` and ship

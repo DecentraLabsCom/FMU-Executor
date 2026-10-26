@@ -9,6 +9,10 @@ import {
   getAdaptiveBatchSize,
   observeAdaptiveBatch,
 } from './batch-controller.js'
+import {
+  getInputUpdateIntervalMs,
+  getInputUpdateRetryDelayMs,
+} from './input-update-quota.js'
 
 const errorWithCode = (message, code) => Object.assign(new Error(message), { code })
 const VALID_ADVANCE_STOP_REASONS = new Set([
@@ -120,18 +124,24 @@ export function createDigitalTwinAppClient({
   }
   async function operation(run, type, expected, payload) {
     const readsOutputs = ['sim.getOutputs', 'sim.advance'].includes(type)
+    const writesInputs = type === 'sim.setInputs'
     const tracksAdaptiveResponse = run.batchPolicy === 'adaptive' && type === 'sim.advance'
     const operationStartedAt = performance.now()
     let rateLimitWaitMs = 0
     while (true) {
       run.controller.signal.throwIfAborted()
       try {
+        if (writesInputs && run.lastInputUpdateAt !== null) {
+          const waitMs = run.lastInputUpdateAt + getInputUpdateIntervalMs(run.session.capabilities) - performance.now()
+          if (waitMs > 0) await wait(Math.ceil(waitMs), run.controller.signal)
+        }
         if (readsOutputs && run.nextOutputAt > performance.now()) {
           const throttleWaitStartedAt = performance.now()
           await wait(Math.ceil(run.nextOutputAt - throttleWaitStartedAt), run.controller.signal)
           rateLimitWaitMs += performance.now() - throttleWaitStartedAt
         }
         const response = await run.session.request(type, expected, payload)
+        if (writesInputs) run.lastInputUpdateAt = performance.now()
         if (readsOutputs) {
           if (tracksAdaptiveResponse) {
             run.lastOutputMetrics = {
@@ -144,6 +154,13 @@ export function createDigitalTwinAppClient({
         return response
       }
       catch (error) {
+        const inputRetryAfterMs = writesInputs
+          ? getInputUpdateRetryDelayMs(error, run.session.capabilities)
+          : null
+        if (inputRetryAfterMs !== null) {
+          await wait(inputRetryAfterMs, run.controller.signal)
+          continue
+        }
         if (error.code !== 'OUTPUT_READ_RATE_LIMITED' || !Number.isFinite(error.retryAfterMs) || error.retryAfterMs < 1 || error.retryAfterMs > 10_000) throw error
         const retryWaitStartedAt = performance.now()
         await wait(error.retryAfterMs, run.controller.signal)
@@ -271,7 +288,7 @@ export function createDigitalTwinAppClient({
     const current = {
       runId: createProtocolId('run'), controller: new AbortController(), sampleCount: 0,
       options, inputController, batchPolicy, maxBatchSamples, adaptiveBatchOptions,
-      lastSampleSequence: null,
+      lastSampleSequence: null, lastInputUpdateAt: null,
     }
     active = current
     try {

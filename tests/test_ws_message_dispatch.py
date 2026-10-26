@@ -168,6 +168,35 @@ def test_advance_reserves_scheduled_input_quota_and_settles_only_applied_events(
     )
 
 
+def test_advance_releases_scheduled_quota_when_output_rate_limit_prevents_execution(dispatch, monkeypatch):
+    session, call = dispatch
+    schedule = [{"time": 0.1, "values": {"input": 1}}]
+    session.validate_input_schedule = Mock(side_effect=lambda events: events)
+    session.advance = Mock(side_effect=process_runner.OutputReadRateLimitError(100))
+    reserve = Mock(return_value={"reservationId": "scheduled-input-reservation"})
+    settle = Mock()
+    monkeypatch.setattr(main, "_reserve_input_updates", reserve)
+    monkeypatch.setattr(main, "_settle_input_updates", settle)
+
+    with pytest.raises(HTTPException) as error:
+        call({
+            "type": "sim.advance",
+            "targetTime": 0.2,
+            "maxSamples": 2,
+            "stepSize": 0.1,
+            "inputSchedule": schedule,
+        })
+
+    assert error.value.status_code == 429
+    session.advance.assert_called_once()
+    settle.assert_called_once_with(
+        session.gateway_context,
+        "demo.fmu",
+        "scheduled-input-reservation",
+        0,
+    )
+
+
 def test_live_session_commands_reject_invalid_shapes_and_states(dispatch):
     session, call = dispatch
     with pytest.raises(HTTPException) as exc:

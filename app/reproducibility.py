@@ -12,6 +12,7 @@ from typing import Any
 
 from . import config
 from .isolation import worker_isolation_capabilities
+from .simulation_defaults import resolve_simulation_time_options
 
 
 def canonical_sha256(value: Any) -> str:
@@ -61,11 +62,10 @@ def effective_execution_options(
             item["name"] for item in model_metadata.get("modelVariables", [])
             if item.get("causality") == "output" and isinstance(item.get("name"), str)
         ]
+    time_options = resolve_simulation_time_options(model_metadata, options)
     return {
         "backend": options.get("backend", "fmpy") or "fmpy",
-        "startTime": float(options.get("startTime", 0.0)),
-        "stopTime": float(options.get("stopTime", 1.0)),
-        "stepSize": float(options.get("stepSize", model_metadata.get("defaultStepSize") or 0.001)),
+        **{name: float(value) for name, value in time_options.items()},
         "earlyReturnAllowed": options.get("earlyReturnAllowed", early_return_default),
         "outputVariables": list(output_variables),
         "outputSampleEverySteps": options.get("outputSampleEverySteps", 1),

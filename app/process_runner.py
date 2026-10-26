@@ -34,6 +34,7 @@ from .isolation import (
     worker_process_is_alive,
 )
 from .windows_appcontainer import WindowsAppContainerProcess, delete_worker_appcontainer_profile
+from .simulation_defaults import DEFAULT_STEP_SIZE, resolve_simulation_time_options
 
 if TYPE_CHECKING:
     from .engine import OutputSubscription
@@ -349,7 +350,7 @@ class RealtimeSession:
         self._time = 0.0
         self._start_time = 0.0
         self._stop_time = 1.0
-        self._step_size = 0.001
+        self._step_size = DEFAULT_STEP_SIZE
         self._time_mode = "simtime"
         self._playback_speed = 1.0
         self._finished_reason = None
@@ -854,11 +855,11 @@ def _execute_worker(
                 config.MAX_SIMULATION_STEPS,
                 int(resource_policy.get("maxSteps", config.MAX_SIMULATION_STEPS)),
             )
-        session.load()
-        start = float(options.get("startTime", 0.0))
-        stop = float(options.get("stopTime", 1.0))
-        step = options.get("stepSize")
-        step_value = float(step) if step is not None else None
+        model_metadata = session.load()
+        time_options = resolve_simulation_time_options(model_metadata, options)
+        start = float(time_options["startTime"])
+        stop = float(time_options["stopTime"])
+        step_value = float(time_options["stepSize"])
         if probe_only:
             session.initialize(start_time=start, stop_time=stop, step_size=step_value)
             output_queue.put({"kind": "result", "payload": {"type": "fmu.probe", "success": True}})

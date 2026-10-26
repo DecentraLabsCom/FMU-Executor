@@ -26,6 +26,22 @@ def find_protocol_source() -> Path:
     raise FileNotFoundError("Marketplace digital-twin protocol SDK source was not found")
 
 
+def sync_protocol_sdk(protocol_source: Path, destination: Path) -> None:
+    """Refresh every runtime module in the companion SDK copy."""
+    source_root = protocol_source.resolve(strict=True).parent
+    sources = sorted(source_root.glob("*.js"))
+    if not sources:
+        raise FileNotFoundError(f"Marketplace protocol SDK has no JavaScript modules: {source_root}")
+
+    destination.mkdir(parents=True, exist_ok=True)
+    source_names = {source.name for source in sources}
+    for stale_module in destination.glob("*.js"):
+        if stale_module.name not in source_names:
+            stale_module.unlink()
+    for source in sources:
+        shutil.copyfile(source, destination / source.name)
+
+
 def build(three_root: Path) -> None:
     three_root = three_root.resolve(strict=True)
     index = (WEBAPP_ROOT / "index.html").read_text(encoding="utf-8")
@@ -75,11 +91,7 @@ def build(three_root: Path) -> None:
             raise FileNotFoundError(f"Three.js source file is missing: {source}")
         shutil.copyfile(source, destination)
 
-    protocol_source = find_protocol_source()
-    sdk_root = WEBAPP_ROOT / "sdk"
-    sdk_root.mkdir(exist_ok=True)
-    for filename in ("index.js", "client.js", "fmu-client.js", "batch-controller.js"):
-        shutil.copyfile(protocol_source.parent / filename, sdk_root / filename)
+    sync_protocol_sdk(find_protocol_source(), WEBAPP_ROOT / "sdk")
 
     # These examples import the package specifier `three`. Rewrite only that
     # import to the vendored module so the ZIP runs without an import map/CDN.

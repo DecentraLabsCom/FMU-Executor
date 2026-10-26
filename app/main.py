@@ -59,6 +59,7 @@ from .session_protocol import (
     SessionCommandServices,
     handle_ws_message as _dispatch_session_command,
 )
+from .simulation_defaults import resolve_simulation_time_options
 
 logger = logging.getLogger(__name__)
 
@@ -371,12 +372,7 @@ async def validate_fmu(
             }
             if report["archiveValid"] and report["modelDescriptionValid"] and report["stationCompatible"]:
                 description = fmu_storage.describe_path(path)
-                experiment = {
-                    "startTime": description.get("defaultStartTime", 0.0),
-                    "stopTime": description.get("defaultStopTime", 1.0),
-                }
-                if description.get("defaultStepSize") is not None:
-                    experiment["stepSize"] = description["defaultStepSize"]
+                experiment = resolve_simulation_time_options(description)
                 await asyncio.to_thread(
                     process_runner.run,
                     path,
@@ -642,9 +638,10 @@ def _validate_input_schedule(
         raise HTTPException(status_code=413, detail="INPUT_SCHEDULE_TOO_LARGE")
 
     try:
-        start = float(options.get("startTime", 0.0))
-        stop = float(options.get("stopTime", 1.0))
-        step = float(options.get("stepSize", model_metadata.get("defaultStepSize") or 0.001))
+        resolved_options = resolve_simulation_time_options(model_metadata, options)
+        start = float(resolved_options["startTime"])
+        stop = float(resolved_options["stopTime"])
+        step = float(resolved_options["stepSize"])
     except (TypeError, ValueError, OverflowError) as exc:
         raise HTTPException(status_code=422, detail="INVALID_INPUT_SCHEDULE") from exc
     if not all(math.isfinite(value) for value in (start, stop, step)) or step <= 0 or stop <= start:
@@ -800,7 +797,7 @@ async def run_simulation(body: SimulationBody):
                     fmu_path,
                     access_key=access_key,
                     parameters=body.parameters or {},
-                    options=body.options,
+                    options=evidence_options,
                     cancel_event=cancel_event,
                     authorization_expires_at=auth_expiry,
                     reservation_ends_at=reservation_end,
@@ -829,13 +826,13 @@ async def run_simulation(body: SimulationBody):
         if slot is None:
             raise RuntimeError("In-process FMU session was not initialized")
         slot.load()
-        start = body.options.get("startTime", 0.0)
-        stop = body.options.get("stopTime", 1.0)
-        step = body.options.get("stepSize")
+        start = evidence_options["startTime"]
+        stop = evidence_options["stopTime"]
+        step = evidence_options["stepSize"]
         slot.initialize(
-            start_time=float(start),
-            stop_time=float(stop),
-            step_size=float(step) if step is not None else None,
+            start_time=start,
+            stop_time=stop,
+            step_size=step,
             parameters=body.parameters or None,
             early_return_allowed=body.options.get("earlyReturnAllowed", False),
         )
@@ -1056,7 +1053,7 @@ async def stream_simulation(body: SimulationBody):
                     fmu_path,
                     access_key=access_key,
                     parameters=body.parameters or {},
-                    options=body.options,
+                    options=evidence_options,
                     authorization_expires_at=auth_expiry,
                     reservation_ends_at=reservation_end,
                     resource_policy=policy,
@@ -1083,19 +1080,19 @@ async def stream_simulation(body: SimulationBody):
                 if slot is None:
                     raise RuntimeError("In-process FMU session was not initialized")
                 slot.load()
-                start = body.options.get("startTime", 0.0)
-                stop = body.options.get("stopTime", 1.0)
-                step = body.options.get("stepSize")
+                start = evidence_options["startTime"]
+                stop = evidence_options["stopTime"]
+                step = evidence_options["stepSize"]
                 slot.initialize(
-                    start_time=float(start),
-                    stop_time=float(stop),
-                    step_size=float(step) if step is not None else None,
+                    start_time=start,
+                    stop_time=stop,
+                    step_size=step,
                     parameters=body.parameters or None,
                     early_return_allowed=body.options.get("earlyReturnAllowed", False),
                 )
                 for snapshot in slot.run_until_streaming(
-                    float(stop),
-                    step_size=float(step) if step is not None else None,
+                    stop,
+                    step_size=step,
                     input_schedule=input_schedule,
                 ):
                     line = encode_line(snapshot)

@@ -12,6 +12,7 @@ from typing import Any, Callable, Protocol, cast
 from fastapi import HTTPException
 
 from . import auth, config, engine, fmu_storage, process_runner
+from .simulation_defaults import resolve_simulation_time_options
 
 MAX_ADVANCE_INPUT_EVENTS = 1024
 MAX_ADVANCE_INPUT_BYTES = 256 * 1024
@@ -258,22 +259,19 @@ async def handle_ws_message(
         if not isinstance(time_mode, str) or time_mode not in {"simtime", "realtime", "external"}:
             raise HTTPException(status_code=400, detail="INVALID_TIME_MODE")
         try:
-            start_time = services.strict_number(options.get("startTime", 0.0), "startTime")
-            stop_time = services.strict_number(options.get("stopTime", 1.0), "stopTime")
-            step_value = services.strict_number(options["stepSize"], "stepSize") if options.get("stepSize") is not None else None
+            model_metadata = await asyncio.to_thread(session.load)
+            time_options = resolve_simulation_time_options(model_metadata, options)
+            start_time = services.strict_number(time_options["startTime"], "startTime")
+            stop_time = services.strict_number(time_options["stopTime"], "stopTime")
+            step_value = services.strict_number(time_options["stepSize"], "stepSize")
             playback_speed = services.strict_number(options.get("playbackSpeed", 1.0), "playbackSpeed")
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail="INVALID_SIMULATION_OPTIONS") from exc
-        effective_step = step_value if step_value is not None else (
-            float(session._md.defaultExperiment.stepSize)
-            if session._md and session._md.defaultExperiment and session._md.defaultExperiment.stepSize
-            else 0.001
-        )
         if (
-            not all(math.isfinite(value) for value in (start_time, stop_time, effective_step, playback_speed))
+            not all(math.isfinite(value) for value in (start_time, stop_time, step_value, playback_speed))
             or stop_time <= start_time
             or not math.isfinite(stop_time - start_time)
-            or effective_step <= 0
+            or step_value <= 0
             or not 0.1 <= playback_speed <= 100.0
         ):
             raise HTTPException(status_code=400, detail="INVALID_SIMULATION_OPTIONS")
@@ -505,6 +503,16 @@ async def handle_ws_message(
                     output_refs=output_refs,
                     max_compute_ms=max_compute_ms,
                 )
+            except process_runner.OutputReadRateLimitError:
+                if reservation:
+                    await asyncio.to_thread(
+                        services.settle_input_updates,
+                        session.gateway_context,
+                        access_key,
+                        reservation["reservationId"],
+                        0,
+                    )
+                raise
             except Exception:
                 if reservation:
                     await asyncio.to_thread(
