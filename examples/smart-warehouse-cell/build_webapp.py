@@ -78,7 +78,7 @@ def build(three_root: Path) -> None:
     protocol_source = find_protocol_source()
     sdk_root = WEBAPP_ROOT / "sdk"
     sdk_root.mkdir(exist_ok=True)
-    for filename in ("index.js", "client.js", "fmu-client.js"):
+    for filename in ("index.js", "client.js", "fmu-client.js", "batch-controller.js"):
         shutil.copyfile(protocol_source.parent / filename, sdk_root / filename)
 
     # These examples import the package specifier `three`. Rewrite only that
