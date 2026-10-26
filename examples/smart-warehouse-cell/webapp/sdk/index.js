@@ -50,12 +50,12 @@ export function isValidConnectionConfig(v) {
   } catch { return false }
 }
 export function isValidSample(v) {
-  return isRecord(v) && keys(v, ['time', 'outputs', 'sequence', 'eventOccurred', 'earlyReturn', 'terminateSimulation', 'finished', 'finishReason'])
+  return isRecord(v) && keys(v, ['time', 'outputs', 'sequence', 'eventOccurred', 'eventHandlingNeeded', 'earlyReturn', 'terminateSimulation', 'finished', 'finishReason'])
     && Number.isFinite(v.time) && isRecord(v.outputs)
     && Object.keys(v.outputs).length <= MAX_OUTPUTS_PER_SAMPLE
     && Object.entries(v.outputs).every(([key, value]) => text(key, 256) && (typeof value === 'boolean' || (typeof value === 'number' && Number.isFinite(value))))
     && (v.sequence === undefined || (Number.isSafeInteger(v.sequence) && v.sequence > 0))
-    && ['eventOccurred', 'earlyReturn', 'terminateSimulation', 'finished'].every((key) => v[key] === undefined || typeof v[key] === 'boolean')
+    && ['eventOccurred', 'eventHandlingNeeded', 'earlyReturn', 'terminateSimulation', 'finished'].every((key) => v[key] === undefined || typeof v[key] === 'boolean')
     && (v.finishReason === undefined || text(v.finishReason))
 }
 export function isValidAppReadyMessage(v) {
