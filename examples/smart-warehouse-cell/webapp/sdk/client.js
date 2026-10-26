@@ -276,23 +276,33 @@ export function createDigitalTwinAppClient({
             run.inputControllerTimes[run.inputControllerTimeIndex] ?? Infinity,
           )
           : Infinity
-        const scheduleBatch = run.schedule.length
-          ? createScheduledInputBatch(run, eventIndex, Math.min(run.options.stopTime, nextControllerTime))
-          : { events: [] }
-        const scheduledTargetTime = scheduleBatch.events.length
-          ? scheduleBatch.events.at(-1).time
-          : Infinity
-        let targetTime = Math.min(run.options.stopTime, nextControllerTime, scheduledTargetTime)
-        if (!Number.isFinite(targetTime)) targetTime = run.options.stopTime
-        if (targetTime <= time + scheduleTolerance) targetTime = Math.min(run.options.stopTime, time + run.options.stepSize)
+        const controllerTargetTime = Math.min(run.options.stopTime, nextControllerTime)
         const controllerSampleLimit = run.inputController && run.inputControllerInterval
-          ? Math.max(1, Math.ceil((targetTime - time) / run.options.stepSize) + 1)
+          ? Math.max(1, Math.ceil((controllerTargetTime - time) / run.options.stepSize) + 1)
           : 1
         const maxSamples = run.batchPolicy === 'adaptive'
           ? getAdaptiveBatchSize(run.batchController)
           : run.inputController
             ? Math.min(run.maxBatchSamples, controllerSampleLimit)
             : run.maxBatchSamples
+        const outputSampleEverySteps = run.advanceOptions.outputSampleEverySteps ?? 1
+        const maxSampleTargetTime = Math.min(
+          run.options.stopTime,
+          time + maxSamples * outputSampleEverySteps * run.options.stepSize,
+        )
+        // Scheduled advances are rejected before execution when their time
+        // span would produce more samples than maxSamples. Keep the schedule
+        // horizon within the current batch budget, including the first
+        // adaptive batch while its estimate is still one sample.
+        const scheduleBatch = run.schedule.length
+          ? createScheduledInputBatch(run, eventIndex, Math.min(controllerTargetTime, maxSampleTargetTime))
+          : { events: [] }
+        const scheduledTargetTime = scheduleBatch.events.length
+          ? scheduleBatch.events.at(-1).time
+          : Infinity
+        let targetTime = Math.min(controllerTargetTime, maxSampleTargetTime, scheduledTargetTime)
+        if (!Number.isFinite(targetTime)) targetTime = run.options.stopTime
+        if (targetTime <= time + scheduleTolerance) targetTime = Math.min(run.options.stopTime, time + run.options.stepSize)
         const result = await operation(run, 'sim.advance', 'sim.samples', {
           targetTime,
           maxSamples,
