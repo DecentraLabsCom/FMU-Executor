@@ -144,9 +144,9 @@ including `exp` when provided by Gateway).
 | `sim.pause` | `sim.state` | Pauses automatic stepping while retaining FMU state. |
 | `sim.resume` | `sim.state` | Resumes from `paused` or `initialized`. |
 | `sim.reset` | `sim.state` | Recreates the FMU instance with the original initialization options. |
-| `sim.step` | `sim.outputs` | Advances by `deltaT`; legacy `stepSize` is accepted. |
+| `sim.step` | `sim.outputs` | Advances by `deltaT`; legacy `stepSize` is accepted. The response includes FMI event/early-return/termination flags and a step `sequence` for ordering same-time event samples. |
 | `sim.runUntil` | `sim.outputs` | Advances to `time`; legacy `targetTime` is accepted. Optional `stepSize`. |
-| `sim.advance` | `sim.samples` | Advances to `targetTime` and returns intermediate samples; optional `stepSize` and `maxSamples` (1–256). |
+| `sim.advance` | `sim.samples` | Advances toward `targetTime` and returns bounded intermediate samples; optional `stepSize`, `maxSamples` (1–256), `maxComputeMs` (1–1000, soft), `outputSampleEverySteps`, `outputVariables` and `inputSchedule`. |
 | `sim.setInputs` | `sim.inputs.updated` | `values` map keyed by model variable name. |
 | `sim.getOutputs` | `sim.outputs` | Optional `variables` array; legacy `valueReferences` accepted. |
 | `sim.subscribeOutputs` | `sim.subscribed` | Optional `variables`, `periodMs`, `maxBatchSize` and `maxHz`. |
@@ -160,19 +160,37 @@ monotonic `seq`, `simTime`, `values`, `batchSize` and `dropped`. Errors use
 `type: "error"`, a short `code`, a safe `message` and `retryable`.
 
 The shared `sim.advance` operation was introduced in FMU Executor 0.3.2.
-It returns `sim.samples` with intermediate samples, `simTime`, `finished` and
-`finishReason`. Its frame size remains below a conservative
-1 MB budget; the Executor can reduce the returned batch size when output names
-are long. Session capabilities advertise `advanceSamples` and `maxOutputHz`.
+It returns `sim.samples` with intermediate samples, `simTime`, `finished`,
+`finishReason`, `stopReason`, `stepsExecuted`, `inputEventsApplied`,
+`samplesReturned`, `sampleBytes`, and `computeMs`. A requested `maxComputeMs`
+adds `maxComputeMs` and `computeBudgetOverrunMs`. Its frame size remains below a
+conservative 1 MB budget; the Executor can reduce the returned batch size when
+output names are long. Session capabilities advertise `advanceSamples`,
+`advanceComputeBudget`, `advanceSampleSequences`, and `maxOutputHz`.
 
-For high-rate models, `outputSampleEverySteps` keeps every Nth integration
-sample and always includes the final sample. The request must still fit within
-`maxSamples` and the frame budget. `outputVariables` can select named FMU
-outputs to reduce each sample. `inputSchedule` can carry up to 1,024 ordered,
-step-aligned timed writes (256 KiB encoded) for that advance window; the
-Executor validates every write against the session's variable permissions and
-applies it at its scheduled model time while advancing. These fields are
-optional; ordinary apps can continue using `sim.advance` as before.
+The `maxComputeMs` budget is soft and is checked between FMI steps. It cannot
+interrupt a long-running `doStep()`: the Executor returns after that step and
+reports any overrun. `stopReason` is `target_reached`, `max_samples`,
+`compute_budget`, `early_return`, or `simulation_finished`. An adaptive client
+can compare `computeMs` with the full request cycle and use measured payload
+bytes to distinguish model cost from transport cost. The budget never changes
+`stepSize`.
+
+For high-rate models, `outputSampleEverySteps` reads and returns every Nth
+integration sample while still executing each FMI step. The final sample,
+event/early-return samples and a sample at a compute-budget stop are also
+included. The request must still fit within `maxSamples` and the frame budget.
+`outputVariables` can select named FMU outputs to reduce each sample.
+`inputSchedule` can carry up to 1,024 ordered, step-aligned timed writes
+(256 KiB encoded) for that advance window; the Executor validates every write
+against the session's variable permissions and applies it at its scheduled
+model time while advancing. `inputEventsApplied` reports the consumed prefix;
+clients must resend the remaining events when a request ends before its target.
+Each sample has a monotonically increasing `sequence` and may share its
+simulation time with another sample when an FMI event returns at the current
+communication point. Event and early-return flags stay attached to their
+sample. These fields are optional; ordinary apps can continue using
+`sim.advance` as before.
 
 If the internal WebSocket closes unexpectedly, the Executor detaches the
 session instead of terminating it immediately. A new connection may attach

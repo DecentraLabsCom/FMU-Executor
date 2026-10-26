@@ -15,6 +15,7 @@ from . import auth, config, engine, fmu_storage, process_runner
 
 MAX_ADVANCE_INPUT_EVENTS = 1024
 MAX_ADVANCE_INPUT_BYTES = 256 * 1024
+MAX_ADVANCE_COMPUTE_MS = 1000
 
 
 @dataclass(frozen=True)
@@ -49,7 +50,7 @@ def _sim_outputs_payload(
         session.seq += 1
     if metadata:
         for key in (
-            "requestedTime", "timeAdvanced", "earlyReturn", "eventOccurred", "eventHandlingNeeded",
+            "requestedTime", "timeAdvanced", "sequence", "earlyReturn", "eventOccurred", "eventHandlingNeeded",
             "terminateSimulation", "finished", "finishReason", "steps",
         ):
             if key in metadata:
@@ -150,6 +151,8 @@ async def handle_ws_message(
                 "setInputs": True,
                 "streamOutputs": True,
                 "advanceSamples": True,
+                "advanceComputeBudget": True,
+                "advanceSampleSequences": True,
                 "maxOutputHz": config.MAX_OUTPUT_SUBSCRIPTION_HZ,
                 "timeMode": ["simtime", "realtime", "external"],
             },
@@ -402,6 +405,14 @@ async def handle_ws_message(
             output_sample_every_steps = msg.get("outputSampleEverySteps", 1)
             if type(output_sample_every_steps) is not int or output_sample_every_steps < 1:
                 raise ValueError("outputSampleEverySteps must be a positive integer")
+            max_compute_ms = msg.get("maxComputeMs")
+            if max_compute_ms is not None and (
+                isinstance(max_compute_ms, bool)
+                or not isinstance(max_compute_ms, (int, float))
+                or not math.isfinite(max_compute_ms)
+                or not 1 <= max_compute_ms <= MAX_ADVANCE_COMPUTE_MS
+            ):
+                raise ValueError(f"maxComputeMs must be between 1 and {MAX_ADVANCE_COMPUTE_MS} milliseconds")
             if session._time_mode == "external":
                 raise ValueError("sim.advance requires simtime or realtime mode")
 
@@ -467,6 +478,7 @@ async def handle_ws_message(
                 input_schedule=normalized_schedule or None,
                 output_sample_every_steps=output_sample_every_steps,
                 output_refs=output_refs,
+                max_compute_ms=max_compute_ms,
             )
         except process_runner.OutputReadRateLimitError as exc:
             raise _output_read_rate_limit_exception(exc) from exc

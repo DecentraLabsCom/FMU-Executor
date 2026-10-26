@@ -1,7 +1,7 @@
 import {
   createProtocolId, DIGITAL_TWIN_CAPABILITY, DIGITAL_TWIN_MESSAGE as MESSAGE,
   isHostMessageEvent, isValidOptions, isValidParameters, isValidInputSchedule,
-  isValidSample, postToHost, MAX_SAMPLES_PER_BATCH,
+  isValidSample, isRecord, postToHost, MAX_SAMPLES_PER_BATCH,
 } from './index.js'
 import { connectFmuSession } from './fmu-client.js'
 import {
@@ -11,6 +11,20 @@ import {
 } from './batch-controller.js'
 
 const errorWithCode = (message, code) => Object.assign(new Error(message), { code })
+const VALID_ADVANCE_STOP_REASONS = new Set([
+  'target_reached', 'max_samples', 'compute_budget', 'early_return', 'simulation_finished',
+])
+
+function hasValidAdvanceMetrics(response, samples) {
+  return Number.isFinite(response?.computeMs) && response.computeMs >= 0
+    && response.samplesReturned === samples.length
+    && Number.isFinite(response.sampleBytes) && response.sampleBytes >= 0
+    && Number.isSafeInteger(response.stepsExecuted) && response.stepsExecuted > 0
+    && Number.isSafeInteger(response.inputEventsApplied) && response.inputEventsApplied >= 0
+    && Number.isFinite(response.computeBudgetOverrunMs) && response.computeBudgetOverrunMs >= 0
+    && VALID_ADVANCE_STOP_REASONS.has(response.stopReason)
+}
+
 const wait = (ms, signal) => new Promise((resolve, reject) => {
   const aborted = () => { clearTimeout(timer); reject(signal.reason) }
   const timer = setTimeout(() => { signal.removeEventListener('abort', aborted); resolve() }, ms)
@@ -107,26 +121,33 @@ export function createDigitalTwinAppClient({
   async function operation(run, type, expected, payload) {
     const readsOutputs = ['sim.getOutputs', 'sim.advance'].includes(type)
     const tracksAdaptiveResponse = run.batchPolicy === 'adaptive' && type === 'sim.advance'
-    let requestResponseMs = 0
+    const operationStartedAt = performance.now()
+    let rateLimitWaitMs = 0
     while (true) {
       run.controller.signal.throwIfAborted()
-      let requestStartedAt
       try {
-        if (readsOutputs && run.nextOutputAt > performance.now()) await wait(Math.ceil(run.nextOutputAt - performance.now()), run.controller.signal)
-        requestStartedAt = performance.now()
+        if (readsOutputs && run.nextOutputAt > performance.now()) {
+          const throttleWaitStartedAt = performance.now()
+          await wait(Math.ceil(run.nextOutputAt - throttleWaitStartedAt), run.controller.signal)
+          rateLimitWaitMs += performance.now() - throttleWaitStartedAt
+        }
         const response = await run.session.request(type, expected, payload)
-        if (tracksAdaptiveResponse) requestResponseMs += performance.now() - requestStartedAt
         if (readsOutputs) {
-          if (tracksAdaptiveResponse) run.lastOutputResponseMs = requestResponseMs
+          if (tracksAdaptiveResponse) {
+            run.lastOutputMetrics = {
+              responseMs: performance.now() - operationStartedAt,
+              rateLimitWaitMs,
+            }
+          }
           run.nextOutputAt = performance.now() + run.outputIntervalMs
         }
         return response
       }
       catch (error) {
-        if (tracksAdaptiveResponse && requestStartedAt !== undefined) requestResponseMs += performance.now() - requestStartedAt
-        if (tracksAdaptiveResponse) run.lastOutputResponseMs = requestResponseMs
         if (error.code !== 'OUTPUT_READ_RATE_LIMITED' || !Number.isFinite(error.retryAfterMs) || error.retryAfterMs < 1 || error.retryAfterMs > 10_000) throw error
+        const retryWaitStartedAt = performance.now()
         await wait(error.retryAfterMs, run.controller.signal)
+        rateLimitWaitMs += performance.now() - retryWaitStartedAt
       }
     }
   }
@@ -165,22 +186,65 @@ export function createDigitalTwinAppClient({
         const maxSamples = run.batchPolicy === 'adaptive'
           ? getAdaptiveBatchSize(run.batchController)
           : run.inputController ? 1 : run.maxBatchSamples
-        const result = await operation(run, 'sim.advance', 'sim.samples', { targetTime, maxSamples, stepSize: run.options.stepSize })
+        const result = await operation(run, 'sim.advance', 'sim.samples', {
+          targetTime,
+          maxSamples,
+          stepSize: run.options.stepSize,
+          ...(run.batchPolicy === 'adaptive' ? { maxComputeMs: run.batchController.maxComputeMs } : {}),
+        })
         const batchReceivedAt = run.batchPolicy === 'adaptive' ? performance.now() : null
-        if (!Array.isArray(result.samples) || !result.samples.length || !Number.isFinite(result.simTime) || result.simTime <= time || result.simTime > targetTime + 1e-9) throw errorWithCode('The FMU did not advance as requested.', 'INVALID_FMU_RESPONSE')
+        const tolerance = Math.max(1e-9, Math.abs(run.options.stepSize) * 1e-7)
+        if (!Array.isArray(result.samples) || !result.samples.length || !Number.isFinite(result.simTime)
+          || result.simTime < time - tolerance || result.simTime > targetTime + tolerance) throw errorWithCode('The FMU did not advance as requested.', 'INVALID_FMU_RESPONSE')
+        if (run.batchPolicy === 'adaptive'
+          && (!hasValidAdvanceMetrics(result, result.samples)
+            || result.maxComputeMs !== run.batchController.maxComputeMs
+            || result.samples.some((sample) => !Number.isSafeInteger(sample?.sequence) || sample.sequence < 1))) {
+          throw errorWithCode('The FMU returned invalid compute-budget or event-sequence metadata.', 'INVALID_FMU_RESPONSE')
+        }
         let previous = time
+        let previousSequence = run.lastSampleSequence
+        let sequenceMode = Number.isSafeInteger(previousSequence) ? true : null
         for (const sample of result.samples) {
-          if (!Number.isFinite(sample.time) || sample.time <= previous || sample.time > result.simTime) throw errorWithCode('The FMU returned an unordered timeline.', 'INVALID_FMU_RESPONSE')
+          const hasSequence = Number.isSafeInteger(sample.sequence) && sample.sequence > 0
+          const sameTime = Math.abs(sample.time - previous) <= tolerance
+          if (!Number.isFinite(sample.time) || sample.time < previous - tolerance || sample.time > result.simTime + tolerance) throw errorWithCode('The FMU returned an unordered timeline.', 'INVALID_FMU_RESPONSE')
+          if ((sameTime && !hasSequence)
+            || (hasSequence && sequenceMode === false)
+            || (!hasSequence && sequenceMode === true)
+            || (hasSequence && Number.isSafeInteger(previousSequence) && sample.sequence <= previousSequence)) {
+            throw errorWithCode('The FMU returned unordered or unsequenced same-time event samples.', 'INVALID_FMU_RESPONSE')
+          }
+          if (hasSequence) {
+            sequenceMode = true
+            previousSequence = sample.sequence
+          } else {
+            sequenceMode = false
+          }
           previous = sample.time
         }
-        if (previous !== result.simTime) throw errorWithCode('The FMU returned an incomplete timeline.', 'INVALID_FMU_RESPONSE')
+        if (Math.abs(previous - result.simTime) > tolerance) throw errorWithCode('The FMU returned an incomplete timeline.', 'INVALID_FMU_RESPONSE')
+        if (Math.abs(result.simTime - time) <= tolerance
+          && (!Number.isSafeInteger(previousSequence) || previousSequence <= (run.lastSampleSequence ?? 0))) {
+          throw errorWithCode('The FMU returned no new step or event.', 'INVALID_FMU_RESPONSE')
+        }
+        run.lastSampleSequence = Number.isSafeInteger(previousSequence) ? previousSequence : null
         const batch = await deliver(run, result.samples)
         time = result.simTime
         if (run.batchPolicy === 'adaptive') {
-          await onBatchRendered?.(result.samples, batch, { runId: run.runId, signal: run.controller.signal })
+          let consumerDelayMs = null
+          if (typeof onBatchRendered === 'function') {
+            await onBatchRendered(result.samples, batch, { runId: run.runId, signal: run.controller.signal })
+            consumerDelayMs = performance.now() - batchReceivedAt
+          }
           run.batchController = observeAdaptiveBatch(run.batchController, {
-            responseMs: run.lastOutputResponseMs,
-            consumerDelayMs: performance.now() - batchReceivedAt,
+            responseMs: run.lastOutputMetrics?.responseMs,
+            computeMs: result.computeMs,
+            sampleCount: result.samplesReturned ?? result.samples.length,
+            payloadBytes: result.sampleBytes,
+            consumerDelayMs,
+            rateLimitWaitMs: run.lastOutputMetrics?.rateLimitWaitMs,
+            stopReason: result.stopReason,
           })
         }
         if (result.finished) break
@@ -190,23 +254,37 @@ export function createDigitalTwinAppClient({
     } catch (error) { await finish(run, run.controller.signal.aborted ? 'cancelled' : 'error', error) }
   }
 
-  async function run({ parameters = {}, options = {}, inputSchedule, inputController, batchPolicy = 'fixed', maxBatchSamples = MAX_SAMPLES_PER_BATCH } = {}) {
+  async function run({
+    parameters = {}, options = {}, inputSchedule, inputController, batchPolicy = 'fixed',
+    maxBatchSamples = MAX_SAMPLES_PER_BATCH, adaptiveBatchOptions = {},
+  } = {}) {
     if (disposed || active) throw errorWithCode('The app cannot start another FMU run.', 'RUN_UNAVAILABLE')
     if (!isValidParameters(parameters) || !isValidOptions(options)) throw errorWithCode('Invalid FMU run parameters.', 'INVALID_RUN_REQUEST')
     parameters = { ...parameters }
     options = { ...options }
     if (inputController !== undefined && typeof inputController !== 'function') throw errorWithCode('Invalid input controller.', 'INVALID_INPUT')
     if (!['fixed', 'adaptive'].includes(batchPolicy)) throw errorWithCode('Invalid batch policy.', 'INVALID_INPUT')
+    if (!isRecord(adaptiveBatchOptions)) throw errorWithCode('Invalid adaptive batch options.', 'INVALID_INPUT')
     if (!Number.isInteger(maxBatchSamples) || maxBatchSamples < 1 || maxBatchSamples > MAX_SAMPLES_PER_BATCH) throw errorWithCode(`maxBatchSamples must be an integer from 1 to ${MAX_SAMPLES_PER_BATCH}.`, 'INVALID_INPUT')
     if (batchPolicy === 'adaptive' && inputController) throw errorWithCode('Adaptive batching cannot be combined with a per-sample input controller.', 'INVALID_INPUT')
     if (inputController && maxBatchSamples !== MAX_SAMPLES_PER_BATCH && maxBatchSamples !== 1) throw errorWithCode('maxBatchSamples must be 1 when using a per-sample input controller.', 'INVALID_INPUT')
-    const current = { runId: createProtocolId('run'), controller: new AbortController(), sampleCount: 0, options, inputController, batchPolicy, maxBatchSamples }
+    const current = {
+      runId: createProtocolId('run'), controller: new AbortController(), sampleCount: 0,
+      options, inputController, batchPolicy, maxBatchSamples, adaptiveBatchOptions,
+      lastSampleSequence: null,
+    }
     active = current
     try {
       const grant = await requestConnection(options, current.controller.signal)
       current.controller.signal.throwIfAborted()
       current.session = await connectFmuSession(grant.connection, { signal: current.controller.signal })
       if (current.session.capabilities.advanceSamples !== true) throw errorWithCode('The provider FMU runtime needs batched WebSocket support.', 'UNSUPPORTED_FMU_RUNTIME')
+      if (batchPolicy === 'adaptive' && current.session.capabilities.advanceComputeBudget !== true) {
+        throw errorWithCode('The provider FMU runtime needs compute-bounded advance support for adaptive batching.', 'UNSUPPORTED_ADAPTIVE_FMU_RUNTIME')
+      }
+      if (batchPolicy === 'adaptive' && current.session.capabilities.advanceSampleSequences !== true) {
+        throw errorWithCode('The provider FMU runtime needs sequenced advance samples for adaptive batching.', 'UNSUPPORTED_ADAPTIVE_FMU_RUNTIME')
+      }
       const outputHz = current.session.capabilities.maxOutputHz
       current.outputIntervalMs = Number.isFinite(outputHz) && outputHz >= 1 && outputHz <= 1000 ? 1000 / outputHz : 0
       const model = await current.session.request('model.describe', 'model.description', { includeVariables: false })
@@ -217,7 +295,11 @@ export function createDigitalTwinAppClient({
       }
       const { startTime, stopTime, stepSize } = current.options
       if (!isValidOptions(current.options) || stopTime <= startTime || stepSize <= 0) throw errorWithCode('Invalid simulation interval.', 'INVALID_RUN_REQUEST')
-      if (batchPolicy === 'adaptive') current.batchController = createAdaptiveBatchController({ startTime, stopTime, stepSize, maxSamples: maxBatchSamples })
+      if (batchPolicy === 'adaptive') {
+        current.batchController = createAdaptiveBatchController({
+          startTime, stopTime, stepSize, maxSamples: maxBatchSamples, ...adaptiveBatchOptions,
+        })
+      }
       const schedule = inputSchedule ?? grant.inputSchedule ?? []
       if (!isValidInputSchedule(schedule) || schedule.some((event) => event.time < startTime || event.time > stopTime)) throw errorWithCode('Invalid input schedule.', 'INVALID_INPUT_SCHEDULE')
       current.schedule = [...schedule].sort((a, b) => a.time - b.time)

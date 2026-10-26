@@ -112,6 +112,7 @@ def test_advance_batches_use_the_same_authorized_session_and_validate_before_exe
         input_schedule=[],
         output_sample_every_steps=1,
         output_refs=None,
+        max_compute_ms=None,
     )
     with pytest.raises(HTTPException):
         call({"type": "sim.advance", "targetTime": 2, "maxSamples": 257})

@@ -603,6 +603,7 @@ class RealtimeSession:
         input_schedule: list[dict[str, Any]] | None = None,
         output_sample_every_steps: int = 1,
         output_refs: list[int] | None = None,
+        max_compute_ms: float | None = None,
     ) -> dict[str, Any]:
         self._acquire_output_read_or_raise()
         try:
@@ -614,6 +615,7 @@ class RealtimeSession:
                 input_schedule=input_schedule,
                 output_sample_every_steps=output_sample_every_steps,
                 output_refs=output_refs,
+                max_compute_ms=max_compute_ms,
             )
         finally:
             self._finish_output_read()

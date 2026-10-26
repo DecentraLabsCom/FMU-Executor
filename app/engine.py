@@ -239,7 +239,9 @@ class FmuSession:
             self._finished_reason = "stop_time_reached"
         else:
             self._state = "running"
-        return self._step_result(previous_time, reached_time, **result)
+        step_result = self._step_result(previous_time, reached_time, **result)
+        step_result["sequence"] = self._step_count
+        return step_result
 
     def run_until(self, target_time: float, step_size: float | None = None) -> dict[str, Any]:
         slave = self._require_slave()
@@ -313,8 +315,16 @@ class FmuSession:
         output_refs: list[int] | None = None,
         input_schedule: list[dict[str, Any]] | None = None,
         _sequence_offset: int = 0,
+        _sample_every_steps: int = 1,
+        _include_unsampled: bool = False,
+        _sample_step_offset: int | None = None,
+        _input_events_applied: list[int] | None = None,
     ) -> Generator[dict[str, Any], None, None]:
         """Step until *target_time*, yielding output snapshots at each step."""
+        if type(_sample_every_steps) is not int or _sample_every_steps < 1:
+            raise ValueError("sampleEverySteps must be a positive integer")
+        if _sample_step_offset is None:
+            _sample_step_offset = self._step_count
         if input_schedule:
             sequence_offset = _sequence_offset
             for event in input_schedule:
@@ -327,17 +337,27 @@ class FmuSession:
                         step_size=step_size,
                         output_refs=output_refs,
                         _sequence_offset=sequence_offset,
+                        _sample_every_steps=_sample_every_steps,
+                        _include_unsampled=_include_unsampled,
+                        _sample_step_offset=_sample_step_offset,
+                        _input_events_applied=_input_events_applied,
                     ):
                         sequence_offset = int(snapshot["seq"]) + 1
                         yield snapshot
                 if self._state == "stopped":
                     return
                 self.set_inputs(event["values"])
+                if _input_events_applied is not None:
+                    _input_events_applied[0] += 1
             yield from self.run_until_streaming(
                 target_time,
                 step_size=step_size,
                 output_refs=output_refs,
                 _sequence_offset=sequence_offset,
+                _sample_every_steps=_sample_every_steps,
+                _include_unsampled=_include_unsampled,
+                _sample_step_offset=_sample_step_offset,
+                _input_events_applied=_input_events_applied,
             )
             return
 
@@ -379,10 +399,24 @@ class FmuSession:
             elif finished:
                 self._state = "stopped"
                 self._finished_reason = "stop_time_reached"
-            outputs = self._read_outputs(output_refs)
+            at_requested_target = self._time >= target_time - 1e-12
+            has_event = bool(
+                step_result.get("eventOccurred")
+                or step_result.get("eventHandlingNeeded")
+                or step_result.get("earlyReturn")
+                or step_result.get("terminateSimulation")
+            )
+            should_sample = (
+                (self._step_count - _sample_step_offset) % _sample_every_steps == 0
+                or at_requested_target
+                or finished
+                or has_event
+            )
+            outputs = self._read_outputs(output_refs) if should_sample or not _include_unsampled else None
             yield {
                 "type": "sim.step",
                 "seq": seq,
+                "sequence": self._step_count,
                 "time": self._time,
                 "outputs": outputs,
                 **step_result,
@@ -412,15 +446,26 @@ class FmuSession:
         input_schedule: list[dict[str, Any]] | None = None,
         output_sample_every_steps: int = 1,
         output_refs: list[int] | None = None,
+        max_compute_ms: float | None = None,
     ) -> dict[str, Any]:
         """Advance one bounded request, optionally applying timed inputs and sampling sparsely."""
+        started_at = _time.perf_counter()
         if type(max_samples) is not int or not 1 <= max_samples <= 256:
             raise ValueError("maxSamples must be an integer between 1 and 256")
         if type(output_sample_every_steps) is not int or output_sample_every_steps < 1:
             raise ValueError("outputSampleEverySteps must be a positive integer")
+        if max_compute_ms is not None and (
+            isinstance(max_compute_ms, bool)
+            or not isinstance(max_compute_ms, (int, float))
+            or not math.isfinite(max_compute_ms)
+            or not 1 <= max_compute_ms <= 1000
+        ):
+            raise ValueError("maxComputeMs must be between 1 and 1000 milliseconds")
         h = self._step_size if step_size is None else step_size
         if not math.isfinite(target_time) or not math.isfinite(h) or h <= 0:
             raise ValueError("targetTime must be finite and stepSize must be positive")
+        if target_time <= self._time + 1e-15:
+            raise ValueError("targetTime must be later than the current simulation time")
         expected_steps = max(0.0, target_time - self._time) / h
         expected_samples = math.ceil(expected_steps / output_sample_every_steps)
         if input_schedule and expected_samples > max_samples:
@@ -429,36 +474,87 @@ class FmuSession:
         outputs = self.get_outputs(output_refs)["outputs"]
         if any(not isinstance(value, (bool, int, float)) for value in outputs.values()):
             raise ValueError("Batched samples require scalar FMI outputs")
-        sample_bound = 128 + sum(len(json.dumps(name)) + 64 for name in outputs)
+        sample_bound = 256 + sum(len(json.dumps(name)) + 64 for name in outputs)
         safe_count = min(max_samples, 900_000 // sample_bound)
         if safe_count < 1:
             raise ValueError("One output sample exceeds the WebSocket frame budget")
         if input_schedule and expected_samples > safe_count:
             raise ValueError("ADVANCE_SAMPLE_LIMIT_EXCEEDED")
         samples = []
+        steps_executed = 0
+        input_events_applied = [0]
+        stop_reason = "target_reached"
+        compute_budget_overrun_ms = 0.0
         snapshots = self.run_until_streaming(
             target_time,
             step_size=step_size,
             output_refs=output_refs,
             input_schedule=input_schedule,
+            _sample_every_steps=output_sample_every_steps,
+            _include_unsampled=True,
+            _input_events_applied=input_events_applied,
         )
-        step_index = 0
         try:
             for snapshot in snapshots:
-                step_index += 1
-                is_final = snapshot["finished"] or snapshot["time"] >= target_time - 1e-12
-                if step_index % output_sample_every_steps == 0 or is_final:
-                    samples.append({"time": snapshot["time"], "outputs": snapshot["outputs"]})
-                    if len(samples) >= safe_count and not input_schedule:
-                        break
+                steps_executed += 1
+                elapsed_ms = (_time.perf_counter() - started_at) * 1000
+                compute_budget_reached = max_compute_ms is not None and elapsed_ms >= max_compute_ms
+                if snapshot["outputs"] is not None or compute_budget_reached:
+                    sample_outputs = snapshot["outputs"]
+                    if sample_outputs is None:
+                        sample_outputs = self._read_outputs(output_refs)
+                    samples.append({
+                        "time": snapshot["time"],
+                        "outputs": sample_outputs,
+                        "sequence": snapshot["sequence"],
+                        "eventOccurred": bool(snapshot.get("eventOccurred", False)),
+                        "earlyReturn": bool(snapshot.get("earlyReturn", False)),
+                        "terminateSimulation": bool(snapshot.get("terminateSimulation", False)),
+                        "finished": bool(snapshot.get("finished", False)),
+                    })
+
+                if max_compute_ms is not None:
+                    compute_budget_overrun_ms = max(0.0, elapsed_ms - max_compute_ms)
+                if snapshot.get("finished") or snapshot.get("terminateSimulation"):
+                    stop_reason = "simulation_finished"
+                    break
+                if snapshot.get("earlyReturn"):
+                    stop_reason = "early_return"
+                    break
+                if snapshot["time"] >= target_time - 1e-12:
+                    stop_reason = "target_reached"
+                    break
+                if len(samples) >= safe_count:
+                    stop_reason = "max_samples"
+                    break
+                if compute_budget_reached:
+                    stop_reason = "compute_budget"
+                    break
         finally:
             snapshots.close()
-        return {
+            if self._state == "running":
+                self._state = "initialized"
+
+        execution_ms = (_time.perf_counter() - started_at) * 1000
+        if not samples:
+            raise RuntimeError("FMU advance returned no samples")
+        sample_bytes = len(json.dumps(samples, separators=(",", ":"), allow_nan=False).encode("utf-8"))
+        result = {
             "samples": samples,
             "simTime": self._time,
             "finished": self._state == "stopped",
             "finishReason": self._finished_reason,
+            "stopReason": stop_reason,
+            "stepsExecuted": steps_executed,
+            "inputEventsApplied": input_events_applied[0],
+            "samplesReturned": len(samples),
+            "sampleBytes": sample_bytes,
+            "computeMs": execution_ms,
+            "computeBudgetOverrunMs": compute_budget_overrun_ms,
         }
+        if max_compute_ms is not None:
+            result["maxComputeMs"] = float(max_compute_ms)
+        return result
 
     def set_inputs(self, values: dict[str, Any]) -> None:
         self._ensure_live()
