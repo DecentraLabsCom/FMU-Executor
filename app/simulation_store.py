@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import sqlite3
 import time
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,10 +28,19 @@ class QuotaExceededError(RuntimeError):
 class InputUpdateQuotaExceededError(RuntimeError):
     """Input update rate or size budget has been exhausted."""
 
-    def __init__(self, code: str, remaining: int):
+    def __init__(
+        self,
+        code: str,
+        remaining: int,
+        *,
+        retry_after_ms: int | None = None,
+        max_batch_size: int | None = None,
+    ):
         super().__init__(code)
         self.code = code
         self.remaining = remaining
+        self.retry_after_ms = retry_after_ms
+        self.max_batch_size = max_batch_size
 
 
 def reservation_scope(context: dict[str, Any] | None) -> tuple[str, dict[str, str]]:
@@ -133,7 +144,10 @@ class SimulationStore:
                 CREATE TABLE IF NOT EXISTS input_update_events (
                     scope_key TEXT NOT NULL,
                     model_key TEXT NOT NULL,
-                    created_at REAL NOT NULL
+                    created_at REAL NOT NULL,
+                    payload_bytes INTEGER NOT NULL DEFAULT 0,
+                    usage_day TEXT NOT NULL DEFAULT '',
+                    reservation_id TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_input_update_events_window
                     ON input_update_events(scope_key, model_key, created_at);
@@ -153,6 +167,20 @@ class SimulationStore:
             ):
                 if column not in existing_columns:
                     db.execute(f"ALTER TABLE simulation_jobs ADD COLUMN {column} {definition}")
+            existing_input_event_columns = {
+                row["name"] for row in db.execute("PRAGMA table_info(input_update_events)").fetchall()
+            }
+            for column, definition in (
+                ("payload_bytes", "INTEGER NOT NULL DEFAULT 0"),
+                ("usage_day", "TEXT NOT NULL DEFAULT ''"),
+                ("reservation_id", "TEXT"),
+            ):
+                if column not in existing_input_event_columns:
+                    db.execute(f"ALTER TABLE input_update_events ADD COLUMN {column} {definition}")
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_input_update_events_reservation "
+                "ON input_update_events(reservation_id)"
+            )
             # Preserve previously debited reservation-wide usage in a wildcard
             # bucket while new executions are counted per immutable model hash.
             db.execute(
@@ -206,14 +234,45 @@ class SimulationStore:
 
     def reserve_input_update(self, scope_key: str, access_key: str, payload_bytes: int) -> dict[str, int]:
         """Debit input update budgets independently from simulation scenarios."""
-        if payload_bytes < 0:
-            raise ValueError("Input payload size must not be negative")
-        if payload_bytes > config.MAX_INPUT_UPDATE_BYTES:
-            raise InputUpdateQuotaExceededError("INPUT_UPDATE_TOO_LARGE", config.MAX_INPUT_UPDATE_BYTES)
+        return self._reserve_input_updates(scope_key, access_key, [payload_bytes], reserve_for_schedule=False)
+
+    def reserve_input_updates(
+        self,
+        scope_key: str,
+        access_key: str,
+        payload_sizes: list[int],
+    ) -> dict[str, Any]:
+        """Reserve quota for timed writes until an advance reports its applied prefix."""
+        return self._reserve_input_updates(scope_key, access_key, payload_sizes, reserve_for_schedule=True)
+
+    def _reserve_input_updates(
+        self,
+        scope_key: str,
+        access_key: str,
+        payload_sizes: list[int],
+        *,
+        reserve_for_schedule: bool,
+    ) -> dict[str, Any]:
+        if not isinstance(payload_sizes, list) or not payload_sizes:
+            raise ValueError("At least one input update is required")
+        if any(type(size) is not int or size < 0 for size in payload_sizes):
+            raise ValueError("Input payload sizes must be non-negative integers")
+        update_count = len(payload_sizes)
+        if reserve_for_schedule and update_count > config.MAX_INPUT_UPDATES_PER_WINDOW:
+            raise InputUpdateQuotaExceededError(
+                "INPUT_UPDATE_BATCH_LIMIT",
+                config.MAX_INPUT_UPDATES_PER_WINDOW,
+                max_batch_size=config.MAX_INPUT_UPDATES_PER_WINDOW,
+            )
+        for payload_bytes in payload_sizes:
+            if payload_bytes > config.MAX_INPUT_UPDATE_BYTES:
+                raise InputUpdateQuotaExceededError("INPUT_UPDATE_TOO_LARGE", config.MAX_INPUT_UPDATE_BYTES)
+        payload_bytes_total = sum(payload_sizes)
         model_key = hashlib.sha256(access_key.encode("utf-8")).hexdigest()
         usage_day = datetime.now(timezone.utc).date().isoformat()
         now = time.time()
         window_start = now - config.INPUT_UPDATE_WINDOW_SECONDS
+        reservation_id = uuid.uuid4().hex if reserve_for_schedule else None
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             db.execute("DELETE FROM input_update_events WHERE created_at<?", (now - 3600,))
@@ -226,9 +285,23 @@ class SimulationStore:
                 "WHERE scope_key=? AND model_key=? AND created_at>=?",
                 (scope_key, model_key, window_start),
             ).fetchone()["count"])
-            if recent >= config.MAX_INPUT_UPDATES_PER_WINDOW:
+            maximum_window_count = config.MAX_INPUT_UPDATES_PER_WINDOW
+            if recent + update_count > maximum_window_count:
+                events_to_expire = recent + update_count - maximum_window_count
+                earliest_required_expiry = db.execute(
+                    "SELECT created_at FROM input_update_events "
+                    "WHERE scope_key=? AND model_key=? AND created_at>=? "
+                    "ORDER BY created_at LIMIT 1 OFFSET ?",
+                    (scope_key, model_key, window_start, events_to_expire - 1),
+                ).fetchone()
+                retry_after_ms = max(
+                    1,
+                    math.ceil((float(earliest_required_expiry["created_at"]) + config.INPUT_UPDATE_WINDOW_SECONDS - now) * 1000),
+                ) if earliest_required_expiry else None
                 raise InputUpdateQuotaExceededError(
-                    "INPUT_UPDATE_RATE_LIMIT", max(0, config.MAX_INPUT_UPDATES_PER_WINDOW - recent)
+                    "INPUT_UPDATE_RATE_LIMIT",
+                    max(0, maximum_window_count - recent),
+                    retry_after_ms=retry_after_ms,
                 )
             row = db.execute(
                 "SELECT updates,payload_bytes FROM input_update_usage "
@@ -237,11 +310,11 @@ class SimulationStore:
             ).fetchone()
             used_updates = int(row["updates"]) if row else 0
             used_bytes = int(row["payload_bytes"]) if row else 0
-            if used_updates + 1 > config.MAX_INPUT_UPDATES_PER_DAY:
+            if used_updates + update_count > config.MAX_INPUT_UPDATES_PER_DAY:
                 raise InputUpdateQuotaExceededError(
                     "INPUT_UPDATE_DAILY_LIMIT", max(0, config.MAX_INPUT_UPDATES_PER_DAY - used_updates)
                 )
-            if used_bytes + payload_bytes > config.MAX_INPUT_UPDATE_BYTES_PER_DAY:
+            if used_bytes + payload_bytes_total > config.MAX_INPUT_UPDATE_BYTES_PER_DAY:
                 raise InputUpdateQuotaExceededError(
                     "INPUT_UPDATE_DAILY_BYTES_LIMIT",
                     max(0, config.MAX_INPUT_UPDATE_BYTES_PER_DAY - used_bytes),
@@ -250,16 +323,73 @@ class SimulationStore:
                 "INSERT INTO input_update_usage(scope_key,model_key,usage_day,updates,payload_bytes) "
                 "VALUES(?,?,?,?,?) ON CONFLICT(scope_key,model_key,usage_day) DO UPDATE SET "
                 "updates=excluded.updates,payload_bytes=excluded.payload_bytes",
-                (scope_key, model_key, usage_day, used_updates + 1, used_bytes + payload_bytes),
+                (scope_key, model_key, usage_day, used_updates + update_count, used_bytes + payload_bytes_total),
             )
-            db.execute(
-                "INSERT INTO input_update_events(scope_key,model_key,created_at) VALUES(?,?,?)",
-                (scope_key, model_key, now),
+            db.executemany(
+                "INSERT INTO input_update_events "
+                "(scope_key,model_key,created_at,payload_bytes,usage_day,reservation_id) VALUES(?,?,?,?,?,?)",
+                [(scope_key, model_key, now, size, usage_day, reservation_id) for size in payload_sizes],
             )
-            return {
-                "updatesRemaining": config.MAX_INPUT_UPDATES_PER_DAY - used_updates - 1,
-                "bytesRemaining": config.MAX_INPUT_UPDATE_BYTES_PER_DAY - used_bytes - payload_bytes,
+            result: dict[str, int | str] = {
+                "updatesRemaining": config.MAX_INPUT_UPDATES_PER_DAY - used_updates - update_count,
+                "bytesRemaining": config.MAX_INPUT_UPDATE_BYTES_PER_DAY - used_bytes - payload_bytes_total,
             }
+            if reservation_id:
+                result["reservationId"] = reservation_id
+            return result
+
+    def settle_input_updates(
+        self,
+        scope_key: str,
+        access_key: str,
+        reservation_id: str,
+        *,
+        applied_count: int,
+    ) -> None:
+        """Keep quota for applied scheduled writes and release the unconsumed suffix."""
+        if type(applied_count) is not int or applied_count < 0:
+            raise ValueError("Applied input update count must be a non-negative integer")
+        model_key = hashlib.sha256(access_key.encode("utf-8")).hexdigest()
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            rows = db.execute(
+                "SELECT rowid,payload_bytes,usage_day FROM input_update_events "
+                "WHERE scope_key=? AND model_key=? AND reservation_id=? ORDER BY rowid",
+                (scope_key, model_key, reservation_id),
+            ).fetchall()
+            if not rows or applied_count > len(rows):
+                raise ValueError("Scheduled input reservation is missing or has an invalid applied count")
+            unused_rows = rows[applied_count:]
+            if unused_rows:
+                unused_bytes = sum(int(row["payload_bytes"]) for row in unused_rows)
+                usage_day = rows[0]["usage_day"]
+                usage = db.execute(
+                    "SELECT updates,payload_bytes FROM input_update_usage "
+                    "WHERE scope_key=? AND model_key=? AND usage_day=?",
+                    (scope_key, model_key, usage_day),
+                ).fetchone()
+                if usage is None or usage["updates"] < len(unused_rows) or usage["payload_bytes"] < unused_bytes:
+                    raise RuntimeError("Scheduled input quota reservation is inconsistent")
+                next_updates = int(usage["updates"]) - len(unused_rows)
+                next_bytes = int(usage["payload_bytes"]) - unused_bytes
+                if next_updates == 0 and next_bytes == 0:
+                    db.execute(
+                        "DELETE FROM input_update_usage WHERE scope_key=? AND model_key=? AND usage_day=?",
+                        (scope_key, model_key, usage_day),
+                    )
+                else:
+                    db.execute(
+                        "UPDATE input_update_usage SET updates=?,payload_bytes=? "
+                        "WHERE scope_key=? AND model_key=? AND usage_day=?",
+                        (next_updates, next_bytes, scope_key, model_key, usage_day),
+                    )
+                db.executemany("DELETE FROM input_update_events WHERE rowid=?", [(row["rowid"],) for row in unused_rows])
+            applied_rows = rows[:applied_count]
+            if applied_rows:
+                db.executemany(
+                    "UPDATE input_update_events SET reservation_id=NULL WHERE rowid=?",
+                    [(row["rowid"],) for row in applied_rows],
+                )
 
     def create_job(
         self,

@@ -157,7 +157,10 @@ including `exp` when provided by Gateway).
 
 Subscribed output events use `type: "sim.outputs"` and include `sessionId`,
 monotonic `seq`, `simTime`, `values`, `batchSize` and `dropped`. Errors use
-`type: "error"`, a short `code`, a safe `message` and `retryable`.
+`type: "error"`, a short `code`, a safe `message` and `retryable`. Temporary
+input write limits return `INPUT_UPDATE_RATE_LIMIT` and `retryAfterMs`; a timed
+schedule that exceeds one advance's quota returns `INPUT_UPDATE_BATCH_LIMIT`
+with `maxBatchSize`.
 
 The shared `sim.advance` operation was introduced in FMU Executor 0.3.2.
 It returns `sim.samples` with intermediate samples, `simTime`, `finished`,
@@ -166,7 +169,10 @@ It returns `sim.samples` with intermediate samples, `simTime`, `finished`,
 adds `maxComputeMs` and `computeBudgetOverrunMs`. Its frame size remains below a
 conservative 1 MB budget; the Executor can reduce the returned batch size when
 output names are long. Session capabilities advertise `advanceSamples`,
-`advanceComputeBudget`, `advanceSampleSequences`, and `maxOutputHz`.
+`advanceComputeBudget`, `advanceSampleSequences`, `maxOutputHz`, and
+`inputUpdateQuota`. The latter reports the sliding-window and daily write
+limits, maximum payload size, and maximum scheduled events and bytes accepted
+per `sim.advance`.
 
 The `maxComputeMs` budget is soft and is checked between FMI steps. It cannot
 interrupt a long-running `doStep()`: the Executor returns after that step and
@@ -181,11 +187,13 @@ integration sample while still executing each FMI step. The final sample,
 event/early-return samples and a sample at a compute-budget stop are also
 included. The request must still fit within `maxSamples` and the frame budget.
 `outputVariables` can select named FMU outputs to reduce each sample.
-`inputSchedule` can carry up to 1,024 ordered, step-aligned timed writes
-(256 KiB encoded) for that advance window; the Executor validates every write
-against the session's variable permissions and applies it at its scheduled
-model time while advancing. `inputEventsApplied` reports the consumed prefix;
-clients must resend the remaining events when a request ends before its target.
+`inputSchedule` can carry up to the advertised `maxScheduledEventsPerAdvance`
+ordered, step-aligned timed writes (bounded by 256 KiB encoded) for that
+advance window; the Executor validates every write against the session's
+variable permissions and applies it at its scheduled model time while
+advancing. Scheduled writes share the session's realtime input quotas.
+`inputEventsApplied` reports the consumed prefix; only that prefix consumes
+quota, so clients can resend the remaining events without charging them twice.
 Each sample has a monotonically increasing `sequence` and may share its
 simulation time with another sample when an FMI event returns at the current
 communication point. Event and early-return flags stay attached to their

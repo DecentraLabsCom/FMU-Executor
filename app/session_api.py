@@ -259,7 +259,7 @@ def create_session_router(
                             "message": detail.get("message") or message,
                             "retryable": bool(detail.get("retryable", False)),
                         }
-                        for field in ("remaining", "retryAfterMs"):
+                        for field in ("remaining", "retryAfterMs", "maxBatchSize"):
                             if field in detail:
                                 err[field] = detail.get(field)
                     else:

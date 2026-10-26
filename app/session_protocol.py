@@ -18,6 +18,34 @@ MAX_ADVANCE_INPUT_BYTES = 256 * 1024
 MAX_ADVANCE_COMPUTE_MS = 1000
 
 
+def _session_capabilities() -> dict[str, Any]:
+    return {
+        "modelDescribe": True,
+        "getState": True,
+        "start": True,
+        "pause": True,
+        "resume": True,
+        "reset": True,
+        "step": True,
+        "setInputs": True,
+        "streamOutputs": True,
+        "advanceSamples": True,
+        "advanceComputeBudget": True,
+        "advanceSampleSequences": True,
+        "maxOutputHz": config.MAX_OUTPUT_SUBSCRIPTION_HZ,
+        "inputUpdateQuota": {
+            "maxUpdatesPerWindow": config.MAX_INPUT_UPDATES_PER_WINDOW,
+            "windowMs": config.INPUT_UPDATE_WINDOW_SECONDS * 1000,
+            "maxUpdateBytes": config.MAX_INPUT_UPDATE_BYTES,
+            "maxUpdatesPerDay": config.MAX_INPUT_UPDATES_PER_DAY,
+            "maxUpdateBytesPerDay": config.MAX_INPUT_UPDATE_BYTES_PER_DAY,
+            "maxScheduledEventsPerAdvance": min(MAX_ADVANCE_INPUT_EVENTS, config.MAX_INPUT_UPDATES_PER_WINDOW),
+            "maxScheduleBytesPerAdvance": MAX_ADVANCE_INPUT_BYTES,
+        },
+        "timeMode": ["simtime", "realtime", "external"],
+    }
+
+
 @dataclass(frozen=True)
 class SessionCommandServices:
     """Application policies used by session commands, supplied by the API layer."""
@@ -27,6 +55,8 @@ class SessionCommandServices:
     model_execution_policy: Callable[[dict[str, Any] | None], dict[str, Any]]
     reserve_simulation_scenario: Callable[..., None]
     reserve_input_update: Callable[..., None]
+    reserve_input_updates: Callable[..., dict[str, Any]]
+    settle_input_updates: Callable[..., None]
     validate_input_schedule: Callable[..., list[dict[str, Any]]]
     strict_number: Callable[[Any, str], float]
 
@@ -140,22 +170,7 @@ async def handle_ws_message(
             "serverTime": time.time(),
             "expiresAt": new_session.expires_at,
             "fmuSha256": model_sha256,
-            "capabilities": {
-                "modelDescribe": True,
-                "getState": True,
-                "start": True,
-                "pause": True,
-                "resume": True,
-                "reset": True,
-                "step": True,
-                "setInputs": True,
-                "streamOutputs": True,
-                "advanceSamples": True,
-                "advanceComputeBudget": True,
-                "advanceSampleSequences": True,
-                "maxOutputHz": config.MAX_OUTPUT_SUBSCRIPTION_HZ,
-                "timeMode": ["simtime", "realtime", "external"],
-            },
+            "capabilities": _session_capabilities(),
             "_session": new_session,
         }
 
@@ -199,6 +214,7 @@ async def handle_ws_message(
             "serverTime": time.time(),
             "expiresAt": attached_session.expires_at,
             "state": attached_session.state,
+            "capabilities": _session_capabilities(),
             "_session": attached_session,
         }
 
@@ -470,16 +486,53 @@ async def handle_ws_message(
                     raise ValueError("outputVariables contains an unknown or non-output variable")
                 output_refs = [int(outputs_by_name[name].valueReference) for name in output_variables]
 
-            result = await asyncio.to_thread(
-                session.advance,
-                target_time,
-                max_samples=max_samples,
-                step_size=step_size,
-                input_schedule=normalized_schedule or None,
-                output_sample_every_steps=output_sample_every_steps,
-                output_refs=output_refs,
-                max_compute_ms=max_compute_ms,
-            )
+            reservation = None
+            if normalized_schedule:
+                reservation = await asyncio.to_thread(
+                    services.reserve_input_updates,
+                    session.gateway_context,
+                    access_key,
+                    normalized_schedule,
+                )
+            try:
+                result = await asyncio.to_thread(
+                    session.advance,
+                    target_time,
+                    max_samples=max_samples,
+                    step_size=step_size,
+                    input_schedule=normalized_schedule,
+                    output_sample_every_steps=output_sample_every_steps,
+                    output_refs=output_refs,
+                    max_compute_ms=max_compute_ms,
+                )
+            except Exception:
+                if reservation:
+                    await asyncio.to_thread(
+                        services.settle_input_updates,
+                        session.gateway_context,
+                        access_key,
+                        reservation["reservationId"],
+                        len(normalized_schedule),
+                    )
+                raise
+            if reservation:
+                applied_count = result.get("inputEventsApplied")
+                if type(applied_count) is not int or not 0 <= applied_count <= len(normalized_schedule):
+                    await asyncio.to_thread(
+                        services.settle_input_updates,
+                        session.gateway_context,
+                        access_key,
+                        reservation["reservationId"],
+                        len(normalized_schedule),
+                    )
+                    raise ValueError("inputEventsApplied is outside the reserved schedule")
+                await asyncio.to_thread(
+                    services.settle_input_updates,
+                    session.gateway_context,
+                    access_key,
+                    reservation["reservationId"],
+                    applied_count,
+                )
         except process_runner.OutputReadRateLimitError as exc:
             raise _output_read_rate_limit_exception(exc) from exc
         except (TypeError, ValueError) as exc:

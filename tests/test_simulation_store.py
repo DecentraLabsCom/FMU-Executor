@@ -2,12 +2,18 @@ from __future__ import annotations
 
 import sqlite3
 import time
+import hashlib
 from contextlib import closing
 
 import pytest
 
 from app import config
-from app.simulation_store import QuotaExceededError, SimulationStore, reservation_scope
+from app.simulation_store import (
+    InputUpdateQuotaExceededError,
+    QuotaExceededError,
+    SimulationStore,
+    reservation_scope,
+)
 
 
 CONTEXT = {
@@ -213,3 +219,58 @@ def test_prune_limits_history_count_and_result_storage_without_deleting_active_j
     assert store.get_result("middle", scope_key)["result"] is None
     assert store.get_result("newest", scope_key)["result"] == {"v": "c" * 10}
     assert store.get_job("active", scope_key)["status"] == "running"
+
+
+def test_scheduled_input_reservation_charges_only_applied_prefix_when_remainder_is_retried(store, monkeypatch):
+    monkeypatch.setattr(config, "MAX_INPUT_UPDATES_PER_WINDOW", 4)
+    scope_key, _ = reservation_scope(CONTEXT)
+
+    reserved = store.reserve_input_updates(scope_key, "model.fmu", [10, 20])
+    store.settle_input_updates(scope_key, "model.fmu", reserved["reservationId"], applied_count=1)
+
+    assert _input_usage(store, scope_key, "model.fmu") == (1, 10)
+    assert _input_window_count(store, scope_key, "model.fmu") == 1
+
+    retried = store.reserve_input_updates(scope_key, "model.fmu", [20])
+    store.settle_input_updates(scope_key, "model.fmu", retried["reservationId"], applied_count=1)
+
+    assert _input_usage(store, scope_key, "model.fmu") == (2, 30)
+    assert _input_window_count(store, scope_key, "model.fmu") == 2
+
+
+def test_input_update_rate_limit_returns_time_until_window_capacity(store, monkeypatch):
+    monkeypatch.setattr(config, "MAX_INPUT_UPDATES_PER_WINDOW", 2)
+    monkeypatch.setattr(config, "INPUT_UPDATE_WINDOW_SECONDS", 10)
+    now = [1_000.0]
+    monkeypatch.setattr("app.simulation_store.time.time", lambda: now[0])
+    scope_key, _ = reservation_scope(CONTEXT)
+
+    store.reserve_input_update(scope_key, "model.fmu", 10)
+    now[0] += 1
+    store.reserve_input_update(scope_key, "model.fmu", 10)
+    now[0] += 1
+
+    with pytest.raises(InputUpdateQuotaExceededError) as error:
+        store.reserve_input_update(scope_key, "model.fmu", 10)
+
+    assert error.value.code == "INPUT_UPDATE_RATE_LIMIT"
+    assert error.value.retry_after_ms == 8_000
+
+
+def _input_usage(store, scope_key, access_key):
+    model_key = hashlib.sha256(access_key.encode("utf-8")).hexdigest()
+    with closing(sqlite3.connect(store.database_path)) as db:
+        row = db.execute(
+            "SELECT updates,payload_bytes FROM input_update_usage WHERE scope_key=? AND model_key=?",
+            (scope_key, model_key),
+        ).fetchone()
+    return tuple(row) if row else (0, 0)
+
+
+def _input_window_count(store, scope_key, access_key):
+    model_key = hashlib.sha256(access_key.encode("utf-8")).hexdigest()
+    with closing(sqlite3.connect(store.database_path)) as db:
+        return db.execute(
+            "SELECT COUNT(*) FROM input_update_events WHERE scope_key=? AND model_key=?",
+            (scope_key, model_key),
+        ).fetchone()[0]

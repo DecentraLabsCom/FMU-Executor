@@ -105,6 +105,36 @@ def test_input_reservation_validates_payload_and_maps_quota(monkeypatch):
     assert quota.value.status_code == 429
     detail = cast(dict[str, Any], quota.value.detail)
     assert detail["code"] == "INPUT_UPDATE_TOO_LARGE"
+    assert detail["retryable"] is False
+
+    reserve.side_effect = InputUpdateQuotaExceededError(
+        "INPUT_UPDATE_RATE_LIMIT",
+        0,
+        retry_after_ms=750,
+    )
+    with pytest.raises(HTTPException) as rate_limit:
+        main._reserve_input_update(context, "model.fmu", {"temperature": 1})
+    assert rate_limit.value.status_code == 429
+    assert rate_limit.value.detail == {
+        "code": "INPUT_UPDATE_RATE_LIMIT",
+        "remaining": 0,
+        "retryable": True,
+        "retryAfterMs": 750,
+    }
+
+    scheduled_events = [
+        {"time": 1.0, "values": {"temperature": 18}},
+        {"time": 2.0, "values": {"temperature": 19}},
+    ]
+    reserve_scheduled = Mock(return_value={"reservationId": "reservation-1"})
+    monkeypatch.setattr(main._simulation_store, "reserve_input_updates", reserve_scheduled)
+    result = main._reserve_input_updates(context, "model.fmu", scheduled_events)
+    payload_sizes = [
+        len(json.dumps(event["values"], separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8"))
+        for event in scheduled_events
+    ]
+    assert result == {"reservationId": "reservation-1"}
+    reserve_scheduled.assert_called_once_with("scope-key", "model.fmu", payload_sizes)
 
     reserve.side_effect = None
     with pytest.raises(HTTPException) as invalid:

@@ -542,12 +542,62 @@ def _reserve_input_update(context: dict[str, Any] | None, access_key: str, value
         )
         _simulation_store.reserve_input_update(scope_key, access_key, payload_bytes)
     except InputUpdateQuotaExceededError as exc:
-        raise HTTPException(
-            status_code=429,
-            detail={"code": exc.code, "remaining": exc.remaining},
-        ) from exc
+        raise _input_update_quota_exception(exc) from exc
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail="INVALID_INPUT_PAYLOAD") from exc
+
+
+def _reserve_input_updates(
+    context: dict[str, Any] | None,
+    access_key: str,
+    events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if not isinstance(context, dict):
+        raise HTTPException(status_code=403, detail="RESERVATION_SCOPE_REQUIRED")
+    scope_key = _scope_key(context, access_key)
+    try:
+        payload_sizes = [
+            len(json.dumps(event["values"], separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8"))
+            for event in events
+        ]
+        return _simulation_store.reserve_input_updates(scope_key, access_key, payload_sizes)
+    except InputUpdateQuotaExceededError as exc:
+        raise _input_update_quota_exception(exc) from exc
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="INVALID_INPUT_PAYLOAD") from exc
+
+
+def _settle_input_updates(
+    context: dict[str, Any] | None,
+    access_key: str,
+    reservation_id: str,
+    applied_count: int,
+) -> None:
+    if not isinstance(context, dict):
+        raise HTTPException(status_code=403, detail="RESERVATION_SCOPE_REQUIRED")
+    scope_key = _scope_key(context, access_key)
+    try:
+        _simulation_store.settle_input_updates(
+            scope_key,
+            access_key,
+            reservation_id,
+            applied_count=applied_count,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=500, detail="INPUT_UPDATE_RESERVATION_INVALID") from exc
+
+
+def _input_update_quota_exception(exc: InputUpdateQuotaExceededError) -> HTTPException:
+    detail: dict[str, Any] = {
+        "code": exc.code,
+        "remaining": exc.remaining,
+        "retryable": exc.retry_after_ms is not None,
+    }
+    if exc.retry_after_ms is not None:
+        detail["retryAfterMs"] = exc.retry_after_ms
+    if exc.max_batch_size is not None:
+        detail["maxBatchSize"] = exc.max_batch_size
+    return HTTPException(status_code=429, detail=detail)
 
 
 def _validate_backend_options(options: dict[str, Any]) -> None:
@@ -1101,6 +1151,8 @@ async def _handle_ws_message(
         model_execution_policy=model_execution_policy,
         reserve_simulation_scenario=_reserve_simulation_scenario,
         reserve_input_update=_reserve_input_update,
+        reserve_input_updates=_reserve_input_updates,
+        settle_input_updates=_settle_input_updates,
         validate_input_schedule=_validate_input_schedule,
         strict_number=_strict_number,
     )
