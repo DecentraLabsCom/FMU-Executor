@@ -19,7 +19,7 @@ MAX_ADVANCE_INPUT_BYTES = 256 * 1024
 MAX_ADVANCE_COMPUTE_MS = 1000
 
 
-def _session_capabilities(max_input_updates_per_window: int) -> dict[str, Any]:
+def _session_capabilities(max_input_updates_per_window: int | None) -> dict[str, Any]:
     return {
         "modelDescribe": True,
         "getState": True,
@@ -41,7 +41,11 @@ def _session_capabilities(max_input_updates_per_window: int) -> dict[str, Any]:
             "maxUpdateBytes": config.MAX_INPUT_UPDATE_BYTES,
             "maxUpdatesPerDay": config.MAX_INPUT_UPDATES_PER_DAY,
             "maxUpdateBytesPerDay": config.MAX_INPUT_UPDATE_BYTES_PER_DAY,
-            "maxScheduledEventsPerAdvance": min(MAX_ADVANCE_INPUT_EVENTS, max_input_updates_per_window),
+            "maxScheduledEventsPerAdvance": (
+                min(MAX_ADVANCE_INPUT_EVENTS, max_input_updates_per_window)
+                if max_input_updates_per_window is not None
+                else MAX_ADVANCE_INPUT_EVENTS
+            ),
             "maxScheduleBytesPerAdvance": MAX_ADVANCE_INPUT_BYTES,
         },
         "timeMode": ["simtime", "realtime", "external"],

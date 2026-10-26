@@ -65,16 +65,39 @@ def _bounded_int(key: str, default: int, minimum: int, maximum: int) -> int:
     return min(maximum, max(minimum, value))
 
 
+def _optional_bounded_int(key: str, maximum: int, *, minimum: int = 1) -> int | None:
+    """Read an optional quota: blank, zero, or 'unlimited' disables the cap."""
+    raw = os.environ.get(key)
+    if raw is None or not raw.strip() or raw.strip().lower() in {"unlimited", "none", "infinity"}:
+        return None
+    if raw.strip() == "0":
+        return None
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{key} must be a positive integer, zero, or 'unlimited'") from exc
+    if value < 0:
+        raise RuntimeError(f"{key} must not be negative")
+    if value == 0:
+        return None
+    return min(maximum, max(minimum, value))
+
+
 MAX_BATCH_CASES: int = _bounded_int("FMU_MAX_BATCH_CASES", 8, 1, 20)
-MAX_SCENARIOS_PER_RESERVATION_PER_DAY: int = _bounded_int(
-    "FMU_MAX_SCENARIOS_PER_RESERVATION_PER_DAY", 100, 1, 10000
+MAX_SCENARIOS_PER_RESERVATION_PER_DAY: int | None = _optional_bounded_int(
+    "FMU_MAX_SCENARIOS_PER_RESERVATION_PER_DAY", 10000
 )
 MAX_INPUT_UPDATE_BYTES: int = _bounded_int("FMU_MAX_INPUT_UPDATE_BYTES", 65536, 1024, 1048576)
-MAX_INPUT_UPDATES_PER_DAY: int = _bounded_int("FMU_MAX_INPUT_UPDATES_PER_DAY", 100000, 1, 1000000)
-MAX_INPUT_UPDATE_BYTES_PER_DAY: int = _bounded_int(
-    "FMU_MAX_INPUT_UPDATE_BYTES_PER_DAY", 64 * 1024 * 1024, 65536, 2 * 1024 * 1024 * 1024
+MAX_INPUT_UPDATES_PER_DAY: int | None = _optional_bounded_int(
+    "FMU_MAX_INPUT_UPDATES_PER_DAY", 1000000
 )
-MAX_INPUT_UPDATES_PER_WINDOW: int = _bounded_int("FMU_MAX_INPUT_UPDATES_PER_WINDOW", 10000, 1, 10000)
+MAX_INPUT_UPDATE_BYTES_PER_DAY: int | None = _optional_bounded_int(
+    "FMU_MAX_INPUT_UPDATE_BYTES_PER_DAY", 2 * 1024 * 1024 * 1024, minimum=65536
+)
+PLATFORM_MAX_INPUT_UPDATES_PER_WINDOW: int = 10000
+MAX_INPUT_UPDATES_PER_WINDOW: int | None = _optional_bounded_int(
+    "FMU_MAX_INPUT_UPDATES_PER_WINDOW", PLATFORM_MAX_INPUT_UPDATES_PER_WINDOW
+)
 INPUT_UPDATE_WINDOW_SECONDS: int = _bounded_int("FMU_INPUT_UPDATE_WINDOW_SECONDS", 10, 1, 3600)
 MAX_OUTPUT_SUBSCRIPTION_HZ: int = _bounded_int("FMU_MAX_OUTPUT_SUBSCRIPTION_HZ", 60, 1, 1000)
 MAX_OUTPUT_SUBSCRIPTION_BATCH: int = _bounded_int("FMU_MAX_OUTPUT_SUBSCRIPTION_BATCH", 256, 1, 4096)

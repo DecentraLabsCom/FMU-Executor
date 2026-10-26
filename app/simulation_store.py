@@ -209,7 +209,7 @@ class SimulationStore:
         if count < 1:
             raise ValueError("Scenario count must be positive")
         usage_day = datetime.now(timezone.utc).date().isoformat()
-        maximum = maximum or config.MAX_SCENARIOS_PER_RESERVATION_PER_DAY
+        maximum = maximum if maximum is not None else config.MAX_SCENARIOS_PER_RESERVATION_PER_DAY
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute(
@@ -223,7 +223,7 @@ class SimulationStore:
                     (scope_key, usage_day),
                 ).fetchone()
                 used += int(legacy["scenarios"]) if legacy else 0
-            if used + count > maximum:
+            if maximum is not None and used + count > maximum:
                 raise QuotaExceededError(maximum - used)
             db.execute(
                 "INSERT INTO simulation_model_usage(scope_key,model_sha256,usage_day,scenarios) VALUES(?,?,?,?) "
@@ -240,7 +240,7 @@ class SimulationStore:
         *,
         maximum_window_count: int | None = None,
         window_seconds: int | None = None,
-    ) -> dict[str, int]:
+    ) -> dict[str, int | None]:
         """Debit input update budgets independently from simulation scenarios."""
         return self._reserve_input_updates(
             scope_key,
@@ -295,11 +295,18 @@ class SimulationStore:
             if window_seconds is None
             else window_seconds
         )
-        if type(effective_window_count) is not int or not 1 <= effective_window_count <= config.MAX_INPUT_UPDATES_PER_WINDOW:
+        if effective_window_count is not None and (
+            type(effective_window_count) is not int
+            or not 1 <= effective_window_count <= config.PLATFORM_MAX_INPUT_UPDATES_PER_WINDOW
+            or (
+                config.MAX_INPUT_UPDATES_PER_WINDOW is not None
+                and effective_window_count > config.MAX_INPUT_UPDATES_PER_WINDOW
+            )
+        ):
             raise ValueError("Maximum input updates per window is outside the platform range")
         if type(effective_window_seconds) is not int or effective_window_seconds != config.INPUT_UPDATE_WINDOW_SECONDS:
             raise ValueError("Input update window must match the platform window")
-        if reserve_for_schedule and update_count > effective_window_count:
+        if reserve_for_schedule and effective_window_count is not None and update_count > effective_window_count:
             raise InputUpdateQuotaExceededError(
                 "INPUT_UPDATE_BATCH_LIMIT",
                 effective_window_count,
@@ -316,33 +323,34 @@ class SimulationStore:
         reservation_id = uuid.uuid4().hex if reserve_for_schedule else None
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            db.execute("DELETE FROM input_update_events WHERE created_at<?", (now - 3600,))
-            db.execute(
-                "DELETE FROM input_update_events WHERE scope_key=? AND model_key=? AND created_at<?",
-                (scope_key, model_key, window_start),
-            )
-            recent = int(db.execute(
-                "SELECT COUNT(*) AS count FROM input_update_events "
-                "WHERE scope_key=? AND model_key=? AND created_at>=?",
-                (scope_key, model_key, window_start),
-            ).fetchone()["count"])
-            if recent + update_count > effective_window_count:
-                events_to_expire = recent + update_count - effective_window_count
-                earliest_required_expiry = db.execute(
-                    "SELECT created_at FROM input_update_events "
-                    "WHERE scope_key=? AND model_key=? AND created_at>=? "
-                    "ORDER BY created_at LIMIT 1 OFFSET ?",
-                    (scope_key, model_key, window_start, events_to_expire - 1),
-                ).fetchone()
-                retry_after_ms = max(
-                    1,
-                    math.ceil((float(earliest_required_expiry["created_at"]) + effective_window_seconds - now) * 1000),
-                ) if earliest_required_expiry else None
-                raise InputUpdateQuotaExceededError(
-                    "INPUT_UPDATE_RATE_LIMIT",
-                    max(0, effective_window_count - recent),
-                    retry_after_ms=retry_after_ms,
+            if effective_window_count is not None:
+                db.execute("DELETE FROM input_update_events WHERE created_at<?", (now - 3600,))
+                db.execute(
+                    "DELETE FROM input_update_events WHERE scope_key=? AND model_key=? AND created_at<?",
+                    (scope_key, model_key, window_start),
                 )
+                recent = int(db.execute(
+                    "SELECT COUNT(*) AS count FROM input_update_events "
+                    "WHERE scope_key=? AND model_key=? AND created_at>=?",
+                    (scope_key, model_key, window_start),
+                ).fetchone()["count"])
+                if recent + update_count > effective_window_count:
+                    events_to_expire = recent + update_count - effective_window_count
+                    earliest_required_expiry = db.execute(
+                        "SELECT created_at FROM input_update_events "
+                        "WHERE scope_key=? AND model_key=? AND created_at>=? "
+                        "ORDER BY created_at LIMIT 1 OFFSET ?",
+                        (scope_key, model_key, window_start, events_to_expire - 1),
+                    ).fetchone()
+                    retry_after_ms = max(
+                        1,
+                        math.ceil((float(earliest_required_expiry["created_at"]) + effective_window_seconds - now) * 1000),
+                    ) if earliest_required_expiry else None
+                    raise InputUpdateQuotaExceededError(
+                        "INPUT_UPDATE_RATE_LIMIT",
+                        max(0, effective_window_count - recent),
+                        retry_after_ms=retry_after_ms,
+                    )
             row = db.execute(
                 "SELECT updates,payload_bytes FROM input_update_usage "
                 "WHERE scope_key=? AND model_key=? AND usage_day=?",
@@ -350,11 +358,17 @@ class SimulationStore:
             ).fetchone()
             used_updates = int(row["updates"]) if row else 0
             used_bytes = int(row["payload_bytes"]) if row else 0
-            if used_updates + update_count > config.MAX_INPUT_UPDATES_PER_DAY:
+            if (
+                config.MAX_INPUT_UPDATES_PER_DAY is not None
+                and used_updates + update_count > config.MAX_INPUT_UPDATES_PER_DAY
+            ):
                 raise InputUpdateQuotaExceededError(
                     "INPUT_UPDATE_DAILY_LIMIT", max(0, config.MAX_INPUT_UPDATES_PER_DAY - used_updates)
                 )
-            if used_bytes + payload_bytes_total > config.MAX_INPUT_UPDATE_BYTES_PER_DAY:
+            if (
+                config.MAX_INPUT_UPDATE_BYTES_PER_DAY is not None
+                and used_bytes + payload_bytes_total > config.MAX_INPUT_UPDATE_BYTES_PER_DAY
+            ):
                 raise InputUpdateQuotaExceededError(
                     "INPUT_UPDATE_DAILY_BYTES_LIMIT",
                     max(0, config.MAX_INPUT_UPDATE_BYTES_PER_DAY - used_bytes),
@@ -365,14 +379,21 @@ class SimulationStore:
                 "updates=excluded.updates,payload_bytes=excluded.payload_bytes",
                 (scope_key, model_key, usage_day, used_updates + update_count, used_bytes + payload_bytes_total),
             )
-            db.executemany(
-                "INSERT INTO input_update_events "
-                "(scope_key,model_key,created_at,payload_bytes,usage_day,reservation_id) VALUES(?,?,?,?,?,?)",
-                [(scope_key, model_key, now, size, usage_day, reservation_id) for size in payload_sizes],
-            )
-            result: dict[str, int | str] = {
-                "updatesRemaining": config.MAX_INPUT_UPDATES_PER_DAY - used_updates - update_count,
-                "bytesRemaining": config.MAX_INPUT_UPDATE_BYTES_PER_DAY - used_bytes - payload_bytes_total,
+            if effective_window_count is not None or reservation_id:
+                db.executemany(
+                    "INSERT INTO input_update_events "
+                    "(scope_key,model_key,created_at,payload_bytes,usage_day,reservation_id) VALUES(?,?,?,?,?,?)",
+                    [(scope_key, model_key, now, size, usage_day, reservation_id) for size in payload_sizes],
+                )
+            result: dict[str, int | str | None] = {
+                "updatesRemaining": (
+                    config.MAX_INPUT_UPDATES_PER_DAY - used_updates - update_count
+                    if config.MAX_INPUT_UPDATES_PER_DAY is not None else None
+                ),
+                "bytesRemaining": (
+                    config.MAX_INPUT_UPDATE_BYTES_PER_DAY - used_bytes - payload_bytes_total
+                    if config.MAX_INPUT_UPDATE_BYTES_PER_DAY is not None else None
+                ),
             }
             if reservation_id:
                 result["reservationId"] = reservation_id
@@ -385,6 +406,7 @@ class SimulationStore:
         reservation_id: str,
         *,
         applied_count: int,
+        maximum_window_count: int | None = None,
     ) -> None:
         """Keep quota for applied scheduled writes and release the unconsumed suffix."""
         if type(applied_count) is not int or applied_count < 0:
@@ -426,10 +448,21 @@ class SimulationStore:
                 db.executemany("DELETE FROM input_update_events WHERE rowid=?", [(row["rowid"],) for row in unused_rows])
             applied_rows = rows[:applied_count]
             if applied_rows:
-                db.executemany(
-                    "UPDATE input_update_events SET reservation_id=NULL WHERE rowid=?",
-                    [(row["rowid"],) for row in applied_rows],
+                effective_window_count = (
+                    maximum_window_count
+                    if maximum_window_count is not None
+                    else config.MAX_INPUT_UPDATES_PER_WINDOW
                 )
+                if effective_window_count is None:
+                    db.executemany(
+                        "DELETE FROM input_update_events WHERE rowid=?",
+                        [(row["rowid"],) for row in applied_rows],
+                    )
+                else:
+                    db.executemany(
+                        "UPDATE input_update_events SET reservation_id=NULL WHERE rowid=?",
+                        [(row["rowid"],) for row in applied_rows],
+                    )
 
     def create_job(
         self,
@@ -445,7 +478,7 @@ class SimulationStore:
         metadata: dict[str, Any],
         authorization_expires_at: float,
         reservation_ends_at: float | None,
-        maximum_scenarios: int,
+        maximum_scenarios: int | None,
     ) -> None:
         """Create the audit row and charge its scenarios in one transaction."""
         self.prune()
@@ -468,7 +501,7 @@ class SimulationStore:
             ).fetchone()
             used += int(legacy["scenarios"]) if legacy and model_sha256 != "*" else 0
             maximum = maximum_scenarios
-            if used + total_cases > maximum:
+            if maximum is not None and used + total_cases > maximum:
                 raise QuotaExceededError(maximum - used)
             db.execute(
                 "INSERT INTO simulation_jobs "

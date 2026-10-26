@@ -592,6 +592,7 @@ def _settle_input_updates(
             access_key,
             reservation_id,
             applied_count=applied_count,
+            maximum_window_count=model_execution_policy(context)["maxInputUpdatesPerWindow"],
         )
     except ValueError as exc:
         raise HTTPException(status_code=500, detail="INPUT_UPDATE_RESERVATION_INVALID") from exc

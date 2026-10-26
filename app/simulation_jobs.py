@@ -39,7 +39,7 @@ def _job_id(requested: str | None) -> str:
     return value
 
 
-def model_execution_policy(context: dict[str, Any] | None) -> dict[str, int]:
+def model_execution_policy(context: dict[str, Any] | None) -> dict[str, int | None]:
     claims = (context or {}).get("claims") or {}
     raw = claims.get("fmuExecutionPolicy", {}) if isinstance(claims, dict) else {}
     if not isinstance(raw, dict):
@@ -54,13 +54,18 @@ def model_execution_policy(context: dict[str, Any] | None) -> dict[str, int]:
     }
     if set(raw) - allowed:
         raise HTTPException(status_code=403, detail="INVALID_FMU_EXECUTION_POLICY")
+    window_ceiling = (
+        config.MAX_INPUT_UPDATES_PER_WINDOW
+        if config.MAX_INPUT_UPDATES_PER_WINDOW is not None
+        else config.PLATFORM_MAX_INPUT_UPDATES_PER_WINDOW
+    )
     maxima = {
         "maxDailyScenarios": 10000,
         "maxSteps": config.MAX_SIMULATION_STEPS,
         "maxCpuSeconds": config.WORKER_CPU_SECONDS,
         "maxMemoryMiB": config.WORKER_MEMORY_BYTES // (1024 * 1024),
         "maxResultBytes": config.MAX_STORED_RESULT_BYTES,
-        "maxInputUpdatesPerWindow": config.MAX_INPUT_UPDATES_PER_WINDOW,
+        "maxInputUpdatesPerWindow": window_ceiling,
     }
     defaults = {
         "maxDailyScenarios": config.MAX_SCENARIOS_PER_RESERVATION_PER_DAY,
@@ -73,6 +78,9 @@ def model_execution_policy(context: dict[str, Any] | None) -> dict[str, int]:
     policy = {}
     for key, default in defaults.items():
         value = raw.get(key, default)
+        if default is None and key not in raw:
+            policy[key] = None
+            continue
         if type(value) is not int or value < 1 or value > maxima[key]:
             raise HTTPException(status_code=403, detail="INVALID_FMU_EXECUTION_POLICY")
         policy[key] = value

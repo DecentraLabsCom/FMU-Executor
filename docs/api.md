@@ -176,11 +176,13 @@ It returns `sim.samples` with intermediate samples, `simTime`, `finished`,
 adds `maxComputeMs` and `computeBudgetOverrunMs`. Its frame size remains below a
 conservative 1 MB budget; the Executor can reduce the returned batch size when
 output names are long. Session capabilities advertise `advanceSamples`,
-`advanceComputeBudget`, `advanceSampleSequences`, `maxOutputHz`, and
-`advanceInputValues` and `inputUpdateQuota`. The latter reports the sliding-window and daily write
-limits, maximum payload size, and maximum scheduled events and bytes accepted
-per `sim.advance`. `maxUpdatesPerWindow` reflects the effective signed
-per-resource policy, bounded by the Station hard maximum.
+`advanceComputeBudget`, `advanceSampleSequences`, `maxOutputHz`,
+`advanceInputValues` and `inputUpdateQuota`. The latter reports sliding-window
+and daily quotas, maximum payload size, and maximum scheduled events and bytes
+accepted per `sim.advance`. A `null` sliding-window or daily quota means that
+quota is unlimited. `maxUpdatesPerWindow` reflects the effective signed
+per-resource policy when one is configured; per-advance event and byte bounds
+remain finite.
 
 The `maxComputeMs` budget is soft and is checked between FMI steps. It cannot
 interrupt a long-running `doStep()`: the Executor returns after that step and

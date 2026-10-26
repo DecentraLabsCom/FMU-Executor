@@ -1,15 +1,18 @@
 export function getInputUpdateQuota(capabilities) {
   const quota = capabilities?.inputUpdateQuota
-  const positiveIntegerLimits = [
+  const optionalQuotaLimits = [
     quota?.maxUpdatesPerWindow,
-    quota?.maxUpdateBytes,
     quota?.maxUpdatesPerDay,
     quota?.maxUpdateBytesPerDay,
+  ]
+  const positiveIntegerLimits = [
+    quota?.maxUpdateBytes,
     quota?.maxScheduledEventsPerAdvance,
     quota?.maxScheduleBytesPerAdvance,
   ]
   const windowMs = quota?.windowMs
-  if (positiveIntegerLimits.some((limit) => !Number.isSafeInteger(limit) || limit < 1)
+  if (optionalQuotaLimits.some((limit) => limit !== null && (!Number.isSafeInteger(limit) || limit < 1))
+    || positiveIntegerLimits.some((limit) => !Number.isSafeInteger(limit) || limit < 1)
     || !Number.isFinite(windowMs) || windowMs < 1 || windowMs > 3_600_000) {
     throw Object.assign(
       new Error('The FMU runtime did not advertise a valid input update quota.'),
@@ -29,7 +32,7 @@ export function getInputUpdateQuota(capabilities) {
 
 export function getInputUpdateIntervalMs(capabilities) {
   const { maxUpdatesPerWindow, windowMs } = getInputUpdateQuota(capabilities)
-  return windowMs / maxUpdatesPerWindow
+  return maxUpdatesPerWindow === null ? 0 : windowMs / maxUpdatesPerWindow
 }
 
 export function getInputUpdateRetryDelayMs(error, capabilities) {

@@ -323,7 +323,7 @@ def test_attach_requires_a_live_context_and_matching_session(dispatch, monkeypat
         selected_session=None,
     )
     assert attached["type"] == "session.attached"
-    assert attached["capabilities"]["inputUpdateQuota"]["maxScheduledEventsPerAdvance"] <= main.config.MAX_INPUT_UPDATES_PER_WINDOW
+    assert attached["capabilities"]["inputUpdateQuota"]["maxScheduledEventsPerAdvance"] == 1024
     with pytest.raises(HTTPException) as exc:
         call({"type": "session.attach", "sessionId": "other"}, {"accessKey": "demo.fmu"})
     assert exc.value.status_code == 403

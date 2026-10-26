@@ -116,16 +116,16 @@ secret to Gateway's `FMU_STATION_INTERNAL_TOKEN`.
 | Variable | Default | Allowed range | Applies to |
 |---|---:|---:|---|
 | `FMU_MAX_BATCH_CASES` | `8` | `1–20` | Scenarios in one batch. |
-| `FMU_MAX_SCENARIOS_PER_RESERVATION_PER_DAY` | `100` | `1–10,000` | Scenario starts per reservation and FMU per UTC day. |
+| `FMU_MAX_SCENARIOS_PER_RESERVATION_PER_DAY` | Unlimited | `1–10,000` | Optional scenario-start quota per reservation and FMU per UTC day. |
 | `FMU_MAX_SIMULATION_PARAMETERS` | `32` | `1–256` | Named parameters in a simulation request. |
 | `FMU_MAX_SIMULATION_STEPS` | `10,000` | `100–1,000,000` | Communication steps per initialization. |
 | `FMU_MAX_INPUT_SCHEDULE_EVENTS` | `128` | `1–200,000` | Events in an input schedule. |
 | `FMU_MAX_INPUT_SCHEDULE_BYTES` | `16 KiB` | `1 KiB–16 MiB` | Serialized input schedule payload. |
 | `FMU_MAX_INPUT_UPDATE_BYTES` | `65,536` | `1,024–1 MiB` | One `sim.setInputs` payload or one scheduled event's values. |
-| `FMU_MAX_INPUT_UPDATES_PER_DAY` | `100,000` | `1–1,000,000` | Input writes per reservation and FMU per UTC day, including timed writes. |
-| `FMU_MAX_INPUT_UPDATE_BYTES_PER_DAY` | `64 MiB` | `64 KiB–2 GiB` | Input payload bytes per reservation and FMU per UTC day. |
-| `FMU_MAX_INPUT_UPDATES_PER_WINDOW` | `10,000` | `1–10,000` | Station hard maximum and default for input writes in one sliding window, including timed writes. A signed `fmuExecutionPolicy.maxInputUpdatesPerWindow` can lower it per resource. |
-| `FMU_INPUT_UPDATE_WINDOW_SECONDS` | `10` | `1–3,600` | Sliding window used for input write throttling. |
+| `FMU_MAX_INPUT_UPDATES_PER_DAY` | Unlimited | `1–1,000,000` | Optional input-write quota per reservation and FMU per UTC day, including timed writes. |
+| `FMU_MAX_INPUT_UPDATE_BYTES_PER_DAY` | Unlimited | `64 KiB–2 GiB` | Optional input-payload quota per reservation and FMU per UTC day. |
+| `FMU_MAX_INPUT_UPDATES_PER_WINDOW` | Unlimited | `1–10,000` | Optional global sliding-window quota for input writes, including timed writes. A signed `fmuExecutionPolicy.maxInputUpdatesPerWindow` can impose a lower per-resource limit. |
+| `FMU_INPUT_UPDATE_WINDOW_SECONDS` | `10` | `1–3,600` | Window duration used only when an input-write quota is configured. |
 | `FMU_MAX_OUTPUT_SUBSCRIPTION_HZ` | `60` | `1–1,000` | Per-session cap for realtime output reads and samples. |
 | `FMU_MAX_OUTPUT_SUBSCRIPTION_BATCH` | `256` | `1–4,096` | Retained samples in one subscription batch. |
 | `FMU_PROGRESS_INTERVAL_MS` | `50` | `10–5,000` | Minimum interval between automatic progress messages. |
@@ -137,6 +137,11 @@ secret to Gateway's `FMU_STATION_INTERNAL_TOKEN`.
 
 Each batch scenario also has a fixed 16 KiB parameter-JSON limit; it is not an
 environment variable.
+
+Quota variables accept a positive integer to enable an explicit cap. An empty
+value, `0`, or `unlimited` leaves the quota unlimited. Request-size,
+per-advance, simulation-step, worker-resource, and reservation-deadline limits
+remain enforced independently.
 
 ### FMU archive and worker limits
 
