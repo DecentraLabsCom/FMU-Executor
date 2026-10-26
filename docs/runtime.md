@@ -99,6 +99,9 @@ Executor before returning a step. Step responses include the last successful
 simulation time, early-return and termination flags, and whether an event
 occurred. `sim.advance` returns a bounded set of intermediate samples in one
 request; see the [WebSocket API reference](api.md#realtime-websocket-protocol).
+Apps with high-rate timed inputs can send a bounded `inputSchedule` with each
+advance and use `outputSampleEverySteps` to keep integration steps separate
+from the rate at which results cross the WebSocket.
 
 Automatic progress messages are throttled independently of `stepSize`.
 Realtime output reads share the configured per-session rate cap across output

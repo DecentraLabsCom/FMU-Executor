@@ -105,7 +105,14 @@ def test_advance_batches_use_the_same_authorized_session_and_validate_before_exe
     session.advance = Mock(return_value={"samples": [{"time": 0.1, "outputs": {"x": 1}}], "simTime": 0.1, "finished": False})
     result = call({"type": "sim.advance", "targetTime": 2, "maxSamples": 256, "stepSize": 0.1})
     assert result["type"] == "sim.samples" and result["sessionId"] == session.session_id
-    session.advance.assert_called_once_with(2.0, max_samples=256, step_size=0.1)
+    session.advance.assert_called_once_with(
+        2.0,
+        max_samples=256,
+        step_size=0.1,
+        input_schedule=[],
+        output_sample_every_steps=1,
+        output_refs=None,
+    )
     with pytest.raises(HTTPException):
         call({"type": "sim.advance", "targetTime": 2, "maxSamples": 257})
     assert session.advance.call_count == 1

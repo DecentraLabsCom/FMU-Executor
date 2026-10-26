@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 import time
 from dataclasses import dataclass
@@ -11,6 +12,9 @@ from typing import Any, Callable, Protocol, cast
 from fastapi import HTTPException
 
 from . import auth, config, engine, fmu_storage, process_runner
+
+MAX_ADVANCE_INPUT_EVENTS = 1024
+MAX_ADVANCE_INPUT_BYTES = 256 * 1024
 
 
 @dataclass(frozen=True)
@@ -395,9 +399,75 @@ async def handle_ws_message(
             max_samples = msg.get("maxSamples", 256)
             if type(max_samples) is not int or not 1 <= max_samples <= 256:
                 raise ValueError("maxSamples must be an integer between 1 and 256")
+            output_sample_every_steps = msg.get("outputSampleEverySteps", 1)
+            if type(output_sample_every_steps) is not int or output_sample_every_steps < 1:
+                raise ValueError("outputSampleEverySteps must be a positive integer")
             if session._time_mode == "external":
                 raise ValueError("sim.advance requires simtime or realtime mode")
-            result = await asyncio.to_thread(session.advance, target_time, max_samples=max_samples, step_size=step_size)
+
+            input_schedule = msg.get("inputSchedule", [])
+            if not isinstance(input_schedule, list) or len(input_schedule) > MAX_ADVANCE_INPUT_EVENTS:
+                raise ValueError("inputSchedule exceeds the event limit")
+            try:
+                encoded_schedule = json.dumps(input_schedule, separators=(",", ":"), allow_nan=False)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("inputSchedule is invalid") from exc
+            if len(encoded_schedule.encode("utf-8")) > MAX_ADVANCE_INPUT_BYTES:
+                raise ValueError("inputSchedule exceeds the byte limit")
+
+            effective_step_size = step_size if step_size is not None else session._step_size
+            if effective_step_size <= 0:
+                raise ValueError("stepSize must be positive")
+            schedule_start = session._time
+            previous_time = schedule_start
+            normalized_schedule = []
+            for event in input_schedule:
+                if not isinstance(event, dict) or set(event) != {"time", "values"}:
+                    raise ValueError("Each inputSchedule event must contain time and values")
+                event_time = services.strict_number(event["time"], "inputSchedule.time")
+                values = event["values"]
+                if not isinstance(values, dict) or not values:
+                    raise ValueError("inputSchedule values must be a non-empty object")
+                tolerance = max(1e-9, abs(effective_step_size) * 1e-7)
+                step_index = round((event_time - session._start_time) / effective_step_size)
+                aligned_time = session._start_time + step_index * effective_step_size
+                if (event_time < schedule_start - 1e-12 or event_time > target_time + 1e-12
+                        or event_time < previous_time - 1e-12
+                        or abs(aligned_time - event_time) > tolerance):
+                    raise ValueError("inputSchedule times must be ordered, within the advance interval and aligned to the model step")
+                normalized_schedule.append({"time": event_time, "values": values})
+                previous_time = event_time
+            if normalized_schedule:
+                normalized_schedule = await asyncio.to_thread(session.validate_input_schedule, normalized_schedule)
+
+            output_refs = None
+            output_variables = msg.get("outputVariables")
+            if output_variables is not None:
+                if (not isinstance(output_variables, list) or not output_variables
+                        or len(output_variables) > 512 or any(not isinstance(name, str) for name in output_variables)
+                        or len(set(output_variables)) != len(output_variables)):
+                    raise ValueError("outputVariables must be a non-empty array of at most 512 names")
+                model_variables = getattr(getattr(session, "_md", None), "modelVariables", None)
+                if not model_variables:
+                    raise ValueError("model description must be loaded before selecting outputVariables")
+                outputs_by_name = {
+                    variable.name: variable
+                    for variable in model_variables
+                    if getattr(variable, "causality", None) == "output"
+                }
+                if any(name not in outputs_by_name for name in output_variables):
+                    raise ValueError("outputVariables contains an unknown or non-output variable")
+                output_refs = [int(outputs_by_name[name].valueReference) for name in output_variables]
+
+            result = await asyncio.to_thread(
+                session.advance,
+                target_time,
+                max_samples=max_samples,
+                step_size=step_size,
+                input_schedule=normalized_schedule or None,
+                output_sample_every_steps=output_sample_every_steps,
+                output_refs=output_refs,
+            )
         except process_runner.OutputReadRateLimitError as exc:
             raise _output_read_rate_limit_exception(exc) from exc
         except (TypeError, ValueError) as exc:

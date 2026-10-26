@@ -165,6 +165,15 @@ It returns `sim.samples` with intermediate samples, `simTime`, `finished` and
 1 MB budget; the Executor can reduce the returned batch size when output names
 are long. Session capabilities advertise `advanceSamples` and `maxOutputHz`.
 
+For high-rate models, `outputSampleEverySteps` keeps every Nth integration
+sample and always includes the final sample. The request must still fit within
+`maxSamples` and the frame budget. `outputVariables` can select named FMU
+outputs to reduce each sample. `inputSchedule` can carry up to 1,024 ordered,
+step-aligned timed writes (256 KiB encoded) for that advance window; the
+Executor validates every write against the session's variable permissions and
+applies it at its scheduled model time while advancing. These fields are
+optional; ordinary apps can continue using `sim.advance` as before.
+
 If the internal WebSocket closes unexpectedly, the Executor detaches the
 session instead of terminating it immediately. A new connection may attach
 using the original `sessionId` and validated `gatewayContext` within

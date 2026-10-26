@@ -404,29 +404,53 @@ class FmuSession:
         if self._step_count + additional_steps > self._max_simulation_steps:
             raise ValueError("MAX_SIMULATION_STEPS_EXCEEDED")
 
-    def advance(self, target_time: float, max_samples: int = 256, step_size: float | None = None) -> dict[str, Any]:
-        """Advance a bounded batch without dropping intermediate output samples.
-
-        One request is one flow-control window. Reserve space for the worst-case
-        scalar values, timestamps and response envelope before doing any steps.
-        The existing streaming iterator owns FMI stepping and termination rules.
-        """
+    def advance(
+        self,
+        target_time: float,
+        max_samples: int = 256,
+        step_size: float | None = None,
+        input_schedule: list[dict[str, Any]] | None = None,
+        output_sample_every_steps: int = 1,
+        output_refs: list[int] | None = None,
+    ) -> dict[str, Any]:
+        """Advance one bounded request, optionally applying timed inputs and sampling sparsely."""
         if type(max_samples) is not int or not 1 <= max_samples <= 256:
             raise ValueError("maxSamples must be an integer between 1 and 256")
-        outputs = self.get_outputs()["outputs"]
+        if type(output_sample_every_steps) is not int or output_sample_every_steps < 1:
+            raise ValueError("outputSampleEverySteps must be a positive integer")
+        h = self._step_size if step_size is None else step_size
+        if not math.isfinite(target_time) or not math.isfinite(h) or h <= 0:
+            raise ValueError("targetTime must be finite and stepSize must be positive")
+        expected_steps = max(0.0, target_time - self._time) / h
+        expected_samples = math.ceil(expected_steps / output_sample_every_steps)
+        if input_schedule and expected_samples > max_samples:
+            raise ValueError("ADVANCE_SAMPLE_LIMIT_EXCEEDED")
+
+        outputs = self.get_outputs(output_refs)["outputs"]
         if any(not isinstance(value, (bool, int, float)) for value in outputs.values()):
             raise ValueError("Batched samples require scalar FMI outputs")
         sample_bound = 128 + sum(len(json.dumps(name)) + 64 for name in outputs)
         safe_count = min(max_samples, 900_000 // sample_bound)
         if safe_count < 1:
             raise ValueError("One output sample exceeds the WebSocket frame budget")
+        if input_schedule and expected_samples > safe_count:
+            raise ValueError("ADVANCE_SAMPLE_LIMIT_EXCEEDED")
         samples = []
-        snapshots = self.run_until_streaming(target_time, step_size=step_size)
+        snapshots = self.run_until_streaming(
+            target_time,
+            step_size=step_size,
+            output_refs=output_refs,
+            input_schedule=input_schedule,
+        )
+        step_index = 0
         try:
             for snapshot in snapshots:
-                samples.append({"time": snapshot["time"], "outputs": snapshot["outputs"]})
-                if len(samples) >= safe_count:
-                    break
+                step_index += 1
+                is_final = snapshot["finished"] or snapshot["time"] >= target_time - 1e-12
+                if step_index % output_sample_every_steps == 0 or is_final:
+                    samples.append({"time": snapshot["time"], "outputs": snapshot["outputs"]})
+                    if len(samples) >= safe_count and not input_schedule:
+                        break
         finally:
             snapshots.close()
         return {
@@ -457,6 +481,16 @@ class FmuSession:
         if self._state in {"stopped", "error"}:
             raise RuntimeError(f"Session cannot accept inputs from state {self._state}")
         return self._validate_values(values, phase="runtime")
+
+    def validate_input_schedule(self, input_schedule: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Validate timed runtime writes in one call without changing FMU state."""
+        self._ensure_live()
+        if self._state in {"stopped", "error"}:
+            raise RuntimeError(f"Session cannot accept inputs from state {self._state}")
+        return [
+            {"time": event["time"], "values": self._validate_values(event["values"], phase="runtime")}
+            for event in input_schedule
+        ]
 
     def validate_runtime_input_values(self, values: dict[str, Any]) -> dict[str, Any]:
         """Validate input values against the loaded model before initialization."""

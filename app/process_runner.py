@@ -66,6 +66,7 @@ _REALTIME_METHODS = {
     "run_until",
     "advance",
     "validate_inputs",
+    "validate_input_schedule",
     "set_inputs",
     "get_outputs",
     "pause",
@@ -594,10 +595,26 @@ class RealtimeSession:
             return self._rpc("run_until", target_time)
         return self._rpc("run_until", target_time, step_size=step_size)
 
-    def advance(self, target_time: float, max_samples: int = 256, step_size: float | None = None) -> dict[str, Any]:
+    def advance(
+        self,
+        target_time: float,
+        max_samples: int = 256,
+        step_size: float | None = None,
+        input_schedule: list[dict[str, Any]] | None = None,
+        output_sample_every_steps: int = 1,
+        output_refs: list[int] | None = None,
+    ) -> dict[str, Any]:
         self._acquire_output_read_or_raise()
         try:
-            return self._rpc("advance", target_time, max_samples=max_samples, step_size=step_size)
+            return self._rpc(
+                "advance",
+                target_time,
+                max_samples=max_samples,
+                step_size=step_size,
+                input_schedule=input_schedule,
+                output_sample_every_steps=output_sample_every_steps,
+                output_refs=output_refs,
+            )
         finally:
             self._finish_output_read()
 
@@ -607,6 +624,10 @@ class RealtimeSession:
     def validate_inputs(self, values: dict[str, Any]) -> dict[str, Any]:
         result = self._rpc("validate_inputs", values)
         return result if isinstance(result, dict) else {}
+
+    def validate_input_schedule(self, input_schedule: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        result = self._rpc("validate_input_schedule", input_schedule)
+        return result if isinstance(result, list) else []
 
     def get_outputs(self, refs: list[int] | None = None) -> dict[str, Any]:
         return self._rpc("get_outputs", refs)
