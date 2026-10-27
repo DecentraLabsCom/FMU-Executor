@@ -127,19 +127,6 @@ a same-stem companion `.glb` for Gateway/Station asset import. The optional
 `.webapp.zip` is also kept beside the FMU so Lab Manager can import it from
 either FMU backend. Build scripts package the checked-in default scene as-is.
 
-## Local scene authoring
-
-To export the current Three.js app scene to the checked-in GLB, start the local
-export helper from this directory:
-
-```powershell
-python tools/serve-scene-export.py --three-root ../../../Marketplace/node_modules/three
-```
-
-Open `http://127.0.0.1:8765/tools/export-scene.html` to generate
-`smart-warehouse-cell.glb` from the app scene. The helper binds only to
-loopback; it does not upload the scene or contact an external asset server.
-
 ## Demo profile
 
 1. Provision `SmartWarehouseCell.fmu` as an FMU laboratory.
