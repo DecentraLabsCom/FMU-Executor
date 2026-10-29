@@ -26,7 +26,7 @@ Gateway authorization or a user-facing credential.
 | `GET` | `/internal/fmu/backends` | Active FMPy backend and optional OMSimulator discovery; internal token. |
 | `GET` | `/internal/fmu/catalog` | FMU inventory; internal token and `X-FMU-Access-Key`. |
 | `GET` | `/internal/fmu/describe` | Normalized model description; internal token and `X-FMU-Access-Key`. Optional `publicOnly=true` and `causality=output` filters. |
-| `GET` | `/internal/fmu/companion-asset` | Same-stem `.glb` or `.webapp.zip`; choose with `assetType=glb` or `assetType=threejs-app`; internal token and FMU access key. |
+| `GET` | `/internal/fmu/companion-asset` | A declared local visual asset from FMI-LS-REF or a same-stem companion; choose `assetType=auto`, `glb` or `threejs-app`; internal token and FMU access key. Auto prefers a `.webapp.zip`, then a declared GLB, then a same-stem GLB, and reports the resolved type and source in response headers. |
 | `GET` | `/internal/fmu/companion-app/{asset_path}` | Reads one safe file from the same-stem `.webapp.zip`; internal token and FMU access key. |
 | `POST` | `/internal/fmu/validate/{access_key}?auto_quarantine=false&probe=false` | Validates archive, model description and Station compatibility; optional isolated execution probe. |
 | `POST` | `/internal/fmu/quarantine/{access_key}?reason=manual` | Quarantines an FMU. |
@@ -49,9 +49,13 @@ context; only the legacy synchronous `run` and `stream` paths can be called
 without it over the internal token-protected channel, and those direct calls do
 not create reservation-scoped history or consume reservation scenario quota.
 
-Companion lookup resolves an asset beside the FMU within `FMU_ROOT`, rejects
-paths outside that root, and enforces its size limit. `companion-app` reads a
-bounded file from the ZIP without extracting the archive to disk.
+For `assetType=auto`, the Executor reads the FMI-LS-REF manifest from inside
+the FMU and accepts only local declared assets beneath `FMU_ROOT`; external
+REF URLs are not fetched. It prefers a declared or same-stem
+`{model}.webapp.zip`, then a declared GLB, then a same-stem `{model}.glb`.
+Companion lookup rejects paths outside `FMU_ROOT` and enforces size limits.
+`companion-app` reads a bounded file from the ZIP without extracting the
+archive to disk.
 
 ## Synchronous simulation requests
 

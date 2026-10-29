@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import zipfile
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -100,6 +101,113 @@ def test_companion_asset_returns_the_sibling_threejs_app(route_client):
     assert response.content == b"static app archive"
     assert response.headers["content-type"] == "application/zip"
     assert response.headers["cache-control"] == "private, no-store"
+
+
+def _write_fmu_with_ref_assets(path, related_files):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    root_attrs = (
+        'xmlns:fmi-ls="http://fmi-standard.org/fmi-ls-manifest" '
+        'fmi-ls:fmi-ls-name="org.fmi-standard.fmi-ls-ref" '
+        'fmi-ls:fmi-ls-version="1.0.0-beta.1"'
+    )
+    related_xml = "".join(
+        f'<Related type="{media_type}" source="{source}" role="other" />'
+        for media_type, source in related_files
+    )
+    manifest = f"<fmiReferences {root_attrs}>{related_xml}</fmiReferences>".encode()
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr(
+            "extra/org.fmi-standard.fmi-ls-ref/fmi-ls-manifest.xml",
+            manifest,
+        )
+        archive.writestr("modelDescription.xml", b"<fmiModelDescription />")
+        archive.writestr("visualizations/cell.glb", b"ref-glb")
+        archive.writestr("visualizations/cell.webapp.zip", b"ref-app")
+
+
+def test_companion_asset_auto_prefers_ref_webapp_over_ref_glb_and_legacy_files(route_client):
+    client, headers = route_client
+    fmu_path = config.FMU_ROOT / "provider" / "ExampleCell.fmu"
+    _write_fmu_with_ref_assets(
+        fmu_path,
+        [
+            ("model/gltf-binary", "../../visualizations/cell.glb"),
+            ("application/zip", "../../visualizations/cell.webapp.zip"),
+        ],
+    )
+    fmu_path.with_suffix(".glb").write_bytes(b"legacy-glb")
+    fmu_path.with_suffix(".webapp.zip").write_bytes(b"legacy-app")
+
+    response = client.get(
+        "/internal/fmu/companion-asset?assetType=auto",
+        headers={**headers, "X-FMU-Access-Key": "provider/ExampleCell.fmu"},
+    )
+
+    assert response.status_code == 200
+    assert response.content == b"ref-app"
+    assert response.headers["content-type"] == "application/zip"
+    assert response.headers["x-digital-twin-asset-type"] == "threejs-app"
+    assert response.headers["x-digital-twin-asset-source"] == "fmi-ls-ref"
+
+
+def test_companion_asset_auto_uses_legacy_app_then_glb_when_ref_is_absent(route_client):
+    client, headers = route_client
+    fmu_path = config.FMU_ROOT / "ExampleCell.fmu"
+    with zipfile.ZipFile(fmu_path, "w") as archive:
+        archive.writestr("modelDescription.xml", b"<fmiModelDescription />")
+    fmu_path.with_suffix(".glb").write_bytes(b"legacy-glb")
+    fmu_path.with_suffix(".webapp.zip").write_bytes(b"legacy-app")
+
+    response = client.get(
+        "/internal/fmu/companion-asset?assetType=auto",
+        headers={**headers, "X-FMU-Access-Key": "ExampleCell.fmu"},
+    )
+
+    assert response.status_code == 200
+    assert response.content == b"legacy-app"
+    assert response.headers["x-digital-twin-asset-type"] == "threejs-app"
+    assert response.headers["x-digital-twin-asset-source"] == "legacy-sibling"
+
+
+def test_companion_asset_auto_falls_back_to_legacy_glb(route_client):
+    client, headers = route_client
+    fmu_path = config.FMU_ROOT / "ExampleCell.fmu"
+    _write_fmu_with_ref_assets(
+        fmu_path,
+        [("application/zip", "https://example.test/app.webapp.zip")],
+    )
+    fmu_path.with_suffix(".glb").write_bytes(b"legacy-glb")
+
+    response = client.get(
+        "/internal/fmu/companion-asset?assetType=auto",
+        headers={**headers, "X-FMU-Access-Key": "ExampleCell.fmu"},
+    )
+
+    assert response.status_code == 200
+    assert response.content == b"legacy-glb"
+    assert response.headers["x-digital-twin-asset-type"] == "glb"
+    assert response.headers["x-digital-twin-asset-source"] == "legacy-sibling"
+
+
+def test_companion_asset_auto_prefers_sibling_webapp_to_ref_glb(route_client):
+    client, headers = route_client
+    fmu_path = config.FMU_ROOT / "ExampleCell.fmu"
+    _write_fmu_with_ref_assets(
+        fmu_path,
+        [("model/gltf-binary", "../../visualizations/cell.glb")],
+    )
+    app_path = fmu_path.with_suffix(".webapp.zip")
+    app_path.write_bytes(b"legacy-app")
+
+    response = client.get(
+        "/internal/fmu/companion-asset?assetType=auto",
+        headers={**headers, "X-FMU-Access-Key": "ExampleCell.fmu"},
+    )
+
+    assert response.status_code == 200
+    assert response.content == b"legacy-app"
+    assert response.headers["x-digital-twin-asset-type"] == "threejs-app"
+    assert response.headers["x-digital-twin-asset-source"] == "legacy-sibling"
 
 
 def test_companion_asset_returns_not_found_when_fmu_or_asset_is_missing(route_client):

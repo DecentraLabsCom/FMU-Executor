@@ -12,14 +12,17 @@ import hashlib
 import json
 import logging
 import math
+import posixpath
 import re
 import secrets
 import threading
 import time
 import zipfile
+import xml.etree.ElementTree as ET
 import zlib
 from pathlib import PurePosixPath
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 from fastapi import (
     Depends,
@@ -65,6 +68,9 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="FMU Executor", version="0.3.2", docs_url=None, redoc_url=None)
 MAX_COMPANION_ASSET_BYTES = 50 * 1024 * 1024
+MAX_FMI_LS_REF_MANIFEST_BYTES = 1024 * 1024
+FMI_LS_REF_MANIFEST_PATH = "extra/org.fmi-standard.fmi-ls-ref/fmi-ls-manifest.xml"
+FMI_LS_REF_NAME = "org.fmi-standard.fmi-ls-ref"
 MAX_COMPANION_APP_FILES = 332
 _COMPANION_APP_MEDIA_TYPES = {
     ".bin": "application/octet-stream",
@@ -218,40 +224,151 @@ async def companion_asset(
     access_key: str = Header(..., alias="X-FMU-Access-Key"),
     asset_type: str = Query("glb", alias="assetType"),
 ):
-    """Return a same-stem GLB or static application ZIP to the Gateway."""
+    """Return a declared or same-stem digital-twin asset to the Gateway."""
     access_key = _validated_access_key(access_key)
     asset_type = asset_type.strip().lower()
-    if asset_type not in {"glb", "threejs-app"}:
+    if asset_type not in {"auto", "glb", "threejs-app"}:
         raise HTTPException(status_code=400, detail="INVALID_COMPANION_ASSET_TYPE")
-    suffix = ".glb" if asset_type == "glb" else ".webapp.zip"
-    media_type = "model/gltf-binary" if asset_type == "glb" else "application/zip"
     try:
         root = config.FMU_ROOT.resolve(strict=True)
         fmu_path = fmu_storage.get_fmu_path(access_key).resolve(strict=True)
         fmu_path.relative_to(root)
-        asset_path = fmu_path.with_name(fmu_path.stem + suffix).resolve(strict=True)
-        asset_path.relative_to(root)
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=404, detail="COMPANION_ASSET_NOT_FOUND") from exc
 
-    try:
-        if not asset_path.is_file():
-            raise HTTPException(status_code=404, detail="COMPANION_ASSET_NOT_FOUND")
-        with asset_path.open("rb") as asset_file:
-            content = asset_file.read(MAX_COMPANION_ASSET_BYTES + 1)
-    except HTTPException:
-        raise
-    except OSError as exc:
-        raise HTTPException(status_code=503, detail="COMPANION_ASSET_UNAVAILABLE") from exc
+    content = None
+    source = "legacy-sibling"
+    selected_type = asset_type
+    if asset_type == "auto":
+        declared_asset = _read_fmi_ls_ref_visual_asset(fmu_path)
+        if declared_asset is not None and declared_asset[1] == "threejs-app":
+            content, selected_type = declared_asset
+            source = "fmi-ls-ref"
+        else:
+            app_path = _legacy_companion_path(fmu_path, "threejs-app", root)
+            if app_path is not None:
+                content = _read_companion_file(app_path)
+                selected_type = "threejs-app"
+            elif declared_asset is not None:
+                content, selected_type = declared_asset
+                source = "fmi-ls-ref"
+            else:
+                glb_path = _legacy_companion_path(fmu_path, "glb", root)
+                if glb_path is not None:
+                    content = _read_companion_file(glb_path)
+                    selected_type = "glb"
+    else:
+        asset_path = _legacy_companion_path(fmu_path, asset_type, root)
+        if asset_path is not None:
+            content = _read_companion_file(asset_path)
 
-    if len(content) > MAX_COMPANION_ASSET_BYTES:
-        raise HTTPException(status_code=413, detail="COMPANION_ASSET_TOO_LARGE")
+    if content is None:
+        raise HTTPException(status_code=404, detail="COMPANION_ASSET_NOT_FOUND")
 
+    media_type = "model/gltf-binary" if selected_type == "glb" else "application/zip"
     return Response(
         content=content,
         media_type=media_type,
-        headers={"Cache-Control": "private, no-store"},
+        headers={
+            "Cache-Control": "private, no-store",
+            "X-Digital-Twin-Asset-Type": selected_type,
+            "X-Digital-Twin-Asset-Source": source,
+        },
     )
+
+
+def _normalized_ref_source(source: str) -> str | None:
+    """Resolve a relative FMI-LS-REF URI to a safe path inside the FMU."""
+    if not source or len(source) > 2048 or "\\" in source or "\x00" in source:
+        return None
+    parsed = urlsplit(source)
+    if parsed.scheme or parsed.netloc or parsed.query or parsed.fragment or not parsed.path:
+        return None
+    decoded_path = unquote(parsed.path)
+    if "\\" in decoded_path or "\x00" in decoded_path or decoded_path.startswith("/"):
+        return None
+    normalized = posixpath.normpath(posixpath.join(
+        posixpath.dirname(FMI_LS_REF_MANIFEST_PATH),
+        decoded_path,
+    ))
+    if normalized in {"", ".", ".."} or normalized.startswith("../") or normalized.startswith("/"):
+        return None
+    return normalized
+
+
+def _read_fmi_ls_ref_visual_asset(fmu_path) -> tuple[bytes, str] | None:
+    """Read the preferred local visual asset declared by an FMI-LS-REF manifest."""
+    try:
+        with zipfile.ZipFile(fmu_path) as archive:
+            manifest_info = archive.getinfo(FMI_LS_REF_MANIFEST_PATH)
+            if manifest_info.file_size > MAX_FMI_LS_REF_MANIFEST_BYTES:
+                return None
+            with archive.open(manifest_info) as source_file:
+                manifest = source_file.read(MAX_FMI_LS_REF_MANIFEST_BYTES + 1)
+            if len(manifest) > MAX_FMI_LS_REF_MANIFEST_BYTES:
+                return None
+            lowered_manifest = manifest.lower()
+            if b"<!doctype" in lowered_manifest or b"<!entity" in lowered_manifest:
+                return None
+            root = ET.fromstring(manifest)
+            if root.tag.rsplit("}", 1)[-1] != "fmiReferences":
+                return None
+            fmi_ls_namespace = "http://fmi-standard.org/fmi-ls-manifest"
+            if root.attrib.get(f"{{{fmi_ls_namespace}}}fmi-ls-name") != FMI_LS_REF_NAME:
+                return None
+
+            candidates: list[tuple[str, str]] = []
+            for related in root:
+                if related.tag.rsplit("}", 1)[-1] != "Related":
+                    continue
+                archive_path = _normalized_ref_source(str(related.attrib.get("source") or ""))
+                if archive_path is None:
+                    continue
+                media_type = str(related.attrib.get("type") or "").split(";", 1)[0].strip().lower()
+                lowered_path = archive_path.lower()
+                if lowered_path.endswith(".webapp.zip") and media_type in {"application/zip", "application/x-zip-compressed"}:
+                    candidates.append((archive_path, "threejs-app"))
+                elif lowered_path.endswith(".glb") and media_type in {"model/gltf-binary", "application/octet-stream"}:
+                    candidates.append((archive_path, "glb"))
+
+            candidates.sort(key=lambda candidate: candidate[1] != "threejs-app")
+            names = archive.namelist()
+            for archive_path, candidate_type in candidates:
+                if names.count(archive_path) != 1:
+                    continue
+                asset_info = archive.getinfo(archive_path)
+                if asset_info.is_dir() or asset_info.file_size > MAX_COMPANION_ASSET_BYTES:
+                    continue
+                with archive.open(asset_info) as asset_file:
+                    content = asset_file.read(MAX_COMPANION_ASSET_BYTES + 1)
+                if len(content) <= MAX_COMPANION_ASSET_BYTES:
+                    return content, candidate_type
+    except (OSError, KeyError, ValueError, ET.ParseError, zipfile.BadZipFile, RuntimeError, EOFError, zlib.error):
+        return None
+    return None
+
+
+def _legacy_companion_path(fmu_path, asset_type: str, root):
+    suffix = ".glb" if asset_type == "glb" else ".webapp.zip"
+    try:
+        asset_path = fmu_path.with_name(fmu_path.stem + suffix).resolve(strict=True)
+        asset_path.relative_to(root)
+    except (FileNotFoundError, ValueError):
+        return None
+    if not asset_path.is_file():
+        return None
+    return asset_path
+
+
+def _read_companion_file(asset_path) -> bytes:
+    try:
+        with asset_path.open("rb") as asset_file:
+            content = asset_file.read(MAX_COMPANION_ASSET_BYTES + 1)
+    except OSError as exc:
+        raise HTTPException(status_code=503, detail="COMPANION_ASSET_UNAVAILABLE") from exc
+    if len(content) > MAX_COMPANION_ASSET_BYTES:
+        raise HTTPException(status_code=413, detail="COMPANION_ASSET_TOO_LARGE")
+    return content
 
 
 # ── Describe ─────────────────────────────────────────────────────
