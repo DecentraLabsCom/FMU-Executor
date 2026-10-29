@@ -63,12 +63,19 @@ from .session_protocol import (
     handle_ws_message as _dispatch_session_command,
 )
 from .simulation_defaults import resolve_simulation_time_options
+from .fmi_ls_experiments import read_fmi_ls_ref_experiments
+from .fmi_ls_experiments import read_fmi_ls_ref_experiments
 
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="FMU Executor", version="0.3.2", docs_url=None, redoc_url=None)
 MAX_COMPANION_ASSET_BYTES = 50 * 1024 * 1024
 MAX_FMI_LS_REF_MANIFEST_BYTES = 1024 * 1024
+MAX_FMI_LS_REF_PARAMETER_SET_BYTES = 512 * 1024
+MAX_FMI_LS_REF_PARAMETER_SET_TOTAL_BYTES = 4 * 1024 * 1024
+MAX_FMI_LS_REF_PARAMETER_SETS = 24
+MAX_FMI_LS_REF_PARAMETERS = 2048
+MAX_FMI_LS_REF_RELATED_RESOURCES = 128
 FMI_LS_REF_MANIFEST_PATH = "extra/org.fmi-standard.fmi-ls-ref/fmi-ls-manifest.xml"
 FMI_LS_REF_NAME = "org.fmi-standard.fmi-ls-ref"
 MAX_COMPANION_APP_FILES = 332
@@ -277,6 +284,36 @@ async def companion_asset(
     )
 
 
+@app.get("/internal/fmu/parameter-sets", dependencies=[Depends(_check_token)])
+async def parameter_sets(access_key: str = Header(..., alias="X-FMU-Access-Key")):
+    """Return provider-authored SSP presets embedded in an FMU's REF manifest."""
+    access_key = _validated_access_key(access_key)
+    if not fmu_storage.fmu_exists(access_key):
+        raise HTTPException(404, "FMU_NOT_FOUND")
+    try:
+        root = config.FMU_ROOT.resolve(strict=True)
+        fmu_path = fmu_storage.get_fmu_path(access_key).resolve(strict=True)
+        fmu_path.relative_to(root)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(404, "FMU_NOT_FOUND") from exc
+    return {"presets": _read_fmi_ls_ref_parameter_sets(fmu_path)}
+
+
+@app.get("/internal/fmu/related-resources", dependencies=[Depends(_check_token)])
+async def related_resources(access_key: str = Header(..., alias="X-FMU-Access-Key")):
+    """Return bounded FMI-LS-REF descriptors for resources embedded in an FMU."""
+    access_key = _validated_access_key(access_key)
+    if not fmu_storage.fmu_exists(access_key):
+        raise HTTPException(404, "FMU_NOT_FOUND")
+    try:
+        root = config.FMU_ROOT.resolve(strict=True)
+        fmu_path = fmu_storage.get_fmu_path(access_key).resolve(strict=True)
+        fmu_path.relative_to(root)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(404, "FMU_NOT_FOUND") from exc
+    return _read_fmi_ls_ref_related_resources(fmu_path)
+
+
 def _normalized_ref_source(source: str) -> str | None:
     """Resolve a relative FMI-LS-REF URI to a safe path inside the FMU."""
     if not source or len(source) > 2048 or "\\" in source or "\x00" in source:
@@ -296,6 +333,488 @@ def _normalized_ref_source(source: str) -> str | None:
     return normalized
 
 
+def _xml_local_name(element: ET.Element) -> str:
+    return element.tag.rsplit("}", 1)[-1]
+
+
+def _read_fmi_ls_ref_related_resources(fmu_path) -> dict[str, Any]:
+    """Read public descriptors for safe, relative resources declared in REF."""
+    empty = {"manifestName": None, "manifestVersion": None, "resources": []}
+    try:
+        with zipfile.ZipFile(fmu_path) as archive:
+            manifest_info = archive.getinfo(FMI_LS_REF_MANIFEST_PATH)
+            if manifest_info.file_size > MAX_FMI_LS_REF_MANIFEST_BYTES:
+                return empty
+            with archive.open(manifest_info) as source_file:
+                manifest = source_file.read(MAX_FMI_LS_REF_MANIFEST_BYTES + 1)
+            if len(manifest) > MAX_FMI_LS_REF_MANIFEST_BYTES or not _safe_ref_xml(manifest):
+                return empty
+
+            root = ET.fromstring(manifest)
+            fmi_ls_namespace = "http://fmi-standard.org/fmi-ls-manifest"
+            if (
+                _xml_local_name(root) != "fmiReferences"
+                or root.attrib.get(f"{{{fmi_ls_namespace}}}fmi-ls-name") != FMI_LS_REF_NAME
+            ):
+                return empty
+
+            archive_names = archive.namelist()
+            name_counts: dict[str, int] = {}
+            for name in archive_names:
+                name_counts[name] = name_counts.get(name, 0) + 1
+
+            resources: list[dict[str, Any]] = []
+            identity_counts: dict[str, int] = {}
+            for related in root:
+                if _xml_local_name(related) != "Related":
+                    continue
+                source = str(related.attrib.get("source") or "").strip()
+                archive_path = _normalized_ref_source(source)
+                if archive_path is None:
+                    # External or unsafe URIs are not copied into the public AAS index.
+                    continue
+
+                role = str(related.attrib.get("role") or "").strip()[:128]
+                media_type = str(related.attrib.get("type") or "").split(";", 1)[0].strip().lower()[:256]
+                description = str(related.attrib.get("description") or "").strip()[:2048]
+                labels = []
+                for child in related:
+                    if _xml_local_name(child) != "Label" or len(labels) >= 32:
+                        continue
+                    label_name = str(child.attrib.get("name") or "").strip()[:256]
+                    if not label_name:
+                        continue
+                    label_description = str(child.attrib.get("description") or "").strip()[:1024]
+                    labels.append({"name": label_name, "description": label_description})
+
+                identity = hashlib.sha256(
+                    f"{role}\0{media_type}\0{source}".encode("utf-8")
+                ).hexdigest()[:24]
+                identity_counts[identity] = identity_counts.get(identity, 0) + 1
+                resource_id = identity if identity_counts[identity] == 1 else f"{identity}_{identity_counts[identity]}"
+                available = name_counts.get(archive_path) == 1
+                if available:
+                    try:
+                        available = not archive.getinfo(archive_path).is_dir()
+                    except KeyError:
+                        available = False
+
+                resources.append({
+                    "id": resource_id,
+                    "role": role,
+                    "type": media_type,
+                    "source": source[:2048],
+                    "description": description,
+                    "labels": labels,
+                    "availableInFmu": available,
+                })
+                if len(resources) >= MAX_FMI_LS_REF_RELATED_RESOURCES:
+                    break
+
+            return {
+                "manifestName": FMI_LS_REF_NAME,
+                "manifestVersion": str(root.attrib.get(f"{{{fmi_ls_namespace}}}fmi-ls-version") or "")[:64],
+                "resources": resources,
+            }
+    except (OSError, KeyError, ValueError, ET.ParseError, zipfile.BadZipFile, RuntimeError, EOFError, zlib.error):
+        return empty
+
+
+def _safe_ref_xml(data: bytes) -> bool:
+    """Accept UTF-8 XML without DTDs or entity declarations."""
+    try:
+        text = data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return False
+    lowered = text.lower()
+    return "<!doctype" not in lowered and "<!entity" not in lowered
+
+
+def _parse_ssv_parameter(parameter: ET.Element) -> tuple[str, Any, str | None]:
+    name = str(parameter.attrib.get("name") or "").strip()
+    if not name or len(name) > 512:
+        raise ValueError("invalid SSV parameter name")
+    type_names = {
+        "Real", "Float32", "Float64", "Integer", "Int8", "UInt8", "Int16", "UInt16",
+        "Int32", "UInt32", "Int64", "UInt64", "Boolean", "String", "Enumeration",
+    }
+    typed_elements = [child for child in parameter if _xml_local_name(child) in type_names | {"Binary"}]
+    if len(typed_elements) != 1:
+        raise ValueError("invalid SSV parameter type")
+    value_element = typed_elements[0]
+    value_type = _xml_local_name(value_element)
+    if value_type == "Binary":
+        raise ValueError("binary SSV values are not supported by the simulation input form")
+    unit = value_element.attrib.get("unit")
+    if unit and value_type not in {"Real", "Float32", "Float64"}:
+        raise ValueError("SSV units are only supported for floating-point parameters")
+
+    value_children = [child for child in value_element if _xml_local_name(child) == "Value"]
+    raw_values = [child.text or "" for child in value_children]
+    if value_children and "value" in value_element.attrib:
+        raise ValueError("SSV value cannot use both an attribute and Value elements")
+    if not value_children:
+        raw_value = value_element.attrib.get("value")
+        if raw_value is None:
+            raise ValueError("SSV parameter value is missing")
+        if value_type not in {"String", "Enumeration"} and len(value_element) > 0:
+            raise ValueError("invalid SSV value children")
+        raw_values = [raw_value]
+
+    if not raw_values or any(len(value) > 65536 for value in raw_values):
+        raise ValueError("SSV parameter value exceeds the supported size")
+    is_array = any(_xml_local_name(child) == "Dimension" for child in parameter) or len(raw_values) > 1
+    if len(raw_values) == 1 and value_type not in {"String", "Enumeration"}:
+        parts = raw_values[0].strip().split()
+        if len(parts) > 1:
+            raw_values = parts
+            is_array = True
+
+    def convert(raw: str):
+        if value_type in {"Real", "Float32", "Float64"}:
+            number = float(raw)
+            if not math.isfinite(number):
+                raise ValueError("non-finite SSV value")
+            return number
+        if value_type in {"Integer", "Int8", "UInt8", "Int16", "UInt16", "Int32", "UInt32", "Int64", "UInt64"}:
+            return int(raw, 10)
+        if value_type == "Boolean":
+            lowered = raw.strip().lower()
+            if lowered in {"true", "1"}:
+                return True
+            if lowered in {"false", "0"}:
+                return False
+            raise ValueError("invalid SSV boolean")
+        if value_type == "Enumeration":
+            return raw.strip()
+        return raw
+
+    values = [convert(raw) for raw in raw_values]
+    return name, values if is_array else values[0], unit
+
+
+def _parse_ssv_parameter_set(data: bytes, *, related: ET.Element, preset_number: int) -> dict[str, Any] | None:
+    if not _safe_ref_xml(data):
+        return None
+    root = ET.fromstring(data)
+    if _xml_local_name(root) != "ParameterSet" or root.attrib.get("version") not in {"1.0", "2.0"}:
+        return None
+    name = str(root.attrib.get("name") or "").strip()
+    if not name or len(name) > 180:
+        return None
+    parameters_element = next((child for child in root if _xml_local_name(child) == "Parameters"), None)
+    if parameters_element is None:
+        return None
+    parameter_nodes = [child for child in parameters_element if _xml_local_name(child) == "Parameter"]
+    if not parameter_nodes or len(parameter_nodes) > MAX_FMI_LS_REF_PARAMETERS:
+        return None
+    parameters: dict[str, Any] = {}
+    parameter_units: dict[str, str] = {}
+    for parameter_node in parameter_nodes:
+        variable_name, value, unit = _parse_ssv_parameter(parameter_node)
+        if variable_name in parameters:
+            return None
+        parameters[variable_name] = value
+        if unit:
+            parameter_units[variable_name] = unit
+
+    description = str(related.attrib.get("description") or "").strip()
+    if not description:
+        label = next((child for child in related if _xml_local_name(child) == "Label"), None)
+        description = str(label.attrib.get("description") or "").strip() if label is not None else ""
+    return {
+        "id": f"preset-{preset_number}",
+        "name": name,
+        "description": description[:1024],
+        "parameters": parameters,
+        "parameterUnits": parameter_units,
+    }
+
+
+def _read_fmi_ls_ref_parameter_sets(fmu_path) -> list[dict[str, Any]]:
+    """Read bounded, local SSP parameter-set references from an FMU archive."""
+    presets: list[dict[str, Any]] = []
+    try:
+        with zipfile.ZipFile(fmu_path) as archive:
+            manifest_info = archive.getinfo(FMI_LS_REF_MANIFEST_PATH)
+            if manifest_info.file_size > MAX_FMI_LS_REF_MANIFEST_BYTES:
+                return []
+            with archive.open(manifest_info) as source_file:
+                manifest = source_file.read(MAX_FMI_LS_REF_MANIFEST_BYTES + 1)
+            if len(manifest) > MAX_FMI_LS_REF_MANIFEST_BYTES:
+                return []
+            if not _safe_ref_xml(manifest):
+                return []
+            root = ET.fromstring(manifest)
+            fmi_ls_namespace = "http://fmi-standard.org/fmi-ls-manifest"
+            if (
+                _xml_local_name(root) != "fmiReferences"
+                or root.attrib.get(f"{{{fmi_ls_namespace}}}fmi-ls-name") != FMI_LS_REF_NAME
+            ):
+                return []
+
+            names = archive.namelist()
+            referenced = []
+            for related in root:
+                if _xml_local_name(related) != "Related":
+                    continue
+                if str(related.attrib.get("role") or "").strip().lower() != "parameter":
+                    continue
+                media_type = str(related.attrib.get("type") or "").split(";", 1)[0].strip().lower()
+                if media_type != "application/x-ssp-parameter-set":
+                    continue
+                archive_path = _normalized_ref_source(str(related.attrib.get("source") or ""))
+                if archive_path is not None:
+                    referenced.append((related, archive_path))
+                if len(referenced) >= MAX_FMI_LS_REF_PARAMETER_SETS:
+                    break
+
+            total_bytes = 0
+            for related, archive_path in referenced:
+                if names.count(archive_path) != 1:
+                    continue
+                info = archive.getinfo(archive_path)
+                if info.is_dir() or info.file_size > MAX_FMI_LS_REF_PARAMETER_SET_BYTES:
+                    continue
+                if total_bytes + info.file_size > MAX_FMI_LS_REF_PARAMETER_SET_TOTAL_BYTES:
+                    break
+                with archive.open(info) as source_file:
+                    content = source_file.read(MAX_FMI_LS_REF_PARAMETER_SET_BYTES + 1)
+                if len(content) > MAX_FMI_LS_REF_PARAMETER_SET_BYTES:
+                    continue
+                total_bytes += len(content)
+                try:
+                    parsed = _parse_ssv_parameter_set(content, related=related, preset_number=len(presets) + 1)
+                except (ValueError, OverflowError, ET.ParseError):
+                    parsed = None
+                if parsed is not None:
+                    presets.append(parsed)
+    except (OSError, KeyError, ValueError, ET.ParseError, zipfile.BadZipFile, RuntimeError, EOFError, zlib.error):
+        return []
+    return presets
+
+
+def _parse_experiment_parameter_set(data: bytes) -> dict[str, Any] | None:
+    parsed = _parse_ssv_parameter_set(
+        data,
+        related=ET.Element("Related"),
+        preset_number=1,
+    )
+    if parsed is None:
+        return None
+    return {
+        "parameters": parsed["parameters"],
+        "parameterUnits": parsed["parameterUnits"],
+    }
+
+
+async def _run_fmi_ls_ref_smoke_experiments(
+    fmu_path,
+    *,
+    access_key: str,
+    model_metadata: dict[str, Any],
+) -> tuple[dict[str, Any], str | None]:
+    """Run supported, provider-declared smoke experiments in isolated workers."""
+    discovery = read_fmi_ls_ref_experiments(
+        fmu_path,
+        parse_parameter_set=_parse_experiment_parameter_set,
+    )
+    declared_sets = discovery.get("resourceSets", [])
+    discovery_truncated = discovery.get("truncated") is True
+    execution_policy = model_execution_policy(None)
+    model_variables = {
+        variable.get("name"): variable
+        for variable in model_metadata.get("modelVariables", [])
+        if isinstance(variable, dict) and isinstance(variable.get("name"), str)
+    }
+    max_runs = 8
+    remaining_steps = 100_000
+    run_count = 0
+    passed_count = 0
+    failed_count = 0
+    skipped_count = 0
+    failure_code = None
+    resource_sets: list[dict[str, Any]] = []
+
+    for declared_set in declared_sets:
+        set_failed_before = failed_count
+        output_set = {
+            key: declared_set.get(key)
+            for key in ("source", "role", "type", "name", "description")
+        }
+        output_set["status"] = declared_set.get("status", "unsupported")
+        output_set["reason"] = declared_set.get("reason", "unsupported_experiment_resource")
+        output_set["truncated"] = declared_set.get("truncated") is True
+        output_set["experiments"] = []
+        if output_set["truncated"]:
+            skipped_count += 1
+        raw_cases = declared_set.get("experiments")
+        if not isinstance(raw_cases, list) or not raw_cases:
+            if output_set["status"] == "invalid":
+                failed_count += 1
+                failure_code = failure_code or "INVALID_FMI_LS_EXPERIMENT"
+            else:
+                skipped_count += 1
+            resource_sets.append(output_set)
+            continue
+
+        for case in raw_cases:
+            output_case = {
+                key: case.get(key)
+                for key in ("name", "description", "eligibleForSmokeProbe")
+            }
+            status = case.get("status")
+            reason = str(case.get("reason") or "")
+            if status == "invalid":
+                output_case.update(status="failed", reason=reason or "invalid_experiment")
+                failed_count += 1
+                failure_code = failure_code or "INVALID_FMI_LS_EXPERIMENT"
+                output_set["experiments"].append(output_case)
+                continue
+            if status != "ready":
+                output_case.update(status="skipped", reason=reason or "experiment_not_supported")
+                skipped_count += 1
+                output_set["experiments"].append(output_case)
+                continue
+            if case.get("eligibleForSmokeProbe") is not True:
+                output_case.update(status="skipped", reason="experiment_role_is_not_smoke_test")
+                skipped_count += 1
+                output_set["experiments"].append(output_case)
+                continue
+            if run_count >= max_runs:
+                output_case.update(status="skipped", reason="smoke_probe_run_limit_exceeded")
+                skipped_count += 1
+                output_set["experiments"].append(output_case)
+                continue
+
+            parameters = case.get("parameters")
+            parameter_units = case.get("parameterUnits")
+            if not isinstance(parameters, dict) or not isinstance(parameter_units, dict):
+                output_case.update(status="failed", reason="invalid_ssp_parameter_set")
+                failed_count += 1
+                failure_code = failure_code or "INVALID_FMI_LS_EXPERIMENT"
+                output_set["experiments"].append(output_case)
+                continue
+            mismatched_units = any(
+                parameter_units.get(name) is not None
+                and parameter_units.get(name) != model_variables.get(name, {}).get("unit")
+                for name in parameters
+            )
+            if mismatched_units:
+                output_case.update(status="skipped", reason="parameter_unit_conversion_not_supported")
+                skipped_count += 1
+                output_set["experiments"].append(output_case)
+                continue
+
+            try:
+                _validate_parameters(parameters)
+                options = resolve_simulation_time_options(model_metadata, case.get("options"))
+                options["earlyReturnAllowed"] = False
+                options["outputVariables"] = []
+                case_policy = {
+                    **execution_policy,
+                    "maxSteps": min(execution_policy["maxSteps"], remaining_steps),
+                }
+                step_count = _validate_options(
+                    access_key,
+                    options,
+                    case_policy,
+                    model_metadata=model_metadata,
+                )
+            except HTTPException as exc:
+                reason_code = str(exc.detail)
+                if reason_code in {"SIMULATION_STEP_LIMIT_EXCEEDED", "FMU_COSIMULATION_REQUIRED"}:
+                    output_case.update(status="skipped", reason="executor_limit_or_capability")
+                    skipped_count += 1
+                else:
+                    output_case.update(status="failed", reason="invalid_experiment_options_or_parameters")
+                    failed_count += 1
+                    failure_code = failure_code or "INVALID_FMI_LS_EXPERIMENT"
+                output_set["experiments"].append(output_case)
+                continue
+            except (TypeError, ValueError, OverflowError):
+                output_case.update(status="failed", reason="invalid_experiment_options_or_parameters")
+                failed_count += 1
+                failure_code = failure_code or "INVALID_FMI_LS_EXPERIMENT"
+                output_set["experiments"].append(output_case)
+                continue
+
+            run_count += 1
+            remaining_steps -= step_count
+            try:
+                await asyncio.to_thread(
+                    process_runner.run,
+                    fmu_path,
+                    access_key=access_key,
+                    parameters=parameters,
+                    options=options,
+                    resource_policy=case_policy,
+                )
+                output_case.update(status="passed", reason="")
+                passed_count += 1
+            except process_runner.ProcessExecutionError as exc:
+                if exc.code in {"FMU_WORKER_ISOLATION_UNAVAILABLE", "FMU_WORKER_START_FAILED"}:
+                    output_case.update(status="unavailable", reason="executor_worker_unavailable")
+                    failure_code = failure_code or exc.code
+                    skipped_count += 1
+                else:
+                    output_case.update(status="failed", reason="experiment_execution_failed")
+                    failed_count += 1
+                    failure_code = failure_code or exc.code
+            except Exception as exc:
+                logger.warning("FMI-LS-REF smoke experiment failed: %s", type(exc).__name__)
+                output_case.update(status="failed", reason="experiment_execution_failed")
+                failed_count += 1
+                failure_code = failure_code or "FMU_EXPERIMENT_EXECUTION_FAILED"
+            output_set["experiments"].append(output_case)
+
+        if failed_count > set_failed_before:
+            output_set["status"] = "failed"
+            output_set["reason"] = "one_or_more_experiments_failed"
+        elif any(case.get("status") == "passed" for case in output_set["experiments"]):
+            output_set["status"] = (
+                "partial"
+                if output_set["truncated"] or any(
+                    case.get("status") != "passed" for case in output_set["experiments"]
+                )
+                else "passed"
+            )
+            output_set["reason"] = ""
+        elif any(case.get("status") == "unavailable" for case in output_set["experiments"]):
+            output_set["status"] = "unavailable"
+            output_set["reason"] = "executor_worker_unavailable"
+        else:
+            output_set["status"] = "unsupported"
+            output_set["reason"] = "no_supported_smoke_experiments"
+        resource_sets.append(output_set)
+
+    if not declared_sets and not discovery_truncated:
+        status = "not_declared"
+    elif failed_count:
+        status = "failed"
+    elif passed_count and (skipped_count or discovery_truncated):
+        status = "partial"
+    elif passed_count:
+        status = "passed"
+    elif discovery_truncated:
+        status = "partial"
+    elif any(item.get("status") == "unavailable" for item in resource_sets):
+        status = "unavailable"
+    else:
+        status = "unsupported"
+
+    return ({
+        "status": status,
+        "declaredExperimentSets": len(declared_sets),
+        "additionalExperimentSetsOmitted": discovery_truncated,
+        "executed": run_count,
+        "passed": passed_count,
+        "failed": failed_count,
+        "skipped": skipped_count,
+        "resourceSets": resource_sets,
+    }, failure_code)
+
+
 def _read_fmi_ls_ref_visual_asset(fmu_path) -> tuple[bytes, str] | None:
     """Read the preferred local visual asset declared by an FMI-LS-REF manifest."""
     try:
@@ -307,8 +826,7 @@ def _read_fmi_ls_ref_visual_asset(fmu_path) -> tuple[bytes, str] | None:
                 manifest = source_file.read(MAX_FMI_LS_REF_MANIFEST_BYTES + 1)
             if len(manifest) > MAX_FMI_LS_REF_MANIFEST_BYTES:
                 return None
-            lowered_manifest = manifest.lower()
-            if b"<!doctype" in lowered_manifest or b"<!entity" in lowered_manifest:
+            if not _safe_ref_xml(manifest):
                 return None
             root = ET.fromstring(manifest)
             if root.tag.rsplit("}", 1)[-1] != "fmiReferences":
@@ -502,6 +1020,19 @@ async def validate_fmu(
                 report["dependenciesChecked"] = True
                 report["probeResult"] = "passed"
                 report["sha256"] = digest
+                experiment_report, experiment_failure_code = await _run_fmi_ls_ref_smoke_experiments(
+                    path,
+                    access_key=access_key,
+                    model_metadata=description,
+                )
+                report["fmiLsExperiments"] = experiment_report
+                if experiment_report["status"] == "failed":
+                    report["probeResult"] = "failed"
+                    probe_failure_code = experiment_failure_code or "FMU_EXPERIMENT_FAILED"
+                    report["issues"].append("One or more declared FMI-LS-REF smoke experiments failed")
+                elif experiment_report["status"] == "unavailable":
+                    probe_failure_code = experiment_failure_code
+                    report["issues"].append("Declared FMI-LS-REF smoke experiments could not run because the worker was unavailable")
             else:
                 report["probeResult"] = "failed"
         except process_runner.ProcessExecutionError as exc:

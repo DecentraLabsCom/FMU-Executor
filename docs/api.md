@@ -26,9 +26,11 @@ Gateway authorization or a user-facing credential.
 | `GET` | `/internal/fmu/backends` | Active FMPy backend and optional OMSimulator discovery; internal token. |
 | `GET` | `/internal/fmu/catalog` | FMU inventory; internal token and `X-FMU-Access-Key`. |
 | `GET` | `/internal/fmu/describe` | Normalized model description; internal token and `X-FMU-Access-Key`. Optional `publicOnly=true` and `causality=output` filters. |
+| `GET` | `/internal/fmu/parameter-sets` | Provider-authored SSP parameter sets declared with role `parameter` in the FMU's FMI-LS-REF manifest; internal token and `X-FMU-Access-Key`. Only local files inside the FMU are read. |
+| `GET` | `/internal/fmu/related-resources` | Bounded descriptors for local related files declared by FMI-LS-REF; returns role, media type, source, description, labels, and archive presence, without file contents. |
 | `GET` | `/internal/fmu/companion-asset` | A declared local visual asset from FMI-LS-REF or a same-stem companion; choose `assetType=auto`, `glb` or `threejs-app`; internal token and FMU access key. Auto prefers a `.webapp.zip`, then a declared GLB, then a same-stem GLB, and reports the resolved type and source in response headers. |
 | `GET` | `/internal/fmu/companion-app/{asset_path}` | Reads one safe file from the same-stem `.webapp.zip`; internal token and FMU access key. |
-| `POST` | `/internal/fmu/validate/{access_key}?auto_quarantine=false&probe=false` | Validates archive, model description and Station compatibility; optional isolated execution probe. |
+| `POST` | `/internal/fmu/validate/{access_key}?auto_quarantine=false&probe=false` | Validates archive, model description and Station compatibility; `probe=true` also runs up to 8 supported FMI-LS-REF smoke experiments. |
 | `POST` | `/internal/fmu/quarantine/{access_key}?reason=manual` | Quarantines an FMU. |
 | `DELETE` | `/internal/fmu/quarantine/{access_key}` | Removes an FMU from quarantine. |
 | `GET` | `/internal/fmu/quarantine` | Lists quarantined FMUs. |
@@ -56,6 +58,21 @@ REF URLs are not fetched. It prefers a declared or same-stem
 Companion lookup rejects paths outside `FMU_ROOT` and enforces size limits.
 `companion-app` reads a bounded file from the ZIP without extracting the
 archive to disk.
+
+The parameter-set endpoint reads SSP 1.0/2.0 `ParameterSet` XML referenced by
+`Related` entries whose FMI-LS-REF role is `parameter` and media type is
+`application/x-ssp-parameter-set`. It returns names, descriptions, and typed
+parameter maps; sets containing unsupported binary values or malformed data
+are omitted. Unit-qualified values are only applied when their unit name
+matches the corresponding FMI variable unit. Gateway applies the active
+reservation's initialization-write policy before exposing any preset to
+Marketplace.
+
+The related-resources endpoint returns bounded descriptors for safe relative
+URIs in a valid FMI-LS-REF manifest. It includes role, media type, source,
+description, labels, and whether each resource is present in the FMU archive.
+It never returns file contents and omits external URIs; Lab Gateway uses this
+metadata-only response to generate the public AAS resource index.
 
 ## Synchronous simulation requests
 

@@ -203,7 +203,16 @@ system and architecture, and whether native dependency loading was checked.
 
 Use `POST /internal/fmu/validate/{access_key}?probe=true` to load and initialize
 an FMU in an isolated worker. A passing probe checks the dependencies required
-for initialization; it does not certify every possible simulation path.
+for initialization; it does not certify every possible simulation path. The
+same probe discovers local FMI-LS-REF `Related` resources with role
+`experiment` or `experiment/smoke-test` and media type
+`application/x-ma-hs-experiments`, then runs up to eight supported transient
+experiments in isolated workers. The current subset accepts local SSP parameter
+sets and experiment time options. Cases that declare stimuli, reference time
+series, solver tolerances or other unsupported features are reported as skipped
+in `fmiLsExperiments`; they are never reported as passed. A failed supported
+smoke experiment fails the probe. See the evolving [MA-HS-Experiments
+draft](https://modelica.github.io/ma-hs-experiments/main/) for the XML format.
 `auto_quarantine` can request quarantine when validation finds an invalid
 artifact. If the probe cannot run because worker isolation infrastructure is
 unavailable, automatic quarantine is skipped. Manual quarantine and removal

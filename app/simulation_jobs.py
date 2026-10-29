@@ -9,6 +9,7 @@ import re
 import sqlite3
 import threading
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -125,7 +126,7 @@ def execution_deadlines(context: dict[str, Any] | None) -> tuple[float, float | 
 def _validate_options(
     access_key: str,
     options: dict[str, Any],
-    policy: dict[str, int] | None = None,
+    policy: Mapping[str, int | None] | None = None,
     *,
     model_metadata: dict[str, Any] | None = None,
 ) -> int:
@@ -159,7 +160,12 @@ def _validate_options(
         steps = math.ceil(duration / step)
     except (OverflowError, ValueError) as exc:
         raise HTTPException(status_code=413, detail="SIMULATION_STEP_LIMIT_EXCEEDED") from exc
-    maximum_steps = (policy or {}).get("maxSteps", config.MAX_SIMULATION_STEPS)
+    configured_maximum_steps = (policy or {}).get("maxSteps")
+    maximum_steps = (
+        configured_maximum_steps
+        if type(configured_maximum_steps) is int
+        else config.MAX_SIMULATION_STEPS
+    )
     if steps > maximum_steps:
         raise HTTPException(status_code=413, detail="SIMULATION_STEP_LIMIT_EXCEEDED")
     sample_every = options.get("outputSampleEverySteps", 1)
