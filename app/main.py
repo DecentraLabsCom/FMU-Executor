@@ -622,6 +622,9 @@ async def _run_fmi_ls_ref_smoke_experiments(
     declared_sets = discovery.get("resourceSets", [])
     discovery_truncated = discovery.get("truncated") is True
     execution_policy = model_execution_policy(None)
+    max_steps = execution_policy["maxSteps"]
+    if max_steps is None:
+        max_steps = config.MAX_SIMULATION_STEPS
     model_variables = {
         variable.get("name"): variable
         for variable in model_metadata.get("modelVariables", [])
@@ -713,7 +716,7 @@ async def _run_fmi_ls_ref_smoke_experiments(
                 options["outputVariables"] = []
                 case_policy = {
                     **execution_policy,
-                    "maxSteps": min(execution_policy["maxSteps"], remaining_steps),
+                    "maxSteps": min(max_steps, remaining_steps),
                 }
                 step_count = _validate_options(
                     access_key,

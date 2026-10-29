@@ -1,0 +1,12 @@
+{
+  "include": [
+    "app",
+    "tests",
+    "examples/smart-warehouse-cell",
+    "examples/reference-fmus"
+  ],
+  "exclude": [
+    "examples/local-demos"
+  ],
+  "pythonVersion": "3.11"
+}

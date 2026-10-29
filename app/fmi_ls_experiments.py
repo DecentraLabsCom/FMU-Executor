@@ -46,7 +46,7 @@ def read_fmi_ls_ref_experiments(
                 _local_name(manifest_root) != "fmiReferences"
                 or manifest_root.attrib.get(f"{{{namespace}}}fmi-ls-name") != FMI_LS_REF_NAME
             ):
-                return []
+                return {"resourceSets": [], "truncated": False}
 
             resource_name_counts: dict[str, int] = {}
             for info in archive.infolist():

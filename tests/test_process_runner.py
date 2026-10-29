@@ -207,7 +207,7 @@ def test_worker_environment_removes_credentials_only(monkeypatch):
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "secret")
     monkeypatch.setenv("GATEWAY_TOKEN", "secret")
     monkeypatch.setenv("WORKER_SAFE_VALUE", "retained")
-    process_runner._sanitize_worker_environment()
+    process_runner._sanitize_worker_environment("test-access-key")
     assert "AWS_ACCESS_KEY_ID" not in os.environ
     assert "GATEWAY_TOKEN" not in os.environ
     assert os.environ["WORKER_SAFE_VALUE"] == "retained"

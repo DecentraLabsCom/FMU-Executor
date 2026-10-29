@@ -309,7 +309,7 @@ class SimulationJobManager:
         scenarios: list[dict[str, Any]],
         stored_parameters: dict[str, Any],
         stored_options: dict[str, Any],
-        policy: dict[str, int],
+        policy: dict[str, int | None],
     ) -> dict[str, Any]:
         if config.execution_mode() != "process":
             raise HTTPException(status_code=409, detail="ASYNC_EXECUTION_REQUIRES_PROCESS_ISOLATION")
@@ -360,6 +360,9 @@ class SimulationJobManager:
                     {"label": scenario.get("label"), "options": scenario["effectiveOptions"]}
                     for scenario in scenarios
                 ]
+                maximum_scenarios = policy["maxDailyScenarios"]
+                if type(maximum_scenarios) is not int:
+                    raise HTTPException(status_code=403, detail="INVALID_FMU_EXECUTION_POLICY")
                 self.store.create_job(
                     job_id=job_id,
                     scope_key=scope_key,
@@ -372,7 +375,7 @@ class SimulationJobManager:
                     metadata=metadata,
                     authorization_expires_at=authorization_expires_at,
                     reservation_ends_at=reservation_ends_at,
-                    maximum_scenarios=policy["maxDailyScenarios"],
+                    maximum_scenarios=maximum_scenarios,
                 )
             except QuotaExceededError as exc:
                 engine.release_capacity(capacity_token)
@@ -424,7 +427,7 @@ class SimulationJobManager:
         authorization_expires_at: float,
         reservation_ends_at: float | None,
         capacity_token: str,
-        policy: dict[str, int],
+        policy: dict[str, int | None],
         policy_evidence: dict[str, Any],
     ) -> None:
         results: list[dict[str, Any]] = []
@@ -457,7 +460,7 @@ class SimulationJobManager:
                         capture_series=True,
                         authorization_expires_at=authorization_expires_at,
                         reservation_ends_at=reservation_ends_at,
-                        resource_policy=policy,
+                        resource_policy=dict(policy),
                     )
                 except process_runner.ProcessExecutionError:
                     raise
