@@ -741,6 +741,13 @@ async def _run_fmi_ls_ref_smoke_experiments(
                     case_policy,
                     model_metadata=model_metadata,
                 )
+                input_schedule = _validate_input_schedule(
+                    case.get("inputSchedule", []),
+                    options=options,
+                    model_metadata=model_metadata,
+                    fmu_path=fmu_path,
+                    access_key=access_key,
+                )
             except HTTPException as exc:
                 reason_code = str(exc.detail)
                 if reason_code in {"SIMULATION_STEP_LIMIT_EXCEEDED", "FMU_COSIMULATION_REQUIRED"}:
@@ -769,6 +776,7 @@ async def _run_fmi_ls_ref_smoke_experiments(
                     parameters=parameters,
                     options=options,
                     resource_policy=case_policy,
+                    input_schedule=input_schedule,
                 )
                 output_case.update(status="passed", reason="")
                 passed_count += 1

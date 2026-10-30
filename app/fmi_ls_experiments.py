@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import math
 import posixpath
+import csv
+import io
 import zipfile
 import xml.etree.ElementTree as ET
 import zlib
@@ -20,8 +22,11 @@ MAX_MANIFEST_BYTES = 1024 * 1024
 MAX_EXPERIMENT_FILE_BYTES = 1024 * 1024
 MAX_PARAMETER_FILE_BYTES = 512 * 1024
 MAX_TOTAL_PARAMETER_BYTES = 512 * 1024
+MAX_STIMULI_FILE_BYTES = 1024 * 1024
+MAX_STIMULI_EVENTS = 128
 MAX_EXPERIMENT_SETS = 8
 MAX_EXPERIMENTS_PER_SET = 16
+MA_HS_EXPERIMENTS_NAMESPACE = "http://modelica.org/HSExperiments1/HSExperiments"
 
 
 def read_fmi_ls_ref_experiments(
@@ -29,11 +34,11 @@ def read_fmi_ls_ref_experiments(
     *,
     parse_parameter_set: Callable[[bytes], dict[str, Any] | None],
 ) -> dict[str, Any]:
-    """Discover REF experiment declarations without opening external URIs.
+    """Discover REF experiments and bounded local CSV stimuli.
 
-    Only the MA-HS-Experiments XML and SSP parameter subset are interpreted.
-    Time-series stimuli/references and solver tolerances are reported as
-    unsupported to callers, which must not mark those cases as passed.
+    Only MA-HS-Experiments declarations, SSP parameter sets, and local
+    time/value CSV stimuli are interpreted. References and solver tolerances
+    remain unsupported; external URIs are never opened.
     """
     try:
         with zipfile.ZipFile(fmu_path) as archive:
@@ -105,9 +110,14 @@ def read_fmi_ls_ref_experiments(
                     descriptor["status"] = "invalid"
                     descriptor["reason"] = "invalid_experiment_xml"
                     continue
-                if experiment_root.tag != "Experiments":
+                if _local_name(experiment_root) != "Experiments":
                     descriptor["status"] = "invalid"
                     descriptor["reason"] = "invalid_experiment_root"
+                    continue
+                experiment_namespace = _namespace(experiment_root)
+                if experiment_namespace not in {"", MA_HS_EXPERIMENTS_NAMESPACE}:
+                    descriptor["status"] = "unsupported"
+                    descriptor["reason"] = "unsupported_experiment_namespace"
                     continue
                 set_name = str(experiment_root.attrib.get("name") or "").strip()
                 if not set_name or len(set_name) > 180:
@@ -118,23 +128,24 @@ def read_fmi_ls_ref_experiments(
                 if not descriptor["description"]:
                     descriptor["description"] = str(experiment_root.attrib.get("description") or "").strip()[:2048]
 
-                experiment_tag = "Experiment"
-                experiments = [child for child in experiment_root if child.tag == experiment_tag]
+                experiment_tags = {"Experiment", "TransientExperiment"}
+                experiments = [child for child in experiment_root if _local_name(child) in experiment_tags]
                 descriptor["truncated"] = len(experiments) > MAX_EXPERIMENTS_PER_SET
                 if any(
-                    child.tag != experiment_tag and _local_name(child) != "Annotations"
+                    _local_name(child) not in experiment_tags | {"Annotations"}
                     for child in experiment_root
                 ):
                     descriptor["status"] = "unsupported"
                     descriptor["reason"] = "unsupported_experiment_type"
                     continue
                 for child in experiment_root:
-                    if child.tag != experiment_tag:
+                    if _local_name(child) not in experiment_tags:
                         continue
                     if len(descriptor["experiments"]) >= MAX_EXPERIMENTS_PER_SET:
                         break
                     case = _parse_experiment(
                         child,
+                        experiment_namespace=experiment_namespace,
                         archive=archive,
                         experiment_archive_path=archive_path,
                         resource_name_counts=resource_name_counts,
@@ -171,6 +182,7 @@ def read_fmi_ls_ref_experiments(
 def _parse_experiment(
     element: ET.Element,
     *,
+    experiment_namespace: str,
     archive: zipfile.ZipFile,
     experiment_archive_path: str,
     resource_name_counts: dict[str, int],
@@ -184,6 +196,7 @@ def _parse_experiment(
         "options": {},
         "parameters": {},
         "parameterUnits": {},
+        "inputSchedule": [],
         "status": "invalid",
         "reason": "invalid_experiment",
     }
@@ -213,7 +226,7 @@ def _parse_experiment(
         local_name = _local_name(child)
         if _local_name(child) == "Annotations":
             continue
-        if child.tag != local_name:
+        if _namespace(child) != experiment_namespace:
             case["reason"] = "unsupported_or_ambiguous_experiment_element"
             return case
         if local_name not in {"Parameters", "Stimuli", "References"}:
@@ -229,9 +242,9 @@ def _parse_experiment(
         case["status"] = "unsupported"
         case["reason"] = "solver_tolerance_not_supported"
         return case
-    if "Stimuli" in children or "References" in children:
+    if "References" in children:
         case["status"] = "unsupported"
-        case["reason"] = "time_series_data_format_not_supported"
+        case["reason"] = "reference_results_not_supported"
         return case
 
     parameters_element = children.get("Parameters")
@@ -277,9 +290,93 @@ def _parse_experiment(
         case["parameters"] = parsed_parameter_set.get("parameters", {})
         case["parameterUnits"] = parsed_parameter_set.get("parameterUnits", {})
 
+    stimuli_element = children.get("Stimuli")
+    if stimuli_element is not None:
+        stimuli_type = str(stimuli_element.attrib.get("type") or "text/csv").split(";", 1)[0].strip().lower()
+        if stimuli_type != "text/csv":
+            case["status"] = "unsupported"
+            case["reason"] = "unsupported_stimuli_file_type"
+            return case
+        stimuli_source = str(stimuli_element.attrib.get("source") or "").strip()
+        if not stimuli_source:
+            case["reason"] = "stimuli_file_source_missing"
+            return case
+        stimuli_path = _resolve_archive_uri(experiment_archive_path, stimuli_source)
+        if stimuli_path is None:
+            case["status"] = "unsupported"
+            case["reason"] = "external_or_unsafe_stimuli_resource"
+            return case
+        if resource_name_counts.get(stimuli_path) != 1:
+            case["status"] = "unavailable"
+            case["reason"] = "stimuli_file_missing_or_ambiguous"
+            return case
+        stimuli_data = _read_archive_file(archive, stimuli_path, MAX_STIMULI_FILE_BYTES)
+        if stimuli_data is None:
+            case["status"] = "unavailable"
+            case["reason"] = "stimuli_file_unavailable_or_too_large"
+            return case
+        try:
+            case["inputSchedule"] = _parse_stimuli_csv(stimuli_data, case["options"])
+        except (UnicodeDecodeError, csv.Error, ValueError):
+            case["reason"] = "invalid_stimuli_csv"
+            return case
+
     case["status"] = "ready"
     case["reason"] = ""
     return case
+
+
+def _parse_stimuli_csv(data: bytes, options: dict[str, Any]) -> list[dict[str, Any]]:
+    """Read a bounded time/value CSV as ordered, step-aligned input changes."""
+    time_options: list[float] = []
+    for name in ("startTime", "stopTime", "stepSize"):
+        value = options.get(name)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+        ):
+            raise ValueError("stimuli require finite startTime, stopTime and stepSize")
+        time_options.append(float(value))
+    start, stop, step = time_options
+    if step <= 0 or stop <= start:
+        raise ValueError("invalid stimuli time range")
+
+    text = data.decode("utf-8-sig")
+    reader = csv.reader(io.StringIO(text, newline=""), strict=True)
+    rows = iter(reader)
+    header = next(rows, None)
+    if not header or len(header) < 2:
+        raise ValueError("stimuli CSV needs time and at least one input column")
+    names = [name.strip() for name in header]
+    if names[0] != "time" or len(set(names)) != len(names):
+        raise ValueError("stimuli CSV must begin with a unique time column")
+    if any(not name or len(name) > 512 or any(ord(char) < 32 for char in name) for name in names[1:]):
+        raise ValueError("invalid stimuli input name")
+
+    schedule: list[dict[str, Any]] = []
+    previous_time: float | None = None
+    tolerance = max(1e-9, abs(step) * 1e-7)
+    for row in rows:
+        if not row or all(not cell.strip() for cell in row):
+            continue
+        if len(row) != len(names) or len(schedule) >= MAX_STIMULI_EVENTS:
+            raise ValueError("stimuli CSV row width or event count is invalid")
+        values = [float(cell.strip()) for cell in row]
+        if any(not math.isfinite(value) for value in values):
+            raise ValueError("stimuli CSV contains a non-finite value")
+        time = values[0]
+        if time < start or time >= stop or (previous_time is not None and time <= previous_time):
+            raise ValueError("stimuli times must be strictly increasing within the experiment")
+        step_index = round((time - start) / step)
+        if abs(start + step_index * step - time) > tolerance:
+            raise ValueError("stimuli times must align to stepSize")
+        schedule.append({"time": time, "values": dict(zip(names[1:], values[1:]))})
+        previous_time = time
+
+    if not schedule or abs(schedule[0]["time"] - start) > tolerance:
+        raise ValueError("stimuli CSV must define inputs at startTime")
+    return schedule
 
 
 def _resolve_archive_uri(base_archive_path: str, source: str) -> str | None:
@@ -320,3 +417,7 @@ def _safe_xml(data: bytes) -> bool:
 
 def _local_name(element: ET.Element) -> str:
     return element.tag.rsplit("}", 1)[-1]
+
+
+def _namespace(element: ET.Element) -> str:
+    return element.tag[1:].split("}", 1)[0] if element.tag.startswith("{") else ""
