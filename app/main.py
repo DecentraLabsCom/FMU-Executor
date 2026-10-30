@@ -64,7 +64,6 @@ from .session_protocol import (
 )
 from .simulation_defaults import resolve_simulation_time_options
 from .fmi_ls_experiments import read_fmi_ls_ref_experiments
-from .fmi_ls_experiments import read_fmi_ls_ref_experiments
 
 logger = logging.getLogger(__name__)
 
@@ -286,7 +285,7 @@ async def companion_asset(
 
 @app.get("/internal/fmu/parameter-sets", dependencies=[Depends(_check_token)])
 async def parameter_sets(access_key: str = Header(..., alias="X-FMU-Access-Key")):
-    """Return provider-authored SSP presets embedded in an FMU's REF manifest."""
+    """Return FMI-LS-REF parameter presets embedded in an FMU."""
     access_key = _validated_access_key(access_key)
     if not fmu_storage.fmu_exists(access_key):
         raise HTTPException(404, "FMU_NOT_FOUND")
@@ -296,7 +295,25 @@ async def parameter_sets(access_key: str = Header(..., alias="X-FMU-Access-Key")
         fmu_path.relative_to(root)
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(404, "FMU_NOT_FOUND") from exc
-    return {"presets": _read_fmi_ls_ref_parameter_sets(fmu_path)}
+    return {"fmiLsParameterPresets": _read_fmi_ls_ref_parameter_sets(fmu_path)}
+
+
+@app.get("/internal/fmu/experiments", dependencies=[Depends(_check_token)])
+async def experiments(access_key: str = Header(..., alias="X-FMU-Access-Key")):
+    """Return provider-declared, locally interpretable FMI-LS-REF experiments."""
+    access_key = _validated_access_key(access_key)
+    if not fmu_storage.fmu_exists(access_key):
+        raise HTTPException(404, "FMU_NOT_FOUND")
+    try:
+        root = config.FMU_ROOT.resolve(strict=True)
+        fmu_path = fmu_storage.get_fmu_path(access_key).resolve(strict=True)
+        fmu_path.relative_to(root)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(404, "FMU_NOT_FOUND") from exc
+    return read_fmi_ls_ref_experiments(
+        fmu_path,
+        parse_parameter_set=_parse_experiment_parameter_set,
+    )
 
 
 @app.get("/internal/fmu/related-resources", dependencies=[Depends(_check_token)])

@@ -43,6 +43,11 @@ default experiment values, and variable metadata when declared:
 The display-unit conversion includes the inverse conversion when defined. FMI
 `min` and `max` describe model limits; FMI does not define a control resolution.
 
+For FMI 3 FMUs, `describe` also reads FMI-LS-STRUCT map declarations from the
+layered-standard manifest and `terminalsAndIcons.xml`. The normalized
+`fmiLsStruct` field carries map terminals and member-variable references; it
+does not alter simulation behavior.
+
 `GET /internal/fmu/describe?publicOnly=true` omits variables with `local`
 causality before constructing the response. Other non-local causalities remain
 available, including input, output, parameter and independent. The optional
@@ -206,13 +211,13 @@ an FMU in an isolated worker. A passing probe checks the dependencies required
 for initialization; it does not certify every possible simulation path. The
 same probe discovers local FMI-LS-REF `Related` resources with role
 `experiment` or `experiment/smoke-test` and media type
-`application/x-ma-hs-experiments`, then runs up to eight supported transient
-experiments in isolated workers. The current subset accepts local SSP parameter
+`application/x-ma-hs-experiments`, then runs up to eight supported experiments
+in isolated workers. The current subset accepts local SSP parameter
 sets and experiment time options. Cases that declare stimuli, reference time
 series, solver tolerances or other unsupported features are reported as skipped
 in `fmiLsExperiments`; they are never reported as passed. A failed supported
-smoke experiment fails the probe. See the evolving [MA-HS-Experiments
-draft](https://modelica.github.io/ma-hs-experiments/main/) for the XML format.
+smoke experiment fails the probe. The XML format is the current
+[MA-HS Experiments specification](https://modelica.github.io/ma-hs-experiments/main/).
 `auto_quarantine` can request quarantine when validation finds an invalid
 artifact. If the probe cannot run because worker isolation infrastructure is
 unavailable, automatic quarantine is skipped. Manual quarantine and removal

@@ -1,4 +1,4 @@
-"""Read the bounded, local subset of FMI-LS-REF smoke experiments."""
+"""Read a bounded, local subset of FMI-LS-REF experiment declarations."""
 
 from __future__ import annotations
 
@@ -14,14 +14,14 @@ from urllib.parse import unquote, urlsplit
 
 FMI_LS_REF_MANIFEST_PATH = "extra/org.fmi-standard.fmi-ls-ref/fmi-ls-manifest.xml"
 FMI_LS_REF_NAME = "org.fmi-standard.fmi-ls-ref"
-MA_HS_EXPERIMENTS_NAMESPACE = "http://modelica.org/HSExperiments1/HSExperiments"
 MA_HS_EXPERIMENTS_MEDIA_TYPE = "application/x-ma-hs-experiments"
 SSP_PARAMETER_SET_MEDIA_TYPE = "application/x-ssp-parameter-set"
 MAX_MANIFEST_BYTES = 1024 * 1024
 MAX_EXPERIMENT_FILE_BYTES = 1024 * 1024
 MAX_PARAMETER_FILE_BYTES = 512 * 1024
+MAX_TOTAL_PARAMETER_BYTES = 512 * 1024
 MAX_EXPERIMENT_SETS = 8
-MAX_TRANSIENT_EXPERIMENTS_PER_SET = 16
+MAX_EXPERIMENTS_PER_SET = 16
 
 
 def read_fmi_ls_ref_experiments(
@@ -54,6 +54,7 @@ def read_fmi_ls_ref_experiments(
 
             sets: list[dict[str, Any]] = []
             truncated = False
+            total_parameter_bytes = 0
             for related in manifest_root:
                 if _local_name(related) != "Related":
                     continue
@@ -104,7 +105,7 @@ def read_fmi_ls_ref_experiments(
                     descriptor["status"] = "invalid"
                     descriptor["reason"] = "invalid_experiment_xml"
                     continue
-                if experiment_root.tag != f"{{{MA_HS_EXPERIMENTS_NAMESPACE}}}Experiments":
+                if experiment_root.tag != "Experiments":
                     descriptor["status"] = "invalid"
                     descriptor["reason"] = "invalid_experiment_root"
                     continue
@@ -117,26 +118,30 @@ def read_fmi_ls_ref_experiments(
                 if not descriptor["description"]:
                     descriptor["description"] = str(experiment_root.attrib.get("description") or "").strip()[:2048]
 
-                transient_tag = f"{{{MA_HS_EXPERIMENTS_NAMESPACE}}}TransientExperiment"
-                annotations_tag = f"{{{MA_HS_EXPERIMENTS_NAMESPACE}}}Annotations"
-                transients = [child for child in experiment_root if child.tag == transient_tag]
-                descriptor["truncated"] = len(transients) > MAX_TRANSIENT_EXPERIMENTS_PER_SET
-                if any(child.tag not in {transient_tag, annotations_tag} for child in experiment_root):
+                experiment_tag = "Experiment"
+                experiments = [child for child in experiment_root if child.tag == experiment_tag]
+                descriptor["truncated"] = len(experiments) > MAX_EXPERIMENTS_PER_SET
+                if any(
+                    child.tag != experiment_tag and _local_name(child) != "Annotations"
+                    for child in experiment_root
+                ):
                     descriptor["status"] = "unsupported"
                     descriptor["reason"] = "unsupported_experiment_type"
                     continue
                 for child in experiment_root:
-                    if child.tag != transient_tag:
+                    if child.tag != experiment_tag:
                         continue
-                    if len(descriptor["experiments"]) >= MAX_TRANSIENT_EXPERIMENTS_PER_SET:
+                    if len(descriptor["experiments"]) >= MAX_EXPERIMENTS_PER_SET:
                         break
-                    case = _parse_transient_experiment(
+                    case = _parse_experiment(
                         child,
                         archive=archive,
                         experiment_archive_path=archive_path,
                         resource_name_counts=resource_name_counts,
                         parse_parameter_set=parse_parameter_set,
+                        remaining_parameter_bytes=MAX_TOTAL_PARAMETER_BYTES - total_parameter_bytes,
                     )
+                    total_parameter_bytes += case.pop("_parameterBytes", 0)
                     case["eligibleForSmokeProbe"] = role in {"experiment", "experiment/smoke-test"}
                     if not case["eligibleForSmokeProbe"] and case["status"] == "ready":
                         case["status"] = "not_selected"
@@ -145,10 +150,10 @@ def read_fmi_ls_ref_experiments(
 
                 if not descriptor["experiments"]:
                     descriptor["status"] = "invalid"
-                    descriptor["reason"] = "no_transient_experiments"
+                    descriptor["reason"] = "no_experiments"
                 elif any(case["status"] == "invalid" for case in descriptor["experiments"]):
                     descriptor["status"] = "invalid"
-                    descriptor["reason"] = "invalid_transient_experiment"
+                    descriptor["reason"] = "invalid_experiment"
                 elif any(case["status"] == "ready" for case in descriptor["experiments"]):
                     descriptor["status"] = "ready"
                     descriptor["reason"] = ""
@@ -163,13 +168,14 @@ def read_fmi_ls_ref_experiments(
         return {"resourceSets": [], "truncated": False}
 
 
-def _parse_transient_experiment(
+def _parse_experiment(
     element: ET.Element,
     *,
     archive: zipfile.ZipFile,
     experiment_archive_path: str,
     resource_name_counts: dict[str, int],
     parse_parameter_set: Callable[[bytes], dict[str, Any] | None],
+    remaining_parameter_bytes: int,
 ) -> dict[str, Any]:
     name = str(element.attrib.get("name") or "").strip()
     case: dict[str, Any] = {
@@ -179,10 +185,10 @@ def _parse_transient_experiment(
         "parameters": {},
         "parameterUnits": {},
         "status": "invalid",
-        "reason": "invalid_transient_experiment",
+        "reason": "invalid_experiment",
     }
     if not name or len(name) > 180:
-        case["reason"] = "invalid_transient_experiment_name"
+        case["reason"] = "invalid_experiment_name"
         return case
 
     for field in ("startTime", "stopTime", "stepSize", "tolerance"):
@@ -205,9 +211,9 @@ def _parse_transient_experiment(
     children: dict[str, ET.Element] = {}
     for child in element:
         local_name = _local_name(child)
-        if child.tag == f"{{{MA_HS_EXPERIMENTS_NAMESPACE}}}Annotations":
+        if _local_name(child) == "Annotations":
             continue
-        if child.tag != f"{{{MA_HS_EXPERIMENTS_NAMESPACE}}}{local_name}":
+        if child.tag != local_name:
             case["reason"] = "unsupported_or_ambiguous_experiment_element"
             return case
         if local_name not in {"Parameters", "Stimuli", "References"}:
@@ -255,6 +261,11 @@ def _parse_transient_experiment(
         if parameter_data is None:
             case["status"] = "unavailable"
             case["reason"] = "parameter_file_unavailable_or_too_large"
+            return case
+        case["_parameterBytes"] = len(parameter_data)
+        if len(parameter_data) > remaining_parameter_bytes:
+            case["status"] = "unavailable"
+            case["reason"] = "experiment_parameter_data_limit_exceeded"
             return case
         try:
             parsed_parameter_set = parse_parameter_set(parameter_data)

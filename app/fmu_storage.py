@@ -21,6 +21,7 @@ from typing import Any
 import fmpy
 
 from . import config
+from .fmi_ls_struct import read_fmi_ls_struct
 
 logger = logging.getLogger(__name__)
 
@@ -509,12 +510,24 @@ def describe_path(
 ) -> dict[str, Any]:
     """Describe a specific immutable FMU file."""
     md = fmpy.read_model_description(str(path))
-    return describe_model_description(
+    description = describe_model_description(
         md,
         public_only=public_only,
         causality=causality,
         display_unit_inverses=_display_unit_inverse_map(path),
     )
+    fmi_ls_struct = read_fmi_ls_struct(
+        path,
+        fmi_version=str(description.get("fmiVersion") or ""),
+        variable_names=[
+            variable["name"]
+            for variable in description.get("modelVariables", [])
+            if isinstance(variable, dict) and isinstance(variable.get("name"), str)
+        ],
+    )
+    if fmi_ls_struct is not None:
+        description["fmiLsStruct"] = fmi_ls_struct
+    return description
 
 
 def _display_unit_inverse_map(path: Path) -> dict[tuple[str, str], bool] | None:
