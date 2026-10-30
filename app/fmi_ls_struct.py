@@ -16,7 +16,15 @@ MATCHING_RULE = f"{MANIFEST_NAME}.map"
 MAP_KIND_PREFIX = f"{MANIFEST_NAME}.map."
 MAP_TERMINAL_KINDS = {
     f"{MAP_KIND_PREFIX}rectilinearGrid",
-    f"{MAP_KIND_PREFIX}irregularGrid",
+    f"{MAP_KIND_PREFIX}irregular",
+}
+DOMAIN_KIND = f"{MANIFEST_NAME}.map.domain"
+DOMAIN_INPUT_KIND = f"{MANIFEST_NAME}.map.domainInput"
+CODOMAIN_KIND = f"{MANIFEST_NAME}.map.codomain"
+CODOMAIN_OUTPUT_KIND = f"{MANIFEST_NAME}.map.codomainOutput"
+ORDERING_CONSTRAINT_TYPE = f"{MANIFEST_NAME}.orderingConstraint"
+ORDERING_CONSTRAINTS = {
+    "unordered", "increasing", "decreasing", "strictlyIncreasing", "strictlyDecreasing",
 }
 MAX_XML_BYTES = 1024 * 1024
 MAX_MAPS = 128
@@ -77,6 +85,7 @@ def normalize_fmi_ls_struct(
             variable_name = raw_member.get("variableName")
             member_name = raw_member.get("memberName")
             variable_kind = raw_member.get("variableKind")
+            ordering_constraint = raw_member.get("orderingConstraint")
             if (
                 not isinstance(variable_name, str)
                 or not variable_name
@@ -90,6 +99,11 @@ def normalize_fmi_ls_struct(
                 or (known_variables is not None and variable_name not in known_variables)
                 or member_name in member_names
                 or variable_name in member_variables
+                or (ordering_constraint is not None and (
+                    variable_kind != DOMAIN_KIND
+                    or terminal_kind != f"{MAP_KIND_PREFIX}rectilinearGrid"
+                    or ordering_constraint not in ORDERING_CONSTRAINTS
+                ))
             ):
                 valid = False
                 break
@@ -97,13 +111,12 @@ def normalize_fmi_ls_struct(
                 "variableName": variable_name,
                 "memberName": member_name,
                 "variableKind": variable_kind,
+                **({"orderingConstraint": ordering_constraint} if ordering_constraint is not None else {}),
             })
             member_names.add(member_name)
             member_variables.add(variable_name)
 
-        if not valid or not any(member["variableKind"] == f"{MANIFEST_NAME}.map.domain" for member in members):
-            continue
-        if not any(member["variableKind"] == f"{MANIFEST_NAME}.map.codomain" for member in members):
+        if not valid or not _has_valid_map_member_order(members):
             continue
 
         maps.append({
@@ -179,11 +192,26 @@ def read_fmi_ls_struct(
                 for member in terminal:
                     if member.tag.rsplit("}", 1)[-1] != "TerminalMemberVariable":
                         continue
-                    raw_members.append({
+                    normalized_member = {
                         "variableName": member.get("variableName"),
                         "memberName": member.get("memberName"),
                         "variableKind": member.get("variableKind"),
-                    })
+                    }
+                    annotations = next(
+                        (child for child in member if child.tag.rsplit("}", 1)[-1] == "Annotations"),
+                        None,
+                    )
+                    if annotations is not None:
+                        ordering_annotations = [
+                            child for child in annotations
+                            if child.tag.rsplit("}", 1)[-1] == "Annotation"
+                            and child.get("type") == ORDERING_CONSTRAINT_TYPE
+                        ]
+                        if len(ordering_annotations) > 1:
+                            normalized_member["orderingConstraint"] = ""
+                        elif ordering_annotations:
+                            normalized_member["orderingConstraint"] = (ordering_annotations[0].text or "").strip()
+                    raw_members.append(normalized_member)
                 maps.append({
                     "name": terminal.get("name"),
                     "terminalKind": terminal.get("terminalKind"),
@@ -200,3 +228,34 @@ def read_fmi_ls_struct(
         }, variable_names=variable_names)
     except (OSError, KeyError, ValueError, UnicodeDecodeError, ET.ParseError, zipfile.BadZipFile, RuntimeError, EOFError, zlib.error):
         return None
+
+
+def _has_valid_map_member_order(members: list[dict]) -> bool:
+    """Check required axes and the immediate pairing of optional map members."""
+    domains = [index for index, member in enumerate(members) if member["variableKind"] == DOMAIN_KIND]
+    codomains = [index for index, member in enumerate(members) if member["variableKind"] == CODOMAIN_KIND]
+    if not domains or not codomains:
+        return False
+
+    for index, member in enumerate(members):
+        kind = member["variableKind"]
+        if kind in {DOMAIN_KIND, DOMAIN_INPUT_KIND} and index >= min(codomains):
+            return False
+        if kind in {CODOMAIN_KIND, CODOMAIN_OUTPUT_KIND} and index <= max(domains):
+            return False
+        if kind in {DOMAIN_KIND, CODOMAIN_KIND}:
+            continue
+        if kind == DOMAIN_INPUT_KIND:
+            if index == 0 or members[index - 1]["variableKind"] != DOMAIN_KIND:
+                return False
+        elif kind == CODOMAIN_OUTPUT_KIND:
+            if index == 0 or members[index - 1]["variableKind"] != CODOMAIN_KIND:
+                return False
+        elif kind.startswith(MAP_KIND_PREFIX):
+            return False
+
+    return all(
+        member.get("orderingConstraint") in ORDERING_CONSTRAINTS
+        for member in members
+        if "orderingConstraint" in member
+    )

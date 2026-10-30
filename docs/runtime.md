@@ -43,9 +43,14 @@ default experiment values, and variable metadata when declared:
 The display-unit conversion includes the inverse conversion when defined. FMI
 `min` and `max` describe model limits; FMI does not define a control resolution.
 
-For FMI 3 FMUs, `describe` also reads FMI-LS-STRUCT map declarations from the
+For FMI 3 FMUs, `describe` reads FMI-LS-STRUCT map declarations from the
 layered-standard manifest and `terminalsAndIcons.xml`. The normalized
-`fmiLsStruct` field carries map terminals and member-variable references; it
+`fmiLsStruct` field carries rectilinear and irregular map terminals, all
+standard map members (`domain`, `domainInput`, `codomain`, and `codomainOutput`),
+and supported domain ordering annotations. Reservation access filtering keeps
+only maps whose member variables are readable. The Marketplace groups editable
+map arrays, renders one-dimensional curves and multidimensional value tables,
+and shows declared operating points and available output samples. This metadata
 does not alter simulation behavior.
 
 `GET /internal/fmu/describe?publicOnly=true` omits variables with `local`
