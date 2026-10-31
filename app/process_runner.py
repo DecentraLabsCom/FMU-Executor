@@ -253,12 +253,12 @@ def _realtime_session_worker(
     session_id: str,
     fmu_path: Path,
     access_key: str,
-    fmu_sha256: str | None = None,
     session_factory: Any = None,
     start_gate: Any = None,
     worker_directory: str | None = None,
     resource_policy: dict[str, Any] | None = None,
     expected_parent_pid: int | None = None,
+    fmu_sha256: str | None = None,
 ) -> None:
     """Own one realtime FmuSession and service a narrow IPC command set."""
     session = None
@@ -428,8 +428,8 @@ class RealtimeSession:
             target=_realtime_session_worker,
             args=(
                 child_connection, self.session_id, worker_fmu_path, self.access_key,
-                self.fmu_sha256, _worker_session_factory, start_gate, str(self._worker_directory), resource_policy,
-                os.getpid(),
+                _worker_session_factory, start_gate, str(self._worker_directory), resource_policy,
+                os.getpid(), self.fmu_sha256,
             ),
             name="LabStation-FMU-Realtime",
             worker_directory=self._worker_directory,
