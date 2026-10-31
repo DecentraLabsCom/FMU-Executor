@@ -92,8 +92,10 @@ def build(three_root: Path) -> None:
         shutil.copyfile(source, destination)
 
     sync_protocol_sdk(find_protocol_source(), WEBAPP_ROOT / "sdk")
+    sdk_index = WEBAPP_ROOT / "sdk" / "index.js"
     sdk_client = WEBAPP_ROOT / "sdk" / "client.js"
-    if b"fmu-state-checkpoints" not in sdk_client.read_bytes():
+    if (b"fmu-state-checkpoints" not in sdk_index.read_bytes()
+            or b"DIGITAL_TWIN_CAPABILITY.FMU_STATE_CHECKPOINTS" not in sdk_client.read_bytes()):
         raise ValueError("The Smart Warehouse app requires the SDK's FMU state checkpoint capability.")
 
     # These examples import the package specifier `three`. Rewrite only that

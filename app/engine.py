@@ -686,6 +686,7 @@ class FmuSession:
     def restore_fmu_state(self, snapshot: dict[str, Any]) -> dict[str, Any]:
         """Restore a signed checkpoint into an initialized FMU instance."""
         slave = self._require_slave()
+        initialized_for_run = self._state == "initialized"
         if not self._supports_serialized_fmu_state():
             raise RuntimeError("FMU state restore is not supported by this model")
         if not isinstance(snapshot, dict):
@@ -740,7 +741,10 @@ class FmuSession:
         self._initial_parameters = copy.deepcopy(initial_parameters)
         self._finished_reason = None
         self._terminated = False
-        self._state = "paused"
+        # A checkpoint supplied to sim.initialize is restored before the first
+        # explicit sim.advance. Keep that newly initialized session runnable;
+        # restoring into an existing paused session should remain paused.
+        self._state = "initialized" if initialized_for_run else "paused"
         return {"state": self._state, "simTime": self._time}
 
     def _supports_serialized_fmu_state(self) -> bool:

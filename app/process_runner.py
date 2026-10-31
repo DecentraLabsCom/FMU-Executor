@@ -672,6 +672,20 @@ class RealtimeSession:
     def set_inputs(self, values: dict[str, Any]) -> None:
         self._rpc("set_inputs", values)
 
+    def capture_fmu_state(self) -> dict[str, Any]:
+        """Capture a serialized FMU checkpoint through the isolated worker."""
+        result = self._rpc("capture_fmu_state")
+        if not isinstance(result, dict):
+            raise ProcessExecutionError("FMU realtime worker returned an invalid state checkpoint")
+        return result
+
+    def restore_fmu_state(self, snapshot: dict[str, Any]) -> dict[str, Any]:
+        """Restore a serialized FMU checkpoint through the isolated worker."""
+        result = self._rpc("restore_fmu_state", snapshot)
+        if not isinstance(result, dict):
+            raise ProcessExecutionError("FMU realtime worker returned an invalid restored state")
+        return result
+
     def validate_inputs(self, values: dict[str, Any]) -> dict[str, Any]:
         result = self._rpc("validate_inputs", values)
         return result if isinstance(result, dict) else {}

@@ -102,6 +102,8 @@ export function createDigitalTwinAppClient({
   let readySent = false
   let startupError
   let active = null
+  let completedRun = null
+  let completedRunTimer = null
   let selectedFmiLsExperiment = null
   let selectedFmuStateCheckpoint = null
   let resumeFromFmuStateCheckpoint = false
@@ -113,6 +115,15 @@ export function createDigitalTwinAppClient({
   if (typeof onPlaybackRate === 'function') capabilities.push(DIGITAL_TWIN_CAPABILITY.PLAYBACK_RATE)
   if (typeof onFmiLsParameterPreset === 'function') capabilities.push(DIGITAL_TWIN_CAPABILITY.FMI_LS_PARAMETER_PRESETS)
   const report = (error) => { try { onError?.(error) } catch { /* The app owns its error presentation. */ } }
+
+  function releaseCompletedRun() {
+    if (completedRunTimer !== null) {
+      clearTimeout(completedRunTimer)
+      completedRunTimer = null
+    }
+    completedRun?.session?.close()
+    completedRun = null
+  }
 
   function sendReady() {
     if (!disposed && hostReady && sceneReady && !readySent && !startupError) {
@@ -189,8 +200,9 @@ export function createDigitalTwinAppClient({
 
   function state(run, value) {
     if (disposed) return
-    try { onSimulationState?.(value, { runId: run.runId, state: value }) } catch (error) { report(error) }
-    postToHost(MESSAGE.EXECUTION_STATE, { runId: run.runId, state: value, options: run.options })
+    const options = run.runOptions || run.options
+    try { onSimulationState?.(value, { runId: run.runId, state: value, options }) } catch (error) { report(error) }
+    postToHost(MESSAGE.EXECUTION_STATE, { runId: run.runId, state: value, options })
   }
   async function deliver(run, samples) {
     run.controller.signal.throwIfAborted()
@@ -257,11 +269,12 @@ export function createDigitalTwinAppClient({
     try { onFmuStateCheckpoint?.(bundle) } catch (error) { report(error) }
     postToHost(MESSAGE.FMU_STATE_SAVED, { bundle })
   }
-  async function captureState(run = active) {
+  async function captureState(run = active || completedRun) {
     if (!run?.session) throw errorWithCode('There is no active FMU session to capture.', 'RUN_UNAVAILABLE')
     try {
       const bundle = await run.session.captureState()
       notifyCheckpoint(bundle)
+      if (run === completedRun) releaseCompletedRun()
       return bundle
     } catch (error) {
       postToHost(MESSAGE.FMU_STATE_ERROR, { code: 'FMU_STATE_CAPTURE_FAILED' })
@@ -278,7 +291,18 @@ export function createDigitalTwinAppClient({
         error = captureError
       }
     }
-    run.session?.close()
+    const retainCompletedRun = outcome === 'completed' && !disposed
+      && run.session?.capabilities?.fmuState?.getAndSet === true
+      && run.session.capabilities?.fmuState?.serialize === true
+    if (retainCompletedRun) {
+      releaseCompletedRun()
+      completedRun = run
+      completedRunTimer = setTimeout(() => {
+        if (completedRun === run) releaseCompletedRun()
+      }, 5 * 60 * 1000)
+    } else {
+      run.session?.close()
+    }
     if (disposed) { if (active === run) active = null; return }
     if (error && outcome === 'error') report(error)
     state(run, outcome)
@@ -319,7 +343,7 @@ export function createDigitalTwinAppClient({
   }
   async function pump(run) {
     try {
-      let time = run.options.startTime
+      let time = run.resumeTime ?? run.options.startTime
       let eventIndex = 0
       while (time < run.options.stopTime - 1e-12) {
         run.controller.signal.throwIfAborted()
@@ -499,6 +523,7 @@ export function createDigitalTwinAppClient({
     if (!Number.isInteger(maxBatchSamples) || maxBatchSamples < 1 || maxBatchSamples > MAX_SAMPLES_PER_BATCH) throw errorWithCode(`maxBatchSamples must be an integer from 1 to ${MAX_SAMPLES_PER_BATCH}.`, 'INVALID_INPUT')
     if (batchPolicy === 'adaptive' && inputController) throw errorWithCode('Adaptive batching cannot be combined with a per-sample input controller.', 'INVALID_INPUT')
     if (inputController && !inputControllerInterval && maxBatchSamples !== MAX_SAMPLES_PER_BATCH && maxBatchSamples !== 1) throw errorWithCode('maxBatchSamples must be 1 when using a per-sample input controller without an update interval.', 'INVALID_INPUT')
+    releaseCompletedRun()
     const current = {
       runId: createProtocolId('run'), controller: new AbortController(), sampleCount: 0,
       options, inputController, inputControllerInterval, inputControllerTimes: [...effectiveInputControllerTimes].sort((a, b) => a - b),
@@ -545,16 +570,24 @@ export function createDigitalTwinAppClient({
         stopTime: options.stopTime ?? model.defaultStopTime ?? 1,
         stepSize: options.stepSize ?? model.defaultStepSize ?? 0.001,
       }
-      if (checkpointBundle) current.options.startTime = checkpointBundle.simTime
       const { startTime, stopTime, stepSize } = current.options
       if (!isValidOptions(current.options) || stopTime <= startTime || stepSize <= 0) throw errorWithCode('Invalid simulation interval.', 'INVALID_RUN_REQUEST')
-      if (current.inputControllerTimes.some((time) => time < startTime || time > stopTime)) {
+      const resumeTime = checkpointBundle?.simTime ?? startTime
+      if (checkpointBundle && resumeTime < startTime) {
+        throw errorWithCode('The saved FMU state is earlier than the configured simulation start time.', 'INVALID_RUN_REQUEST')
+      }
+      if (resumeTime >= stopTime) {
+        throw errorWithCode('Stop time must be later than the saved FMU state. Stop time is absolute.', 'INVALID_RUN_REQUEST')
+      }
+      current.resumeTime = resumeTime
+      current.runOptions = { ...current.options, startTime: resumeTime }
+      if (current.inputControllerTimes.some((time) => time < resumeTime || time > stopTime)) {
         throw errorWithCode('An input controller time is outside the simulation interval.', 'INVALID_INPUT')
       }
-      current.nextControllerTime = inputControllerInterval === undefined ? Infinity : startTime + inputControllerInterval
+      current.nextControllerTime = inputControllerInterval === undefined ? Infinity : resumeTime + inputControllerInterval
       if (batchPolicy === 'adaptive') {
         current.batchController = createAdaptiveBatchController({
-          startTime, stopTime, stepSize, maxSamples: maxBatchSamples, ...adaptiveBatchOptions,
+          startTime: resumeTime, stopTime, stepSize, maxSamples: maxBatchSamples, ...adaptiveBatchOptions,
         })
       }
       // Keep provider-authorized FMI-LS experiments and Schedule changes when
@@ -584,16 +617,16 @@ export function createDigitalTwinAppClient({
         ...(current.advanceOptions.outputVariables ? { variables: current.advanceOptions.outputVariables } : {}),
       })
       if (current.advanceOptions.outputVariables) {
-        const rounding = Number.EPSILON * Math.max(1, Math.abs(startTime)) * 8
+        const rounding = Number.EPSILON * Math.max(1, Math.abs(resumeTime)) * 8
         const tolerance = Math.min(Math.abs(stepSize) / 4, Math.max(1e-9, Math.abs(stepSize) * 1e-7, rounding))
-        if (!Number.isFinite(initial?.simTime) || Math.abs(initial.simTime - startTime) > tolerance) {
+        if (!Number.isFinite(initial?.simTime) || Math.abs(initial.simTime - resumeTime) > tolerance) {
           throw errorWithCode('The FMU returned an invalid initial sample time.', 'INVALID_FMU_RESPONSE')
         }
       }
       const initialSample = { time: initial.simTime, outputs: initial.values }
       await deliver(current, [initialSample])
-      if (current.inputControllerTimes.length && current.inputControllerTimes[0] <= startTime + 1e-12) {
-        while (current.inputControllerTimes[current.inputControllerTimeIndex] <= startTime + 1e-12) current.inputControllerTimeIndex += 1
+      if (current.inputControllerTimes.length && current.inputControllerTimes[0] <= resumeTime + 1e-12) {
+        while (current.inputControllerTimes[current.inputControllerTimeIndex] <= resumeTime + 1e-12) current.inputControllerTimeIndex += 1
       }
       await updateController(current, initialSample, { initial: true })
       onRunAccepted?.({ runId: current.runId })
@@ -619,6 +652,7 @@ export function createDigitalTwinAppClient({
     dispose() {
       disposed = true
       cancel()
+      releaseCompletedRun()
       for (const requestId of grants.keys()) finishGrant(requestId, errorWithCode('The client was disposed.', 'DISPOSED'))
       globalThis.window?.removeEventListener('message', receive)
     },
