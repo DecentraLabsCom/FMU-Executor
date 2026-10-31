@@ -121,6 +121,8 @@ quota helper, before packaging. It removes stale JavaScript modules and checks
 that the app's local module and asset references are present in the generated
 ZIP. Rebuild the webapp bundle after updating the Marketplace SDK.
 The browser contract also accepts apps that implement its messages directly.
+The FMU implements FMI 2.0 state get/set and serialization, so Marketplace can
+save a completed laboratory state and resume a later run from that checkpoint.
 
 Both FMU builds embed the default Three.js-exported GLB in `resources/` and ship
 a same-stem companion `.glb` for Gateway/Station asset import. The optional

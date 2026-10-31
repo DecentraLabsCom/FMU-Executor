@@ -1,4 +1,4 @@
-// Host integration v2 carries authorization and optional HMI controls only.
+// Host integration v2 carries authorization and optional FMI-LS controls.
 export const DIGITAL_TWIN_PROTOCOL_VERSION = 2
 export const DIGITAL_TWIN_APP_ASSET_FILENAME = 'index.js'
 export const MAX_RUN_PARAMETERS = 256
@@ -18,17 +18,32 @@ export const DIGITAL_TWIN_MESSAGE = Object.freeze({
   EXECUTION_STATE: 'decentralabs:execution-state',
   EXECUTION_CANCEL: 'decentralabs:execution-cancel',
   PLAYBACK_CONTROL: 'decentralabs:fmi-playback-control',
+  FMI_LS_PARAMETER_PRESET: 'decentralabs:fmi-ls-parameter-preset',
+  FMI_LS_EXPERIMENT: 'decentralabs:fmi-ls-experiment',
+  FMU_STATE_CONFIGURATION: 'decentralabs:fmu-state-configuration',
+  FMU_STATE_CAPTURE: 'decentralabs:fmu-state-capture',
+  FMU_STATE_SAVED: 'decentralabs:fmu-state-saved',
+  FMU_STATE_ERROR: 'decentralabs:fmu-state-error',
   MODEL_CHANGE: 'decentralabs:digital-twin-model-change',
 })
-export const DIGITAL_TWIN_CAPABILITY = Object.freeze({ PLAYBACK_RATE: 'playback-rate', EXECUTION_CONTROL: 'execution-control' })
+export const DIGITAL_TWIN_CAPABILITY = Object.freeze({
+  PLAYBACK_RATE: 'playback-rate',
+  EXECUTION_CONTROL: 'execution-control',
+  FMI_LS_PARAMETER_PRESETS: 'fmi-ls-parameter-presets',
+  FMI_LS_EXPERIMENTS: 'fmi-ls-experiments',
+  FMU_STATE_CHECKPOINTS: 'fmu-state-checkpoints',
+})
 export const APP_TO_HOST_MESSAGE_TYPES = Object.freeze([
   DIGITAL_TWIN_MESSAGE.APP_HELLO,
   DIGITAL_TWIN_MESSAGE.APP_READY, DIGITAL_TWIN_MESSAGE.APP_ERROR, DIGITAL_TWIN_MESSAGE.CONNECTION_REQUEST,
   DIGITAL_TWIN_MESSAGE.EXECUTION_STATE, DIGITAL_TWIN_MESSAGE.MODEL_CHANGE,
+  DIGITAL_TWIN_MESSAGE.FMU_STATE_SAVED, DIGITAL_TWIN_MESSAGE.FMU_STATE_ERROR,
 ])
 export const HOST_TO_APP_MESSAGE_TYPES = Object.freeze([
   DIGITAL_TWIN_MESSAGE.HOST_READY, DIGITAL_TWIN_MESSAGE.CONNECTION_READY, DIGITAL_TWIN_MESSAGE.CONNECTION_ERROR,
   DIGITAL_TWIN_MESSAGE.EXECUTION_CANCEL, DIGITAL_TWIN_MESSAGE.PLAYBACK_CONTROL,
+  DIGITAL_TWIN_MESSAGE.FMI_LS_PARAMETER_PRESET, DIGITAL_TWIN_MESSAGE.FMI_LS_EXPERIMENT,
+  DIGITAL_TWIN_MESSAGE.FMU_STATE_CONFIGURATION, DIGITAL_TWIN_MESSAGE.FMU_STATE_CAPTURE,
 ])
 export const isRecord = (v) => v !== null && typeof v === 'object' && !Array.isArray(v)
 const keys = (v, allowed) => Object.keys(v).every((key) => allowed.includes(key))
@@ -40,6 +55,20 @@ export const isFiniteScalar = (v) => typeof v === 'boolean' || (typeof v === 'nu
 export const isValidOptions = (v) => isRecord(v) && Object.entries(v).every(([key, value]) => ['startTime', 'stopTime', 'stepSize'].includes(key) && typeof value === 'number' && Number.isFinite(value))
 export const isValidParameters = (v) => isRecord(v) && Object.keys(v).length <= MAX_RUN_PARAMETERS && Object.entries(v).every(([key, value]) => text(key, 256) && isFiniteScalar(value))
 export const isValidInputSchedule = (v) => Array.isArray(v) && v.length <= 128 && v.every((event) => isRecord(event) && keys(event, ['time', 'values']) && Number.isFinite(event.time) && isValidParameters(event.values))
+export function isValidFmuStateCheckpoint(v) {
+  return isRecord(v) && keys(v, ['format', 'checkpointId', 'scope', 'createdAt', 'expiresAt', 'signature'])
+    && v.format === 'decentralabs-fmi-state-v1'
+    && typeof v.checkpointId === 'string' && /^[a-f\d]{32}$/.test(v.checkpointId)
+    && typeof v.scope === 'string' && /^[a-f\d]{64}$/.test(v.scope)
+    && Number.isFinite(v.createdAt) && Number.isFinite(v.expiresAt)
+    && v.expiresAt > v.createdAt && v.expiresAt > Date.now() / 1000
+    && typeof v.signature === 'string' && /^[a-f\d]{64}$/.test(v.signature)
+}
+export function isValidFmuStateCheckpointBundle(v) {
+  if (!isRecord(v) || !keys(v, ['version', 'simTime', 'checkpoint']) || v.version !== 1
+    || !Number.isFinite(v.simTime) || !isValidFmuStateCheckpoint(v.checkpoint)) return false
+  try { return new TextEncoder().encode(JSON.stringify(v)).length <= 4096 } catch { return false }
+}
 export function isValidConnectionConfig(v) {
   if (!isRecord(v) || !keys(v, ['protocolVersion', 'gatewayWsUrl', 'labId', 'reservationKey', 'sessionTicket', 'ticketExpiresAt'])) return false
   if (v.protocolVersion !== '1.0' || !text(v.labId) || !text(v.reservationKey, 256) || !text(v.sessionTicket, 4096) || !Number.isSafeInteger(v.ticketExpiresAt) || v.ticketExpiresAt <= 0) return false
@@ -79,6 +108,10 @@ export function isValidAppMessage(v) {
         && ['idle', 'running', 'completed', 'cancelled', 'error'].includes(v.state) && (v.options === undefined || isValidOptions(v.options))
     case DIGITAL_TWIN_MESSAGE.MODEL_CHANGE:
       return keys(v, ['type', 'version', 'modelId']) && text(v.modelId)
+    case DIGITAL_TWIN_MESSAGE.FMU_STATE_SAVED:
+      return keys(v, ['type', 'version', 'bundle']) && isValidFmuStateCheckpointBundle(v.bundle)
+    case DIGITAL_TWIN_MESSAGE.FMU_STATE_ERROR:
+      return keys(v, ['type', 'version', 'code']) && text(v.code)
     default: return false
   }
 }
@@ -95,8 +128,33 @@ export function isValidHostMessage(v) {
       return keys(v, ['type', 'version', 'runId']) && isValidProtocolId(v.runId)
     case DIGITAL_TWIN_MESSAGE.PLAYBACK_CONTROL:
       return keys(v, ['type', 'version', 'rate', 'rateUnit']) && Number.isFinite(v.rate) && v.rate > 0 && v.rate <= 100000 && v.rateUnit === 'model-seconds-per-real-second'
+    case DIGITAL_TWIN_MESSAGE.FMI_LS_PARAMETER_PRESET:
+      return keys(v, ['type', 'version', 'id', 'name', 'description', 'parameters'])
+        && isValidProtocolId(v.id) && text(v.name, 180)
+        && typeof v.description === 'string' && v.description.length <= 1024
+        && isValidParameters(v.parameters)
+    case DIGITAL_TWIN_MESSAGE.FMI_LS_EXPERIMENT:
+      return keys(v, ['type', 'version', 'experiment'])
+        && (v.experiment === null || isValidFmiLsExperiment(v.experiment))
+    case DIGITAL_TWIN_MESSAGE.FMU_STATE_CONFIGURATION:
+      return keys(v, ['type', 'version', 'checkpoint', 'resume', 'captureOnCompletion'])
+        && (v.checkpoint === null || isValidFmuStateCheckpointBundle(v.checkpoint))
+        && typeof v.resume === 'boolean' && typeof v.captureOnCompletion === 'boolean'
+    case DIGITAL_TWIN_MESSAGE.FMU_STATE_CAPTURE:
+      return keys(v, ['type', 'version'])
     default: return false
   }
+}
+export function isValidFmiLsExperiment(v) {
+  return isRecord(v)
+    && keys(v, ['id', 'name', 'description', 'parameters', 'options', 'inputSchedule'])
+    && isValidProtocolId(v.id)
+    && text(v.name, 180)
+    && typeof v.description === 'string' && v.description.length <= 2048
+    && isValidParameters(v.parameters)
+    && isValidOptions(v.options)
+    && (v.inputSchedule === undefined || isValidInputSchedule(v.inputSchedule))
+    && (Object.keys(v.parameters).length > 0 || Object.keys(v.options).length > 0 || (v.inputSchedule?.length || 0) > 0)
 }
 export function createProtocolId(prefix = 'run') {
   return `${prefix}:${globalThis.crypto?.randomUUID?.() || `${Date.now().toString(36)}:${Math.random().toString(36).slice(2, 14)}`}`

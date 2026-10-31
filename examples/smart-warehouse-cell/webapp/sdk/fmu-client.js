@@ -1,7 +1,29 @@
 import { createProtocolId, isValidConnectionConfig, MAX_SAMPLE_BATCH_JSON_CHARS } from './index.js'
 import { getInputUpdateQuota, getInputUpdateRetryDelayMs } from './input-update-quota.js'
+import { omitParametersMatchingFmiStart } from './parameter-defaults.js'
 
 const failure = (message, code = 'FMU_CONNECTION_FAILED') => Object.assign(new Error(message), { code })
+const CHECKPOINT_FIELDS = ['format', 'checkpointId', 'scope', 'createdAt', 'expiresAt', 'signature']
+
+export function isValidFmuStateCheckpoint(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    && Object.keys(value).length === CHECKPOINT_FIELDS.length
+    && Object.keys(value).every((key) => CHECKPOINT_FIELDS.includes(key))
+    && value.format === 'decentralabs-fmi-state-v1'
+    && typeof value.checkpointId === 'string' && /^[a-f\d]{32}$/.test(value.checkpointId)
+    && typeof value.scope === 'string' && /^[a-f\d]{64}$/.test(value.scope)
+    && Number.isFinite(value.createdAt) && Number.isFinite(value.expiresAt)
+    && value.expiresAt > value.createdAt && value.expiresAt > Date.now() / 1000
+    && typeof value.signature === 'string' && /^[a-f\d]{64}$/.test(value.signature)
+}
+
+export function isValidFmuStateCheckpointBundle(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || Object.keys(value).length !== 3 || !['version', 'simTime', 'checkpoint'].every((key) => key in value)
+    || value.version !== 1 || !Number.isFinite(value.simTime)
+    || !isValidFmuStateCheckpoint(value.checkpoint)) return false
+  try { return new TextEncoder().encode(JSON.stringify(value)).length <= 4096 } catch { return false }
+}
 
 function waitForRetry(delayMs, signal) {
   signal?.throwIfAborted()
@@ -34,6 +56,7 @@ export async function connectFmuSession(connection, { signal, timeoutMs = 120_00
   const pending = new Map()
   let sessionId
   let capabilities = {}
+  let modelVariablesForStart = null
   let closed = false
   let openResolve
   let openReject
@@ -82,6 +105,28 @@ export async function connectFmuSession(connection, { signal, timeoutMs = 120_00
   })
 
   async function request(type, expected, payload = {}) {
+    const hasInitializationParameters = payload.parameters
+      && typeof payload.parameters === 'object' && !Array.isArray(payload.parameters)
+      && Object.keys(payload.parameters).length > 0
+    if (type === 'sim.initialize' && hasInitializationParameters && modelVariablesForStart === null) {
+      try {
+        await request('model.describe', 'model.description', { includeVariables: true })
+      } catch (error) {
+        if (closed || signal?.aborted) throw error
+      }
+    }
+
+    let requestPayload = payload
+    if (type === 'model.describe') {
+      requestPayload = { ...payload, includeVariables: true }
+    } else if (type === 'sim.initialize' && payload.parameters
+      && typeof payload.parameters === 'object' && !Array.isArray(payload.parameters)) {
+      requestPayload = {
+        ...payload,
+        parameters: omitParametersMatchingFmiStart(payload.parameters, modelVariablesForStart || []),
+      }
+    }
+
     const hasInputUpdates = type === 'sim.setInputs'
       ? Boolean(payload.values && Object.keys(payload.values).length)
       : type === 'sim.advance' && (
@@ -94,16 +139,20 @@ export async function connectFmuSession(connection, { signal, timeoutMs = 120_00
       signal?.throwIfAborted()
       const requestId = createProtocolId('rpc')
       try {
-        return await new Promise((resolve, reject) => {
+        const response = await new Promise((resolve, reject) => {
           const timeout = setTimeout(() => {
             pending.delete(requestId)
             reject(failure('The FMU operation timed out.', 'FMU_REQUEST_TIMEOUT'))
             close()
           }, timeoutMs)
           pending.set(requestId, { resolve, reject, timeout, expected })
-          try { socket.send(JSON.stringify({ ...payload, type, requestId, ...(sessionId ? { sessionId } : {}) })) }
+          try { socket.send(JSON.stringify({ ...requestPayload, type, requestId, ...(sessionId ? { sessionId } : {}) })) }
           catch (error) { close(error) }
         })
+        if (type === 'model.describe') {
+          modelVariablesForStart = Array.isArray(response.modelVariables) ? response.modelVariables : []
+        }
+        return response
       } catch (error) {
         if (!hasInputUpdates) throw error
         const retryAfterMs = getInputUpdateRetryDelayMs(error, capabilities)
@@ -123,10 +172,37 @@ export async function connectFmuSession(connection, { signal, timeoutMs = 120_00
     getInputUpdateQuota(created.capabilities || {})
     capabilities = created.capabilities || {}
     sessionId = created.sessionId
+    function requireFmuStateSupport() {
+      if (capabilities.fmuState?.getAndSet !== true || capabilities.fmuState?.serialize !== true) {
+        throw failure('The provider FMU runtime does not support serialized FMU states.', 'UNSUPPORTED_FMU_STATE')
+      }
+    }
+
+    async function captureState() {
+      requireFmuStateSupport()
+      const response = await request('sim.captureFMUState', 'sim.fmuState')
+      const bundle = { version: 1, simTime: Number(response.simTime), checkpoint: response.checkpoint }
+      if (!isValidFmuStateCheckpointBundle(bundle)) {
+        throw failure('The provider returned an invalid FMU state checkpoint.', 'INVALID_FMU_STATE_CHECKPOINT')
+      }
+      return bundle
+    }
+
+    async function restoreState(value) {
+      requireFmuStateSupport()
+      const checkpoint = isValidFmuStateCheckpointBundle(value) ? value.checkpoint : value
+      if (!isValidFmuStateCheckpoint(checkpoint)) {
+        throw failure('The FMU state checkpoint is invalid.', 'INVALID_FMU_STATE_CHECKPOINT')
+      }
+      return request('sim.restoreFMUState', 'sim.state', { checkpoint })
+    }
+
     return {
       sessionId,
       capabilities,
       request,
+      captureState,
+      restoreState,
       close() {
         if (!closed && socket.readyState === WebSocket.OPEN) {
           socket.send(JSON.stringify({ type: 'session.terminate', requestId: createProtocolId('close'), sessionId }))

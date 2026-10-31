@@ -12,8 +12,8 @@
     needsExecutionTool="false"
     canHandleVariableCommunicationStepSize="true"
     canInterpolateInputs="false"
-    canGetAndSetFMUstate="false"
-    canSerializeFMUstate="false"
+    canGetAndSetFMUstate="true"
+    canSerializeFMUstate="true"
     canNotUseMemoryManagementFunctions="true"
     canRunAsynchronuously="false" />
   <UnitDefinitions>

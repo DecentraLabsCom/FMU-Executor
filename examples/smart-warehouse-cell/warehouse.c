@@ -1,4 +1,6 @@
 #include <math.h>
+#include <stddef.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -87,6 +89,16 @@ typedef struct {
     fmi2Boolean transferPackageVisible;
     fmi2Boolean shelfPackageAvailable[6];
 } SmartWarehouseCell;
+
+#define SMART_WAREHOUSE_STATE_MAGIC UINT32_C(0x44574c53)
+#define SMART_WAREHOUSE_STATE_VERSION UINT32_C(1)
+#define SMART_WAREHOUSE_STATE_OFFSET offsetof(SmartWarehouseCell, time)
+
+typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    unsigned char modelState[sizeof(SmartWarehouseCell) - SMART_WAREHOUSE_STATE_OFFSET];
+} SmartWarehouseState;
 
 enum {
     PHASE_PICKUP = 0,
@@ -327,6 +339,13 @@ static void initialize_state(SmartWarehouseCell* state) {
 #endif
 
 static SmartWarehouseCell* cell(fmi2Component component) { return (SmartWarehouseCell*)component; }
+
+static SmartWarehouseState* warehouse_state(fmi2FMUstate state) {
+    SmartWarehouseState* snapshot = (SmartWarehouseState*)state;
+    if (!snapshot || snapshot->magic != SMART_WAREHOUSE_STATE_MAGIC
+        || snapshot->version != SMART_WAREHOUSE_STATE_VERSION) return NULL;
+    return snapshot;
+}
 
 EXPORT fmi2String fmi2GetTypesPlatform(void) { return "default"; }
 EXPORT fmi2String fmi2GetVersion(void) { return "2.0"; }
@@ -630,14 +649,68 @@ EXPORT fmi2Status fmi2SetString(fmi2Component c, const fmi2ValueReference vr[], 
     (void)c; (void)vr; (void)n; (void)values; return fmi2Error;
 }
 
-/* FMI 2.0 Co-Simulation API symbols unused by this deterministic demo. */
 EXPORT fmi2Status fmi2CancelStep(fmi2Component c) { (void)c; return fmi2Error; }
-EXPORT fmi2Status fmi2GetFMUstate(fmi2Component c, fmi2FMUstate* state) { (void)c; (void)state; return fmi2Error; }
-EXPORT fmi2Status fmi2SetFMUstate(fmi2Component c, fmi2FMUstate state) { (void)c; (void)state; return fmi2Error; }
-EXPORT fmi2Status fmi2FreeFMUstate(fmi2Component c, fmi2FMUstate* state) { (void)c; (void)state; return fmi2Error; }
-EXPORT fmi2Status fmi2SerializedFMUstateSize(fmi2Component c, fmi2FMUstate state, size_t* size) { (void)c; (void)state; (void)size; return fmi2Error; }
-EXPORT fmi2Status fmi2SerializeFMUstate(fmi2Component c, fmi2FMUstate state, fmi2Byte serializedState[], size_t size) { (void)c; (void)state; (void)serializedState; (void)size; return fmi2Error; }
-EXPORT fmi2Status fmi2DeSerializeFMUstate(fmi2Component c, const fmi2Byte serializedState[], size_t size, fmi2FMUstate* state) { (void)c; (void)serializedState; (void)size; (void)state; return fmi2Error; }
+EXPORT fmi2Status fmi2GetFMUstate(fmi2Component c, fmi2FMUstate* state) {
+    SmartWarehouseCell* s = cell(c);
+    if (!s || !state) return fmi2Error;
+
+    SmartWarehouseState* snapshot = *state ? warehouse_state(*state) : NULL;
+    if (*state && !snapshot) return fmi2Error;
+    if (!snapshot) {
+        snapshot = (SmartWarehouseState*)calloc(1, sizeof(*snapshot));
+        if (!snapshot) return fmi2Fatal;
+        *state = (fmi2FMUstate)snapshot;
+    }
+    snapshot->magic = SMART_WAREHOUSE_STATE_MAGIC;
+    snapshot->version = SMART_WAREHOUSE_STATE_VERSION;
+    memcpy(snapshot->modelState, (const unsigned char*)s + SMART_WAREHOUSE_STATE_OFFSET,
+        sizeof(snapshot->modelState));
+    return fmi2OK;
+}
+EXPORT fmi2Status fmi2SetFMUstate(fmi2Component c, fmi2FMUstate state) {
+    SmartWarehouseCell* s = cell(c);
+    SmartWarehouseState* snapshot = warehouse_state(state);
+    if (!s || !snapshot) return fmi2Error;
+    memcpy((unsigned char*)s + SMART_WAREHOUSE_STATE_OFFSET, snapshot->modelState,
+        sizeof(snapshot->modelState));
+    return fmi2OK;
+}
+EXPORT fmi2Status fmi2FreeFMUstate(fmi2Component c, fmi2FMUstate* state) {
+    (void)c;
+    if (!state) return fmi2Error;
+    free(*state);
+    *state = NULL;
+    return fmi2OK;
+}
+EXPORT fmi2Status fmi2SerializedFMUstateSize(fmi2Component c, fmi2FMUstate state, size_t* size) {
+    (void)c;
+    if (!size || !warehouse_state(state)) return fmi2Error;
+    *size = sizeof(SmartWarehouseState);
+    return fmi2OK;
+}
+EXPORT fmi2Status fmi2SerializeFMUstate(fmi2Component c, fmi2FMUstate state,
+                                        fmi2Byte serializedState[], size_t size) {
+    (void)c;
+    SmartWarehouseState* snapshot = warehouse_state(state);
+    if (!snapshot || !serializedState || size != sizeof(*snapshot)) return fmi2Error;
+    memcpy(serializedState, snapshot, sizeof(*snapshot));
+    return fmi2OK;
+}
+EXPORT fmi2Status fmi2DeSerializeFMUstate(fmi2Component c, const fmi2Byte serializedState[],
+                                          size_t size, fmi2FMUstate* state) {
+    (void)c;
+    if (!serializedState || !state || size != sizeof(SmartWarehouseState)) return fmi2Error;
+
+    SmartWarehouseState decoded;
+    memcpy(&decoded, serializedState, sizeof(decoded));
+    if (!warehouse_state((fmi2FMUstate)&decoded)) return fmi2Error;
+
+    SmartWarehouseState* snapshot = (SmartWarehouseState*)malloc(sizeof(*snapshot));
+    if (!snapshot) return fmi2Fatal;
+    memcpy(snapshot, &decoded, sizeof(*snapshot));
+    *state = (fmi2FMUstate)snapshot;
+    return fmi2OK;
+}
 EXPORT fmi2Status fmi2GetDirectionalDerivative(fmi2Component c, const fmi2ValueReference unknowns[], size_t unknownCount, const fmi2ValueReference knowns[], size_t knownCount, const fmi2Real knownDerivatives[], fmi2Real unknownDerivatives[]) { (void)c; (void)unknowns; (void)unknownCount; (void)knowns; (void)knownCount; (void)knownDerivatives; (void)unknownDerivatives; return fmi2Error; }
 EXPORT fmi2Status fmi2SetRealInputDerivatives(fmi2Component c, const fmi2ValueReference vr[], size_t n, const fmi2Integer order[], const fmi2Real value[]) { (void)c; (void)vr; (void)n; (void)order; (void)value; return fmi2Error; }
 EXPORT fmi2Status fmi2GetRealOutputDerivatives(fmi2Component c, const fmi2ValueReference vr[], size_t n, const fmi2Integer order[], fmi2Real value[]) { (void)c; (void)vr; (void)n; (void)order; (void)value; return fmi2Error; }
