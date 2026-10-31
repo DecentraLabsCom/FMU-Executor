@@ -106,6 +106,16 @@ as an `error` object with a short `code` and, when applicable,
 `retryable: true`. On success, `sim.done.evidence` contains runtime metadata and
 the SHA-256 of the preceding NDJSON data lines.
 
+The streaming `stream` endpoint accepts `captureFmuState: true` to include an
+opaque `checkpoint` in `sim.done`. A request may also include `checkpoint` to
+resume from that state; the new `options.startTime` may be earlier than the
+checkpoint time but cannot be later, and `stopTime` must be later. The runtime
+resumes at the stored time. Checkpoint support requires a Co-Simulation
+FMU that declares both `canGetAndSetFMUstate` and `canSerializeFMUstate`, plus
+Executor signing configuration. Checkpoints are bound to the active reservation,
+FMU file hash, and execution platform, expire after 24 hours, and are stored
+outside the browser in `FMU_EXECUTOR_STATE_DIR`.
+
 Options can select `outputVariables` and reduce output volume with
 `outputSampleEverySteps`. Result and history storage limits remain enforced.
 The supported request fields and runtime limits are described in the
@@ -160,7 +170,7 @@ including `exp` when provided by Gateway).
 | `session.create` | `session.created` | Loads a session; returns `sessionId`, expiry and capabilities. |
 | `session.attach` | `session.attached` | Reattaches a disconnected session during the configured grace window after validating its original context. |
 | `model.describe` | `model.description` | Returns normalized FMU metadata. `includeVariables: false` omits the variable list. |
-| `sim.initialize` | `sim.state` | Accepts `options.startTime`, `stopTime`, `stepSize` and initial `parameters`. |
+| `sim.initialize` | `sim.state` | Accepts `options.startTime`, `stopTime`, `stepSize` and initial `parameters`. An optional `checkpoint` restores a prior serialized FMU state after initialization; omit initial `parameters` when restoring. |
 | `sim.start` | `sim.state` | Starts automatic stepping through `stopTime`. |
 | `sim.pause` | `sim.state` | Pauses automatic stepping while retaining FMU state. |
 | `sim.resume` | `sim.state` | Resumes from `paused` or `initialized`. |
@@ -170,6 +180,8 @@ including `exp` when provided by Gateway).
 | `sim.advance` | `sim.samples` | Advances toward `targetTime` and returns bounded intermediate samples; optional `stepSize`, `maxSamples` (1–256), `maxComputeMs` (1–1000, soft), `outputSampleEverySteps`, `outputVariables`, `inputValues` and `inputSchedule`. Supports `external` mode when `currentCommunicationPoint` matches the current simulation time and the target does not exceed `stopTime`. |
 | `sim.setInputs` | `sim.inputs.updated` | `values` map keyed by model variable name. |
 | `sim.getOutputs` | `sim.outputs` | Optional `variables` array; legacy `valueReferences` accepted. |
+| `sim.captureFMUState` | `sim.fmuState` | Captures the current serialized state and returns an opaque, reservation-bound `checkpoint` and its `simTime`. |
+| `sim.restoreFMUState` | `sim.state` | Restores an initialized session from `checkpoint`. Optional `variables` requests up to 512 readable values so a proxy can refresh its local output cache. |
 | `sim.subscribeOutputs` | `sim.subscribed` | Optional `variables`, `periodMs`, `maxBatchSize` and `maxHz`. |
 | `sim.unsubscribeOutputs` | `sim.unsubscribed` | Stops background output events. |
 | `sim.getState` | `sim.state` | Returns current session state and simulation time. |

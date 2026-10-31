@@ -10,7 +10,7 @@ from unittest.mock import Mock
 import pytest
 from fastapi import HTTPException
 
-from app import auth, config, engine, fmu_storage, process_runner
+from app import auth, config, fmu_storage, process_runner, session_registry
 from app.simulation_jobs import (
     SimulationJobManager,
     _job_id,
@@ -61,9 +61,9 @@ def jobs(monkeypatch, tmp_path):
         "modelVariables": [{"name": "speed", "causality": "output"}],
     }
     monkeypatch.setattr(fmu_storage, "describe_path", lambda _path: model_metadata)
-    monkeypatch.setattr(engine, "create_session", lambda *_args, **_kwargs: SimpleNamespace(session_id="job-session"))
-    monkeypatch.setattr(engine, "remove_session", Mock())
-    monkeypatch.setattr(engine, "release_capacity", Mock(wraps=engine.release_capacity))
+    monkeypatch.setattr(session_registry, "create_session", lambda *_args, **_kwargs: SimpleNamespace(session_id="job-session"))
+    monkeypatch.setattr(session_registry, "remove_session", Mock())
+    monkeypatch.setattr(session_registry, "release_capacity", Mock(wraps=session_registry.release_capacity))
     monkeypatch.setattr(process_runner, "run", Mock(return_value={
         "type": "sim.result", "time": 1.0, "outputs": {"speed": 2.0},
     }))
@@ -151,7 +151,7 @@ def test_submit_single_executes_and_records_scoped_result(jobs):
     assert result["result"]["time"] == 1.0
     assert result["result"]["outputs"] == {"speed": 2.0}
     assert result["result"]["evidence"]["fmuSha256"] == "a" * 64
-    cast(Mock, engine.release_capacity).assert_called_once()
+    cast(Mock, session_registry.release_capacity).assert_called_once()
     cast(Mock, process_runner.run).assert_called_once()
 
 
@@ -258,7 +258,7 @@ def sqlite_error():
 def test_submission_rejects_full_station_capacity(jobs, monkeypatch):
     manager, _ = jobs
     monkeypatch.setattr(config, "MAX_CONCURRENT_SESSIONS", 1)
-    monkeypatch.setattr(engine, "reserve_capacity", Mock(side_effect=engine.CapacityExceededError("full")))
+    monkeypatch.setattr(session_registry, "reserve_capacity", Mock(side_effect=session_registry.CapacityExceededError("full")))
 
     with pytest.raises(HTTPException) as error:
         asyncio.run(_submit(manager))
@@ -278,8 +278,8 @@ def test_submission_rejects_full_station_capacity(jobs, monkeypatch):
 def test_execution_maps_worker_failures_and_cleans_up(jobs, monkeypatch, failure, status, code):
     manager, _ = jobs
     scope_key, _ = reservation_scope(CONTEXT)
-    if isinstance(failure, engine.CapacityExceededError):
-        monkeypatch.setattr(engine, "reserve_capacity", Mock(side_effect=failure))
+    if isinstance(failure, session_registry.CapacityExceededError):
+        monkeypatch.setattr(session_registry, "reserve_capacity", Mock(side_effect=failure))
     else:
         monkeypatch.setattr(process_runner, "run", Mock(side_effect=failure))
 
@@ -290,12 +290,12 @@ def test_execution_maps_worker_failures_and_cleans_up(jobs, monkeypatch, failure
     result = asyncio.run(run())
     assert result["status"] == status
     assert result["errorCode"] == code
-    cast(Mock, engine.release_capacity).assert_called_once()
+    cast(Mock, session_registry.release_capacity).assert_called_once()
 
 
 def test_capacity_failure_is_rejected_before_job_creation(jobs, monkeypatch):
     manager, store = jobs
-    monkeypatch.setattr(engine, "reserve_capacity", Mock(side_effect=engine.CapacityExceededError("busy")))
+    monkeypatch.setattr(session_registry, "reserve_capacity", Mock(side_effect=session_registry.CapacityExceededError("busy")))
     with pytest.raises(HTTPException) as error:
         asyncio.run(_submit(manager))
     assert error.value.status_code == 429
@@ -307,7 +307,7 @@ def test_cancel_before_execution_prevents_fmu_session_creation(jobs, monkeypatch
     manager, _ = jobs
     scope_key, _ = reservation_scope(CONTEXT)
     create_session = Mock(side_effect=AssertionError("cancelled job must not allocate a session"))
-    monkeypatch.setattr(engine, "create_session", create_session)
+    monkeypatch.setattr(session_registry, "create_session", create_session)
 
     async def run():
         response = await _submit(manager)

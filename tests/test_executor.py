@@ -53,7 +53,7 @@ def _isolate_config(tmp_path: Path):
                 yield fmu_root
         finally:
             # Cleanup while the test configuration is still active.
-            from app.engine import terminate_all
+            from app.session_registry import terminate_all
             terminate_all()
             # Clear quarantine cache between tests
             from app.fmu_storage import _quarantine_cache
@@ -854,7 +854,7 @@ class TestSessionAttach:
 
     def test_attach_after_station_websocket_disconnect_preserves_session(self, client, _isolate_config):
         """A new Station WebSocket can reattach to the existing FMU state."""
-        from app import engine
+        from app import engine, session_registry
 
         with _mock_fmu_patches(_isolate_config):
             gateway_context = {
@@ -873,7 +873,7 @@ class TestSessionAttach:
                 )
                 session_id = created["sessionId"]
 
-            assert engine.get_session(session_id) is not None
+            assert session_registry.get_session(session_id) is not None
 
             with client.websocket_connect(
                 "/internal/fmu/sessions",
@@ -899,7 +899,7 @@ class TestSessionAttach:
 
     def test_attach_after_disconnect_rejects_different_reservation_context(self, client, _isolate_config):
         """Reattach must retain the original reservation binding."""
-        from app import engine
+        from app import engine, session_registry
 
         with _mock_fmu_patches(_isolate_config):
             original_context = {
@@ -936,11 +936,11 @@ class TestSessionAttach:
                 assert response["type"] == "error"
                 assert response["code"] == "FORBIDDEN"
 
-            assert engine.get_session(session_id) is not None
+            assert session_registry.get_session(session_id) is not None
 
     def test_detached_session_is_removed_after_attach_grace(self, client, _isolate_config, monkeypatch):
         """A disconnected session must not consume capacity indefinitely."""
-        from app import config, engine
+        from app import config, engine, session_registry
 
         monkeypatch.setattr(config, "FMU_ATTACH_GRACE_SECONDS", 0)
         with _mock_fmu_patches(_isolate_config):
@@ -951,8 +951,8 @@ class TestSessionAttach:
                 created = _ws_create_session(ws, request_id="grace-create")
                 session_id = created["sessionId"]
 
-            engine.cleanup_expired_sessions()
-            assert engine.get_session(session_id) is None
+            session_registry.cleanup_expired_sessions()
+            assert session_registry.get_session(session_id) is None
 
     def test_attach_without_create_fails(self, client):
         """session.attach requires an active session."""
@@ -970,16 +970,16 @@ class TestSessionAttach:
 
     def test_stale_websocket_cleanup_cannot_detach_new_attachment(self, _isolate_config):
         """A late disconnect from the old channel must not break a reattach."""
-        from app import engine
+        from app import engine, session_registry
 
         session = engine.FmuSession("sess-owner-race", _isolate_config / "Test.fmu")
-        engine._sessions[session.session_id] = session
+        session_registry._sessions[session.session_id] = session
         old_connection = object()
         new_connection = object()
 
         session.mark_attached(old_connection)
         session.mark_attached(new_connection)
-        engine.detach_session(
+        session_registry.detach_session(
             session.session_id,
             grace_seconds=120,
             attachment_owner=old_connection,
@@ -989,7 +989,7 @@ class TestSessionAttach:
         assert session._attachment_owner is new_connection
         assert session.can_attach() is True
 
-        engine.detach_session(
+        session_registry.detach_session(
             session.session_id,
             grace_seconds=120,
             attachment_owner=new_connection,
@@ -1035,7 +1035,7 @@ class TestSubscriptionBackpressure:
         from app.engine import OutputSubscription, FmuSession
 
         now = [1.0]
-        monkeypatch.setattr("app.engine._time.monotonic", lambda: now[0])
+        monkeypatch.setattr("app.session_registry._time.monotonic", lambda: now[0])
 
         session = FmuSession.__new__(FmuSession)
         session.session_id = "bp-test"

@@ -12,17 +12,14 @@ import hashlib
 import json
 import logging
 import math
-import posixpath
 import re
 import secrets
 import threading
 import time
 import zipfile
-import xml.etree.ElementTree as ET
 import zlib
 from pathlib import PurePosixPath
 from typing import Any
-from urllib.parse import unquote, urlsplit
 
 from fastapi import (
     Depends,
@@ -33,10 +30,19 @@ from fastapi import (
     Request,
 )
 from fastapi.responses import Response, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictBool, field_validator
 from starlette.background import BackgroundTask
 
-from . import auth, backends, config, engine, fmu_storage, process_runner
+from . import (
+    auth,
+    backends,
+    config,
+    engine,
+    fmu_storage,
+    fmu_state,
+    process_runner,
+    session_registry,
+)
 from .isolation import worker_isolation_capabilities
 from .simulation_jobs import (
     SimulationJobManager,
@@ -64,19 +70,17 @@ from .session_protocol import (
 )
 from .simulation_defaults import resolve_simulation_time_options
 from .fmi_ls_experiments import read_fmi_ls_ref_experiments
+from .fmi_ls_ref_resources import (
+    MAX_COMPANION_ASSET_BYTES,
+    parse_experiment_parameter_set as _parse_experiment_parameter_set,
+    read_parameter_sets as _read_fmi_ls_ref_parameter_sets,
+    read_related_resources as _read_fmi_ls_ref_related_resources,
+    read_visual_asset as _read_fmi_ls_ref_visual_asset,
+)
 
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="FMU Executor", version="0.3.2", docs_url=None, redoc_url=None)
-MAX_COMPANION_ASSET_BYTES = 50 * 1024 * 1024
-MAX_FMI_LS_REF_MANIFEST_BYTES = 1024 * 1024
-MAX_FMI_LS_REF_PARAMETER_SET_BYTES = 512 * 1024
-MAX_FMI_LS_REF_PARAMETER_SET_TOTAL_BYTES = 4 * 1024 * 1024
-MAX_FMI_LS_REF_PARAMETER_SETS = 24
-MAX_FMI_LS_REF_PARAMETERS = 2048
-MAX_FMI_LS_REF_RELATED_RESOURCES = 128
-FMI_LS_REF_MANIFEST_PATH = "extra/org.fmi-standard.fmi-ls-ref/fmi-ls-manifest.xml"
-FMI_LS_REF_NAME = "org.fmi-standard.fmi-ls-ref"
 MAX_COMPANION_APP_FILES = 332
 _COMPANION_APP_MEDIA_TYPES = {
     ".bin": "application/octet-stream",
@@ -107,7 +111,7 @@ _simulation_jobs = SimulationJobManager(_simulation_store)
 async def _cleanup_sessions_loop() -> None:
     try:
         while True:
-            await asyncio.to_thread(engine.cleanup_expired_sessions)
+            await asyncio.to_thread(session_registry.cleanup_expired_sessions)
             await asyncio.sleep(1)
     except asyncio.CancelledError:
         return
@@ -127,7 +131,7 @@ async def _startup() -> None:
     # Reap abandoned sessions before startup returns. The background loop is
     # deliberately periodic; relying on its first scheduled iteration races
     # with immediate TestClient/server shutdown on short-lived processes.
-    await asyncio.to_thread(engine.cleanup_expired_sessions)
+    await asyncio.to_thread(session_registry.cleanup_expired_sessions)
     logger.info(
         "FMU Executor starting – root=%s, port=%s, max_sessions=%s",
         config.FMU_ROOT, config.bind_port(), config.MAX_CONCURRENT_SESSIONS,
@@ -148,7 +152,7 @@ async def _shutdown() -> None:
         _session_cleanup_task = None
     logger.info("Shutting down – terminating all sessions")
     await _simulation_jobs.shutdown()
-    await asyncio.to_thread(engine.terminate_all)
+    await asyncio.to_thread(session_registry.terminate_all)
 
 
 # ── Dependency ───────────────────────────────────────────────────
@@ -162,7 +166,7 @@ async def _check_token(request: Request) -> None:
 @app.get("/internal/health")
 async def health():
     fmu_count = len(fmu_storage.list_fmus())
-    active = engine.active_session_count()
+    active = session_registry.active_session_count()
     return {
         "status": "UP",
         "fmuCount": fmu_count,
@@ -182,7 +186,7 @@ async def health():
 @app.get("/internal/fmu/capacity", dependencies=[Depends(_check_token)])
 async def capacity():
     """Expose the Station execution authority to the provider backend."""
-    active = engine.active_session_count()
+    active = session_registry.active_session_count()
     capacity = config.MAX_CONCURRENT_SESSIONS
     return {
         "capacity": capacity,
@@ -329,300 +333,6 @@ async def related_resources(access_key: str = Header(..., alias="X-FMU-Access-Ke
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(404, "FMU_NOT_FOUND") from exc
     return _read_fmi_ls_ref_related_resources(fmu_path)
-
-
-def _normalized_ref_source(source: str) -> str | None:
-    """Resolve a relative FMI-LS-REF URI to a safe path inside the FMU."""
-    if not source or len(source) > 2048 or "\\" in source or "\x00" in source:
-        return None
-    parsed = urlsplit(source)
-    if parsed.scheme or parsed.netloc or parsed.query or parsed.fragment or not parsed.path:
-        return None
-    decoded_path = unquote(parsed.path)
-    if "\\" in decoded_path or "\x00" in decoded_path or decoded_path.startswith("/"):
-        return None
-    normalized = posixpath.normpath(posixpath.join(
-        posixpath.dirname(FMI_LS_REF_MANIFEST_PATH),
-        decoded_path,
-    ))
-    if normalized in {"", ".", ".."} or normalized.startswith("../") or normalized.startswith("/"):
-        return None
-    return normalized
-
-
-def _xml_local_name(element: ET.Element) -> str:
-    return element.tag.rsplit("}", 1)[-1]
-
-
-def _read_fmi_ls_ref_related_resources(fmu_path) -> dict[str, Any]:
-    """Read public descriptors for safe, relative resources declared in REF."""
-    empty = {"manifestName": None, "manifestVersion": None, "resources": []}
-    try:
-        with zipfile.ZipFile(fmu_path) as archive:
-            manifest_info = archive.getinfo(FMI_LS_REF_MANIFEST_PATH)
-            if manifest_info.file_size > MAX_FMI_LS_REF_MANIFEST_BYTES:
-                return empty
-            with archive.open(manifest_info) as source_file:
-                manifest = source_file.read(MAX_FMI_LS_REF_MANIFEST_BYTES + 1)
-            if len(manifest) > MAX_FMI_LS_REF_MANIFEST_BYTES or not _safe_ref_xml(manifest):
-                return empty
-
-            root = ET.fromstring(manifest)
-            fmi_ls_namespace = "http://fmi-standard.org/fmi-ls-manifest"
-            if (
-                _xml_local_name(root) != "fmiReferences"
-                or root.attrib.get(f"{{{fmi_ls_namespace}}}fmi-ls-name") != FMI_LS_REF_NAME
-            ):
-                return empty
-
-            archive_names = archive.namelist()
-            name_counts: dict[str, int] = {}
-            for name in archive_names:
-                name_counts[name] = name_counts.get(name, 0) + 1
-
-            resources: list[dict[str, Any]] = []
-            identity_counts: dict[str, int] = {}
-            for related in root:
-                if _xml_local_name(related) != "Related":
-                    continue
-                source = str(related.attrib.get("source") or "").strip()
-                archive_path = _normalized_ref_source(source)
-                if archive_path is None:
-                    # External or unsafe URIs are not copied into the public AAS index.
-                    continue
-
-                role = str(related.attrib.get("role") or "").strip()[:128]
-                media_type = str(related.attrib.get("type") or "").split(";", 1)[0].strip().lower()[:256]
-                description = str(related.attrib.get("description") or "").strip()[:2048]
-                labels = []
-                for child in related:
-                    if _xml_local_name(child) != "Label" or len(labels) >= 32:
-                        continue
-                    label_name = str(child.attrib.get("name") or "").strip()[:256]
-                    if not label_name:
-                        continue
-                    label_description = str(child.attrib.get("description") or "").strip()[:1024]
-                    labels.append({"name": label_name, "description": label_description})
-
-                identity = hashlib.sha256(
-                    f"{role}\0{media_type}\0{source}".encode("utf-8")
-                ).hexdigest()[:24]
-                identity_counts[identity] = identity_counts.get(identity, 0) + 1
-                resource_id = identity if identity_counts[identity] == 1 else f"{identity}_{identity_counts[identity]}"
-                available = name_counts.get(archive_path) == 1
-                if available:
-                    try:
-                        available = not archive.getinfo(archive_path).is_dir()
-                    except KeyError:
-                        available = False
-
-                resources.append({
-                    "id": resource_id,
-                    "role": role,
-                    "type": media_type,
-                    "source": source[:2048],
-                    "description": description,
-                    "labels": labels,
-                    "availableInFmu": available,
-                })
-                if len(resources) >= MAX_FMI_LS_REF_RELATED_RESOURCES:
-                    break
-
-            return {
-                "manifestName": FMI_LS_REF_NAME,
-                "manifestVersion": str(root.attrib.get(f"{{{fmi_ls_namespace}}}fmi-ls-version") or "")[:64],
-                "resources": resources,
-            }
-    except (OSError, KeyError, ValueError, ET.ParseError, zipfile.BadZipFile, RuntimeError, EOFError, zlib.error):
-        return empty
-
-
-def _safe_ref_xml(data: bytes) -> bool:
-    """Accept UTF-8 XML without DTDs or entity declarations."""
-    try:
-        text = data.decode("utf-8-sig")
-    except UnicodeDecodeError:
-        return False
-    lowered = text.lower()
-    return "<!doctype" not in lowered and "<!entity" not in lowered
-
-
-def _parse_ssv_parameter(parameter: ET.Element) -> tuple[str, Any, str | None]:
-    name = str(parameter.attrib.get("name") or "").strip()
-    if not name or len(name) > 512:
-        raise ValueError("invalid SSV parameter name")
-    type_names = {
-        "Real", "Float32", "Float64", "Integer", "Int8", "UInt8", "Int16", "UInt16",
-        "Int32", "UInt32", "Int64", "UInt64", "Boolean", "String", "Enumeration",
-    }
-    typed_elements = [child for child in parameter if _xml_local_name(child) in type_names | {"Binary"}]
-    if len(typed_elements) != 1:
-        raise ValueError("invalid SSV parameter type")
-    value_element = typed_elements[0]
-    value_type = _xml_local_name(value_element)
-    if value_type == "Binary":
-        raise ValueError("binary SSV values are not supported by the simulation input form")
-    unit = value_element.attrib.get("unit")
-    if unit and value_type not in {"Real", "Float32", "Float64"}:
-        raise ValueError("SSV units are only supported for floating-point parameters")
-
-    value_children = [child for child in value_element if _xml_local_name(child) == "Value"]
-    raw_values = [child.text or "" for child in value_children]
-    if value_children and "value" in value_element.attrib:
-        raise ValueError("SSV value cannot use both an attribute and Value elements")
-    if not value_children:
-        raw_value = value_element.attrib.get("value")
-        if raw_value is None:
-            raise ValueError("SSV parameter value is missing")
-        if value_type not in {"String", "Enumeration"} and len(value_element) > 0:
-            raise ValueError("invalid SSV value children")
-        raw_values = [raw_value]
-
-    if not raw_values or any(len(value) > 65536 for value in raw_values):
-        raise ValueError("SSV parameter value exceeds the supported size")
-    is_array = any(_xml_local_name(child) == "Dimension" for child in parameter) or len(raw_values) > 1
-    if len(raw_values) == 1 and value_type not in {"String", "Enumeration"}:
-        parts = raw_values[0].strip().split()
-        if len(parts) > 1:
-            raw_values = parts
-            is_array = True
-
-    def convert(raw: str):
-        if value_type in {"Real", "Float32", "Float64"}:
-            number = float(raw)
-            if not math.isfinite(number):
-                raise ValueError("non-finite SSV value")
-            return number
-        if value_type in {"Integer", "Int8", "UInt8", "Int16", "UInt16", "Int32", "UInt32", "Int64", "UInt64"}:
-            return int(raw, 10)
-        if value_type == "Boolean":
-            lowered = raw.strip().lower()
-            if lowered in {"true", "1"}:
-                return True
-            if lowered in {"false", "0"}:
-                return False
-            raise ValueError("invalid SSV boolean")
-        if value_type == "Enumeration":
-            return raw.strip()
-        return raw
-
-    values = [convert(raw) for raw in raw_values]
-    return name, values if is_array else values[0], unit
-
-
-def _parse_ssv_parameter_set(data: bytes, *, related: ET.Element, preset_number: int) -> dict[str, Any] | None:
-    if not _safe_ref_xml(data):
-        return None
-    root = ET.fromstring(data)
-    if _xml_local_name(root) != "ParameterSet" or root.attrib.get("version") not in {"1.0", "2.0"}:
-        return None
-    name = str(root.attrib.get("name") or "").strip()
-    if not name or len(name) > 180:
-        return None
-    parameters_element = next((child for child in root if _xml_local_name(child) == "Parameters"), None)
-    if parameters_element is None:
-        return None
-    parameter_nodes = [child for child in parameters_element if _xml_local_name(child) == "Parameter"]
-    if not parameter_nodes or len(parameter_nodes) > MAX_FMI_LS_REF_PARAMETERS:
-        return None
-    parameters: dict[str, Any] = {}
-    parameter_units: dict[str, str] = {}
-    for parameter_node in parameter_nodes:
-        variable_name, value, unit = _parse_ssv_parameter(parameter_node)
-        if variable_name in parameters:
-            return None
-        parameters[variable_name] = value
-        if unit:
-            parameter_units[variable_name] = unit
-
-    description = str(related.attrib.get("description") or "").strip()
-    if not description:
-        label = next((child for child in related if _xml_local_name(child) == "Label"), None)
-        description = str(label.attrib.get("description") or "").strip() if label is not None else ""
-    return {
-        "id": f"preset-{preset_number}",
-        "name": name,
-        "description": description[:1024],
-        "parameters": parameters,
-        "parameterUnits": parameter_units,
-    }
-
-
-def _read_fmi_ls_ref_parameter_sets(fmu_path) -> list[dict[str, Any]]:
-    """Read bounded, local SSP parameter-set references from an FMU archive."""
-    presets: list[dict[str, Any]] = []
-    try:
-        with zipfile.ZipFile(fmu_path) as archive:
-            manifest_info = archive.getinfo(FMI_LS_REF_MANIFEST_PATH)
-            if manifest_info.file_size > MAX_FMI_LS_REF_MANIFEST_BYTES:
-                return []
-            with archive.open(manifest_info) as source_file:
-                manifest = source_file.read(MAX_FMI_LS_REF_MANIFEST_BYTES + 1)
-            if len(manifest) > MAX_FMI_LS_REF_MANIFEST_BYTES:
-                return []
-            if not _safe_ref_xml(manifest):
-                return []
-            root = ET.fromstring(manifest)
-            fmi_ls_namespace = "http://fmi-standard.org/fmi-ls-manifest"
-            if (
-                _xml_local_name(root) != "fmiReferences"
-                or root.attrib.get(f"{{{fmi_ls_namespace}}}fmi-ls-name") != FMI_LS_REF_NAME
-            ):
-                return []
-
-            names = archive.namelist()
-            referenced = []
-            for related in root:
-                if _xml_local_name(related) != "Related":
-                    continue
-                if str(related.attrib.get("role") or "").strip().lower() != "parameter":
-                    continue
-                media_type = str(related.attrib.get("type") or "").split(";", 1)[0].strip().lower()
-                if media_type != "application/x-ssp-parameter-set":
-                    continue
-                archive_path = _normalized_ref_source(str(related.attrib.get("source") or ""))
-                if archive_path is not None:
-                    referenced.append((related, archive_path))
-                if len(referenced) >= MAX_FMI_LS_REF_PARAMETER_SETS:
-                    break
-
-            total_bytes = 0
-            for related, archive_path in referenced:
-                if names.count(archive_path) != 1:
-                    continue
-                info = archive.getinfo(archive_path)
-                if info.is_dir() or info.file_size > MAX_FMI_LS_REF_PARAMETER_SET_BYTES:
-                    continue
-                if total_bytes + info.file_size > MAX_FMI_LS_REF_PARAMETER_SET_TOTAL_BYTES:
-                    break
-                with archive.open(info) as source_file:
-                    content = source_file.read(MAX_FMI_LS_REF_PARAMETER_SET_BYTES + 1)
-                if len(content) > MAX_FMI_LS_REF_PARAMETER_SET_BYTES:
-                    continue
-                total_bytes += len(content)
-                try:
-                    parsed = _parse_ssv_parameter_set(content, related=related, preset_number=len(presets) + 1)
-                except (ValueError, OverflowError, ET.ParseError):
-                    parsed = None
-                if parsed is not None:
-                    presets.append(parsed)
-    except (OSError, KeyError, ValueError, ET.ParseError, zipfile.BadZipFile, RuntimeError, EOFError, zlib.error):
-        return []
-    return presets
-
-
-def _parse_experiment_parameter_set(data: bytes) -> dict[str, Any] | None:
-    parsed = _parse_ssv_parameter_set(
-        data,
-        related=ET.Element("Related"),
-        preset_number=1,
-    )
-    if parsed is None:
-        return None
-    return {
-        "parameters": parsed["parameters"],
-        "parameterUnits": parsed["parameterUnits"],
-    }
 
 
 async def _run_fmi_ls_ref_smoke_experiments(
@@ -843,57 +553,6 @@ async def _run_fmi_ls_ref_smoke_experiments(
     }, failure_code)
 
 
-def _read_fmi_ls_ref_visual_asset(fmu_path) -> tuple[bytes, str] | None:
-    """Read the preferred local visual asset declared by an FMI-LS-REF manifest."""
-    try:
-        with zipfile.ZipFile(fmu_path) as archive:
-            manifest_info = archive.getinfo(FMI_LS_REF_MANIFEST_PATH)
-            if manifest_info.file_size > MAX_FMI_LS_REF_MANIFEST_BYTES:
-                return None
-            with archive.open(manifest_info) as source_file:
-                manifest = source_file.read(MAX_FMI_LS_REF_MANIFEST_BYTES + 1)
-            if len(manifest) > MAX_FMI_LS_REF_MANIFEST_BYTES:
-                return None
-            if not _safe_ref_xml(manifest):
-                return None
-            root = ET.fromstring(manifest)
-            if root.tag.rsplit("}", 1)[-1] != "fmiReferences":
-                return None
-            fmi_ls_namespace = "http://fmi-standard.org/fmi-ls-manifest"
-            if root.attrib.get(f"{{{fmi_ls_namespace}}}fmi-ls-name") != FMI_LS_REF_NAME:
-                return None
-
-            candidates: list[tuple[str, str]] = []
-            for related in root:
-                if related.tag.rsplit("}", 1)[-1] != "Related":
-                    continue
-                archive_path = _normalized_ref_source(str(related.attrib.get("source") or ""))
-                if archive_path is None:
-                    continue
-                media_type = str(related.attrib.get("type") or "").split(";", 1)[0].strip().lower()
-                lowered_path = archive_path.lower()
-                if lowered_path.endswith(".webapp.zip") and media_type in {"application/zip", "application/x-zip-compressed"}:
-                    candidates.append((archive_path, "threejs-app"))
-                elif lowered_path.endswith(".glb") and media_type in {"model/gltf-binary", "application/octet-stream"}:
-                    candidates.append((archive_path, "glb"))
-
-            candidates.sort(key=lambda candidate: candidate[1] != "threejs-app")
-            names = archive.namelist()
-            for archive_path, candidate_type in candidates:
-                if names.count(archive_path) != 1:
-                    continue
-                asset_info = archive.getinfo(archive_path)
-                if asset_info.is_dir() or asset_info.file_size > MAX_COMPANION_ASSET_BYTES:
-                    continue
-                with archive.open(asset_info) as asset_file:
-                    content = asset_file.read(MAX_COMPANION_ASSET_BYTES + 1)
-                if len(content) <= MAX_COMPANION_ASSET_BYTES:
-                    return content, candidate_type
-    except (OSError, KeyError, ValueError, ET.ParseError, zipfile.BadZipFile, RuntimeError, EOFError, zlib.error):
-        return None
-    return None
-
-
 def _legacy_companion_path(fmu_path, asset_type: str, root):
     suffix = ".glb" if asset_type == "glb" else ".webapp.zip"
     try:
@@ -1023,8 +682,8 @@ async def validate_fmu(
     }
     if probe and report["archiveValid"] and report["stationCompatible"]:
         try:
-            token = engine.reserve_capacity()
-        except engine.CapacityExceededError:
+            token = session_registry.reserve_capacity()
+        except session_registry.CapacityExceededError:
             raise HTTPException(status_code=429, detail="STATION_CAPACITY_EXHAUSTED")
         try:
             path, digest = fmu_storage.snapshot_fmu(fmu_storage.get_fmu_path(access_key))
@@ -1074,7 +733,7 @@ async def validate_fmu(
             report["probeResult"] = "failed"
             report["issues"].append(f"Isolated instantiation probe failed ({exc.code})")
         finally:
-            engine.release_capacity(token)
+            session_registry.release_capacity(token)
     valid = report["archiveValid"] and report["modelDescriptionValid"] and report["stationCompatible"]
     if probe:
         valid = valid and report.get("probeResult") == "passed"
@@ -1122,10 +781,27 @@ class SimulationBody(BaseModel):
     reservationKey: str | None = None
     parameters: dict = Field(default_factory=dict)
     options: dict = Field(default_factory=dict)
+    checkpoint: dict | None = None
+    captureFmuState: StrictBool = False
     inputSchedule: list[dict] = Field(
         default_factory=list,
         max_length=config.MAX_INPUT_SCHEDULE_EVENTS,
     )
+
+    @field_validator("checkpoint")
+    @classmethod
+    def _bounded_fmu_state_checkpoint(cls, value):
+        if value is None:
+            return value
+        if not isinstance(value, dict):
+            raise ValueError("FMU state checkpoint must be an object")
+        try:
+            encoded = json.dumps(value, separators=(",", ":"), allow_nan=False).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            raise ValueError("FMU state checkpoint is invalid") from exc
+        if len(encoded) > 4096:
+            raise ValueError("FMU state checkpoint exceeds 4 KiB")
+        return value
 
 
 class BatchScenario(BaseModel):
@@ -1464,12 +1140,12 @@ async def run_simulation(body: SimulationBody):
     slot: engine.FmuSession | None = None
     capacity_token = None
     try:
-        capacity_token = engine.reserve_capacity()
+        capacity_token = session_registry.reserve_capacity()
         if config.execution_mode() != "process":
             slot = engine.FmuSession(
                 f"run_{secrets.token_hex(6)}", fmu_path, access_key=access_key,
             )
-    except engine.CapacityExceededError as exc:
+    except session_registry.CapacityExceededError as exc:
         raise HTTPException(429, "STATION_CAPACITY_EXHAUSTED") from exc
     try:
         if body.gatewayContext is not None:
@@ -1573,7 +1249,7 @@ async def run_simulation(body: SimulationBody):
     finally:
         if slot is not None:
             slot.terminate()
-        engine.release_capacity(capacity_token)
+        session_registry.release_capacity(capacity_token)
 
 
 @app.post("/internal/fmu/simulations/jobs", status_code=202, dependencies=[Depends(_check_token)])
@@ -1681,6 +1357,34 @@ async def stream_simulation(body: SimulationBody):
         raise HTTPException(status_code=422, detail={"code": "FMU_NOT_COMPATIBLE", "issues": report["issues"][:8]})
     model_metadata = fmu_storage.describe_path(fmu_path)
     _validate_options(access_key, body.options, policy, model_metadata=model_metadata)
+    model_capabilities = model_metadata.get("capabilities", {})
+    model_capabilities = model_capabilities if isinstance(model_capabilities, dict) else {}
+    supports_serialized_state = bool(
+        model_metadata.get("simulationType") == "CoSimulation"
+        and model_capabilities.get("canGetAndSetFMUstate", model_capabilities.get("canGetAndSetFMUState", False))
+        and model_capabilities.get("canSerializeFMUstate", model_capabilities.get("canSerializeFMUState", False))
+        and config.internal_token()
+    )
+    if type(body.captureFmuState) is not bool:
+        raise HTTPException(status_code=400, detail="INVALID_FMU_STATE_OPTIONS")
+    if (body.captureFmuState or body.checkpoint is not None) and not supports_serialized_state:
+        raise HTTPException(status_code=409, detail="FMU_STATE_NOT_SUPPORTED")
+    checkpoint_snapshot = None
+    if body.checkpoint is not None:
+        if not isinstance(body.gatewayContext, dict):
+            raise HTTPException(status_code=403, detail="RESERVATION_SCOPE_REQUIRED")
+        try:
+            checkpoint_snapshot = fmu_state.open_fmu_state_checkpoint(
+                body.checkpoint,
+                gateway_context=body.gatewayContext,
+                signing_secret=config.internal_token(),
+                expected_fmu_sha256=model_sha256,
+                state_dir=config.STATE_DIR,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="INVALID_FMU_STATE_CHECKPOINT") from exc
+    if (body.captureFmuState or checkpoint_snapshot is not None) and not isinstance(body.gatewayContext, dict):
+        raise HTTPException(status_code=403, detail="RESERVATION_SCOPE_REQUIRED")
     input_schedule = _validate_input_schedule(
         body.inputSchedule,
         options=body.options,
@@ -1696,10 +1400,15 @@ async def stream_simulation(body: SimulationBody):
     slot: engine.FmuSession | None = None
     capacity_token = None
     try:
-        capacity_token = engine.reserve_capacity()
+        capacity_token = session_registry.reserve_capacity()
         if config.execution_mode() != "process":
-            slot = engine.FmuSession(f"stream_{secrets.token_hex(6)}", fmu_path, access_key=access_key)
-    except engine.CapacityExceededError as exc:
+            slot = engine.FmuSession(
+                f"stream_{secrets.token_hex(6)}",
+                fmu_path,
+                access_key=access_key,
+                fmu_sha256=model_sha256,
+            )
+    except session_registry.CapacityExceededError as exc:
         raise HTTPException(status_code=429, detail="STATION_CAPACITY_EXHAUSTED") from exc
 
     try:
@@ -1714,7 +1423,7 @@ async def stream_simulation(body: SimulationBody):
     except Exception:
         if slot is not None:
             slot.terminate()
-        engine.release_capacity(capacity_token)
+        session_registry.release_capacity(capacity_token)
         raise
 
     capacity_release_lock = threading.Lock()
@@ -1730,7 +1439,7 @@ async def stream_simulation(body: SimulationBody):
             if slot is not None:
                 slot.terminate()
         finally:
-            engine.release_capacity(capacity_token)
+            session_registry.release_capacity(capacity_token)
 
     def _generate():
         stream_digest = hashlib.sha256()
@@ -1749,6 +1458,10 @@ async def stream_simulation(body: SimulationBody):
                     reservation_ends_at=reservation_end,
                     resource_policy=policy,
                     input_schedule=input_schedule,
+                    fmu_sha256=model_sha256,
+                    gateway_context=body.gatewayContext,
+                    checkpoint_snapshot=checkpoint_snapshot,
+                    capture_fmu_state=body.captureFmuState,
                 ):
                     if snapshot.get("type") == "sim.done":
                         policy_evidence = applied_execution_policy(policy, evidence_options)
@@ -1781,6 +1494,8 @@ async def stream_simulation(body: SimulationBody):
                     parameters=body.parameters or None,
                     early_return_allowed=body.options.get("earlyReturnAllowed", False),
                 )
+                if checkpoint_snapshot is not None:
+                    slot.restore_fmu_state(checkpoint_snapshot)
                 for snapshot in slot.run_until_streaming(
                     stop,
                     step_size=step,
@@ -1794,6 +1509,13 @@ async def stream_simulation(body: SimulationBody):
                     "time": float(slot._time),
                     "finishReason": slot._finished_reason,
                 }
+                if body.captureFmuState:
+                    final_payload["checkpoint"] = fmu_state.seal_fmu_state_checkpoint(
+                        slot.capture_fmu_state(),
+                        gateway_context=body.gatewayContext,
+                        signing_secret=config.internal_token(),
+                        state_dir=config.STATE_DIR,
+                    )
                 final_evidence = build_execution_evidence(
                     model_sha256=model_sha256,
                     parameters=body.parameters or {},

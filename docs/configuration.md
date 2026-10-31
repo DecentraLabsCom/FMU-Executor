@@ -62,7 +62,7 @@ unless otherwise stated.
 | `FMU_EXECUTOR_HOST` | `0.0.0.0` | Bind address. |
 | `FMU_EXECUTOR_PORT` | `8091` | TCP port; must be from 1 to 65535. |
 | `FMU_ROOT` | `<repository>/fmu-data` | Root directory containing provisioned FMUs and their companion files. |
-| `FMU_EXECUTOR_STATE_DIR` | `<FMU_ROOT parent>/state` | Persistent SQLite job history and quota store. Must be writable by the service account. |
+| `FMU_EXECUTOR_STATE_DIR` | `<FMU_ROOT parent>/state` | Persistent SQLite job history and quota store, plus private serialized FMI state checkpoints. Keep it persistent and writable only by the Executor service account. |
 | `FMU_EXECUTOR_TEMP` | `<FMU_ROOT>/.tmp` | Temporary directory used while extracting and running FMUs. |
 | `FMU_EXECUTION_MODE` | `process` | Worker boundary: `process` (recommended) or `in-process` (diagnostics only). Any other value selects `process`. |
 | `FMU_EXECUTION_TIMEOUT_SECONDS` | `3600` | Maximum duration for a one-shot or streaming worker; minimum `1`. |

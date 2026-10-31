@@ -12,7 +12,7 @@ from typing import Any, Awaitable, Callable
 
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 
-from . import config, engine
+from . import config, session_registry
 
 logger = logging.getLogger(__name__)
 
@@ -138,7 +138,7 @@ def create_session_router(
                 if session is not expiring_session:
                     return
                 await _stop_runner()
-                await asyncio.to_thread(engine.remove_session, expiring_session.session_id)
+                await asyncio.to_thread(session_registry.remove_session, expiring_session.session_id)
                 session = None
                 await ws.send_text(json.dumps({
                     "type": "session.closed",
@@ -232,7 +232,7 @@ def create_session_router(
                             _expiry_task.cancel()
                             _expiry_task = None
                         if session:
-                            await asyncio.to_thread(engine.remove_session, session.session_id)
+                            await asyncio.to_thread(session_registry.remove_session, session.session_id)
                         session = None
                         _output_sampler_changed.set()
                     elif msg_type in (
@@ -298,7 +298,7 @@ def create_session_router(
                 except asyncio.CancelledError:
                     logger.debug("WebSocket emitter task cancelled during cleanup")
             if session and not session._terminated:
-                engine.detach_session(
+                session_registry.detach_session(
                     session.session_id,
                     config.FMU_ATTACH_GRACE_SECONDS,
                     attachment_owner=attachment_owner,

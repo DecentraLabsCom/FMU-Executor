@@ -8,7 +8,7 @@ from unittest.mock import Mock
 import pytest
 from fastapi import HTTPException
 
-from app import engine, main, process_runner
+from app import engine, main, process_runner, session_registry
 
 
 class Session:
@@ -236,14 +236,14 @@ def test_session_creation_and_capacity_failure(dispatch, monkeypatch, tmp_path):
     monkeypatch.setattr(main.fmu_storage, "inspect_fmu_path", lambda *_args, **_kwargs: {
         "archiveValid": True, "modelDescriptionValid": True, "stationCompatible": True, "issues": [],
     })
-    monkeypatch.setattr(engine, "create_session", lambda *_args, **_kwargs: new_session)
+    monkeypatch.setattr(session_registry, "create_session", lambda *_args, **_kwargs: new_session)
     created = call({"type": "session.create"}, {"accessKey": "demo.fmu", "claims": {"exp": time.time() + 3600}}, selected_session=None)
     assert created["type"] == "session.created" and created["_session"] is new_session
     assert new_session.loaded
     assert created["capabilities"]["inputUpdateQuota"]["maxUpdatesPerWindow"] == main.config.MAX_INPUT_UPDATES_PER_WINDOW
     assert created["capabilities"]["inputUpdateQuota"]["windowMs"] == main.config.INPUT_UPDATE_WINDOW_SECONDS * 1000
 
-    monkeypatch.setattr(engine, "create_session", lambda *_args, **_kwargs: (_ for _ in ()).throw(engine.CapacityExceededError("full")))
+    monkeypatch.setattr(session_registry, "create_session", lambda *_args, **_kwargs: (_ for _ in ()).throw(session_registry.CapacityExceededError("full")))
     with pytest.raises(HTTPException) as exc:
         call({"type": "session.create"}, {"accessKey": "demo.fmu", "claims": {}}, selected_session=None)
     assert exc.value.status_code == 429
@@ -273,7 +273,7 @@ def test_session_creation_uses_configured_worker_boundary(dispatch, monkeypatch,
         created["kwargs"] = kwargs
         return new_session
 
-    monkeypatch.setattr(engine, "create_session", create_session)
+    monkeypatch.setattr(session_registry, "create_session", create_session)
 
     response = call(
         {"type": "session.create"},
@@ -316,7 +316,7 @@ def test_attach_requires_a_live_context_and_matching_session(dispatch, monkeypat
         call({"type": "session.attach"}, selected_session=None)
     with pytest.raises(HTTPException):
         call({"type": "session.attach", "sessionId": "route-session"}, {"accessKey": "demo.fmu"}, selected_session=None)
-    monkeypatch.setattr(engine, "get_attachable_session", lambda _sid: session)
+    monkeypatch.setattr(session_registry, "get_attachable_session", lambda _sid: session)
     attached = call(
         {"type": "session.attach", "sessionId": "route-session"},
         {"accessKey": "demo.fmu", "labId": "lab-1", "reservationKey": "reservation-1"},
@@ -331,13 +331,13 @@ def test_attach_requires_a_live_context_and_matching_session(dispatch, monkeypat
 
 def test_attach_rejects_missing_expired_and_mismatched_access_key(dispatch, monkeypatch):
     session, call = dispatch
-    monkeypatch.setattr(engine, "get_attachable_session", lambda _sid: None)
+    monkeypatch.setattr(session_registry, "get_attachable_session", lambda _sid: None)
     with pytest.raises(HTTPException):
         call({"type": "session.attach", "sessionId": "route-session"}, {"accessKey": "demo.fmu"}, selected_session=None)
     with pytest.raises(HTTPException) as exc:
         call({"type": "session.attach"}, {"accessKey": "demo.fmu"})
     assert exc.value.status_code == 401
-    monkeypatch.setattr(engine, "get_attachable_session", lambda _sid: session)
+    monkeypatch.setattr(session_registry, "get_attachable_session", lambda _sid: session)
     with pytest.raises(HTTPException) as exc:
         call({"type": "session.attach"}, {"accessKey": "another.fmu"})
     assert exc.value.status_code == 403

@@ -7,6 +7,7 @@ not take the Station HTTP/WebSocket control plane down with it.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import logging
@@ -73,6 +74,8 @@ _REALTIME_METHODS = {
     "pause",
     "resume",
     "reset",
+    "capture_fmu_state",
+    "restore_fmu_state",
 }
 
 _SECRET_ENV_MARKERS = (
@@ -250,6 +253,7 @@ def _realtime_session_worker(
     session_id: str,
     fmu_path: Path,
     access_key: str,
+    fmu_sha256: str | None = None,
     session_factory: Any = None,
     start_gate: Any = None,
     worker_directory: str | None = None,
@@ -274,7 +278,12 @@ def _realtime_session_worker(
         if session_factory is None:
             from .engine import FmuSession
             session_factory = FmuSession
-        session = session_factory(session_id, fmu_path, access_key=access_key)
+        session = session_factory(
+            session_id,
+            fmu_path,
+            access_key=access_key,
+            fmu_sha256=fmu_sha256,
+        )
         if resource_policy is not None:
             session._max_simulation_steps = min(
                 config.MAX_SIMULATION_STEPS,
@@ -364,6 +373,7 @@ class RealtimeSession:
         access_key: str | None = None,
         expires_at: float | int | str | None = None,
         gateway_context: dict[str, Any] | None = None,
+        fmu_sha256: str | None = None,
         resource_policy: dict[str, Any] | None = None,
         _worker_session_factory: Any = None,
     ):
@@ -372,6 +382,7 @@ class RealtimeSession:
         self.access_key = access_key or self.fmu_path.name
         self.expires_at = expires_at
         self.gateway_context = dict(gateway_context or {})
+        self.fmu_sha256 = fmu_sha256
         self._state = "new"
         self._time = 0.0
         self._start_time = 0.0
@@ -417,7 +428,7 @@ class RealtimeSession:
             target=_realtime_session_worker,
             args=(
                 child_connection, self.session_id, worker_fmu_path, self.access_key,
-                _worker_session_factory, start_gate, str(self._worker_directory), resource_policy,
+                self.fmu_sha256, _worker_session_factory, start_gate, str(self._worker_directory), resource_policy,
                 os.getpid(),
             ),
             name="LabStation-FMU-Realtime",
@@ -863,6 +874,11 @@ def _execute_worker(
     resource_policy: dict[str, Any] | None = None,
     expected_parent_pid: int | None = None,
     input_schedule: list[dict[str, Any]] | None = None,
+    fmu_sha256: str | None = None,
+    checkpoint_snapshot: dict[str, Any] | None = None,
+    checkpoint_state_path: str | None = None,
+    capture_fmu_state: bool = False,
+    capture_state_output_path: str | None = None,
 ) -> None:
     """Worker entry point; imports native FMU code only after OS limits apply."""
     session = None
@@ -886,6 +902,7 @@ def _execute_worker(
             f"worker_{mp.current_process().pid}",
             Path(fmu_path),
             access_key=access_key,
+            fmu_sha256=fmu_sha256,
         )
         if resource_policy is not None:
             session._max_simulation_steps = min(
@@ -908,6 +925,14 @@ def _execute_worker(
             parameters=parameters or None,
             early_return_allowed=options.get("earlyReturnAllowed", True),
         )
+        if checkpoint_snapshot is not None:
+            if not checkpoint_state_path:
+                raise ValueError("FMU state checkpoint data is unavailable")
+            checkpoint_bytes = Path(checkpoint_state_path).read_bytes()
+            session.restore_fmu_state({
+                **checkpoint_snapshot,
+                "serializedState": base64.b64encode(checkpoint_bytes).decode("ascii"),
+            })
         scheduled_inputs = list(input_schedule or [])
         while scheduled_inputs and float(scheduled_inputs[0]["time"]) <= start + 1e-12:
             session.set_inputs(scheduled_inputs.pop(0)["values"])
@@ -944,14 +969,27 @@ def _execute_worker(
                     output_queue.put({"kind": "error", "code": "RESULT_SIZE_LIMIT_EXCEEDED"})
                     return
                 output_queue.put({"kind": "message", "payload": snapshot})
-            output_queue.put({
-                "kind": "message",
-                "payload": {
-                    "type": "sim.done",
-                    "time": session._time,
-                    "finishReason": session._finished_reason,
-                },
-            })
+            completed = {
+                "type": "sim.done",
+                "time": session._time,
+                "finishReason": session._finished_reason,
+            }
+            if capture_fmu_state:
+                if not capture_state_output_path:
+                    raise RuntimeError("FMU state checkpoint output is unavailable")
+                from . import fmu_state
+
+                checkpoint = session.capture_fmu_state()
+                serialized_state = base64.b64decode(checkpoint.pop("serializedState"), validate=True)
+                if len(serialized_state) > fmu_state.MAX_FMU_STATE_BYTES:
+                    raise ValueError("FMU state checkpoint exceeds the size limit")
+                checkpoint_path = Path(capture_state_output_path)
+                with checkpoint_path.open("xb") as checkpoint_file:
+                    checkpoint_file.write(serialized_state)
+                if os.name != "nt":
+                    checkpoint_path.chmod(0o600)
+                completed["checkpointSnapshot"] = checkpoint
+            output_queue.put({"kind": "message", "payload": completed})
         elif capture_series:
             initial = session.get_outputs()
             initial_outputs = select_outputs(initial["outputs"])
@@ -1070,14 +1108,39 @@ def _new_process(
     probe_only: bool = False,
     resource_policy: dict[str, Any] | None = None,
     input_schedule: list[dict[str, Any]] | None = None,
+    fmu_sha256: str | None = None,
+    checkpoint_snapshot: dict[str, Any] | None = None,
+    capture_fmu_state: bool = False,
 ) -> tuple[Any, Any, WindowsWorkerJob | None, Path, Any]:
     context = mp.get_context("spawn")
     config.TEMP_DIR.mkdir(parents=True, exist_ok=True)
     worker_directory = Path(tempfile.mkdtemp(prefix="worker_", dir=str(config.TEMP_DIR)))
     if os.name != "nt":
         os.chmod(worker_directory, 0o700)
+    checkpoint_state_path = None
+    capture_state_output_path = None
+    worker_checkpoint = None
     try:
         worker_fmu_path = _stage_windows_fmu(fmu_path, worker_directory)
+        if checkpoint_snapshot is not None:
+            encoded_state = checkpoint_snapshot.get("serializedState")
+            if not isinstance(encoded_state, str):
+                raise ValueError("FMU state checkpoint is invalid")
+            state_bytes = base64.b64decode(encoded_state, validate=True)
+            if not state_bytes or len(state_bytes) > 32 * 1024 * 1024:
+                raise ValueError("FMU state checkpoint exceeds the size limit")
+            checkpoint_path = worker_directory / "fmu-state-input.bin"
+            with checkpoint_path.open("xb") as checkpoint_file:
+                checkpoint_file.write(state_bytes)
+            if os.name != "nt":
+                checkpoint_path.chmod(0o600)
+            checkpoint_state_path = str(checkpoint_path)
+            worker_checkpoint = {
+                key: value for key, value in checkpoint_snapshot.items()
+                if key != "serializedState"
+            }
+        if capture_fmu_state:
+            capture_state_output_path = str(worker_directory / "fmu-state-output.bin")
     except Exception:
         _cleanup_worker_directory(worker_directory)
         raise
@@ -1085,7 +1148,9 @@ def _new_process(
     worker_args = (
         str(worker_fmu_path), access_key, parameters, options, output_queue,
         streaming, capture_series, start_gate, str(worker_directory),
-        probe_only, resource_policy, os.getpid(), input_schedule,
+        probe_only, resource_policy, os.getpid(), input_schedule, fmu_sha256,
+        worker_checkpoint, checkpoint_state_path, capture_fmu_state,
+        capture_state_output_path,
     )
     process = _worker_process(
         context,
@@ -1221,6 +1286,10 @@ def stream(
     reservation_ends_at: float | None = None,
     resource_policy: dict[str, Any] | None = None,
     input_schedule: list[dict[str, Any]] | None = None,
+    fmu_sha256: str | None = None,
+    gateway_context: dict[str, Any] | None = None,
+    checkpoint_snapshot: dict[str, Any] | None = None,
+    capture_fmu_state: bool = False,
 ) -> Iterator[dict[str, Any]]:
     """Yield NDJSON payloads from an isolated streaming worker."""
     context = mp.get_context("spawn")
@@ -1230,6 +1299,9 @@ def stream(
             fmu_path, access_key, parameters, options, output_queue, True,
             resource_policy=resource_policy,
             input_schedule=input_schedule,
+            fmu_sha256=fmu_sha256,
+            checkpoint_snapshot=checkpoint_snapshot,
+            capture_fmu_state=capture_fmu_state,
         )
     except Exception:
         output_queue.close()
@@ -1294,6 +1366,39 @@ def stream(
             if kind == "message":
                 payload = message.get("payload")
                 if isinstance(payload, dict):
+                    if payload.get("type") == "sim.done" and capture_fmu_state:
+                        from . import fmu_state
+
+                        checkpoint_metadata = payload.pop("checkpointSnapshot", None)
+                        checkpoint_path = worker_directory / "fmu-state-output.bin"
+                        if not isinstance(checkpoint_metadata, dict) or not checkpoint_path.is_file():
+                            yield {
+                                "type": "error",
+                                "code": "FMU_STATE_CAPTURE_FAILED",
+                                "message": "The FMU state checkpoint could not be captured",
+                                "retryable": False,
+                            }
+                            break
+                        try:
+                            serialized_state = checkpoint_path.read_bytes()
+                            payload["checkpoint"] = fmu_state.seal_fmu_state_checkpoint(
+                                {
+                                    **checkpoint_metadata,
+                                    "serializedState": base64.b64encode(serialized_state).decode("ascii"),
+                                },
+                                gateway_context=gateway_context,
+                                signing_secret=config.internal_token(),
+                                state_dir=config.STATE_DIR,
+                            )
+                        except (OSError, ValueError) as exc:
+                            logger.warning("FMU state checkpoint could not be stored: %s", type(exc).__name__)
+                            yield {
+                                "type": "error",
+                                "code": "FMU_STATE_CAPTURE_FAILED",
+                                "message": "The FMU state checkpoint could not be stored",
+                                "retryable": False,
+                            }
+                            break
                     yield payload
                 if isinstance(payload, dict) and payload.get("type") == "sim.done":
                     break

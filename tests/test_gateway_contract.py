@@ -52,7 +52,7 @@ def _isolate_config(tmp_path: Path):
             with patch("app.process_runner.RealtimeSession", in_process_test_session):
                 yield fmu_root
         finally:
-            from app.engine import terminate_all
+            from app.session_registry import terminate_all
             terminate_all()
             from app.fmu_storage import _quarantine_cache
             _quarantine_cache.clear()
@@ -580,7 +580,7 @@ class TestWsSimOutputsContract:
 
     def test_get_outputs_reports_missing_model_description(self, client, _isolate_config):
         """A selected-output request must report an unloaded model explicitly."""
-        from app import engine
+        from app import engine, session_registry
 
         _provision_fmu(_isolate_config)
         md = _make_mock_md()
@@ -602,7 +602,7 @@ class TestWsSimOutputsContract:
                 }))
                 created = json.loads(ws.receive_text())
                 assert created["type"] == "session.created"
-                session = engine.get_session(created["sessionId"])
+                session = session_registry.get_session(created["sessionId"])
                 assert session is not None
                 session._md = None
 

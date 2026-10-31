@@ -2,23 +2,27 @@
 
 from __future__ import annotations
 
-import math
-import posixpath
 import csv
 import io
+import math
 import zipfile
 import xml.etree.ElementTree as ET
 import zlib
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import unquote, urlsplit
 
+from .fmi_ls_ref_archive import (
+    FMI_LS_REF_MANIFEST_PATH,
+    is_safe_xml as _safe_xml,
+    local_name as _local_name,
+    namespace as _namespace,
+    read_archive_file as _read_archive_file,
+    read_fmi_ls_ref_manifest,
+    resolve_archive_uri as _resolve_archive_uri,
+)
 
-FMI_LS_REF_MANIFEST_PATH = "extra/org.fmi-standard.fmi-ls-ref/fmi-ls-manifest.xml"
-FMI_LS_REF_NAME = "org.fmi-standard.fmi-ls-ref"
 MA_HS_EXPERIMENTS_MEDIA_TYPE = "application/x-ma-hs-experiments"
 SSP_PARAMETER_SET_MEDIA_TYPE = "application/x-ssp-parameter-set"
-MAX_MANIFEST_BYTES = 1024 * 1024
 MAX_EXPERIMENT_FILE_BYTES = 1024 * 1024
 MAX_PARAMETER_FILE_BYTES = 512 * 1024
 MAX_TOTAL_PARAMETER_BYTES = 512 * 1024
@@ -42,20 +46,10 @@ def read_fmi_ls_ref_experiments(
     """
     try:
         with zipfile.ZipFile(fmu_path) as archive:
-            manifest_data = _read_archive_file(archive, FMI_LS_REF_MANIFEST_PATH, MAX_MANIFEST_BYTES)
-            if manifest_data is None or not _safe_xml(manifest_data):
+            manifest = read_fmi_ls_ref_manifest(archive)
+            if manifest is None:
                 return {"resourceSets": [], "truncated": False}
-            manifest_root = ET.fromstring(manifest_data)
-            namespace = "http://fmi-standard.org/fmi-ls-manifest"
-            if (
-                _local_name(manifest_root) != "fmiReferences"
-                or manifest_root.attrib.get(f"{{{namespace}}}fmi-ls-name") != FMI_LS_REF_NAME
-            ):
-                return {"resourceSets": [], "truncated": False}
-
-            resource_name_counts: dict[str, int] = {}
-            for info in archive.infolist():
-                resource_name_counts[info.filename] = resource_name_counts.get(info.filename, 0) + 1
+            manifest_root, resource_name_counts = manifest
 
             sets: list[dict[str, Any]] = []
             truncated = False
@@ -95,7 +89,12 @@ def read_fmi_ls_ref_experiments(
                     descriptor["status"] = "unavailable"
                     descriptor["reason"] = "experiment_file_missing_or_ambiguous"
                     continue
-                experiment_data = _read_archive_file(archive, archive_path, MAX_EXPERIMENT_FILE_BYTES)
+                experiment_data = _read_archive_file(
+                    archive,
+                    archive_path,
+                    MAX_EXPERIMENT_FILE_BYTES,
+                    member_counts=resource_name_counts,
+                )
                 if experiment_data is None:
                     descriptor["status"] = "unavailable"
                     descriptor["reason"] = "experiment_file_unavailable_or_too_large"
@@ -270,7 +269,12 @@ def _parse_experiment(
             case["status"] = "unavailable"
             case["reason"] = "parameter_file_missing_or_ambiguous"
             return case
-        parameter_data = _read_archive_file(archive, parameter_path, MAX_PARAMETER_FILE_BYTES)
+        parameter_data = _read_archive_file(
+            archive,
+            parameter_path,
+            MAX_PARAMETER_FILE_BYTES,
+            member_counts=resource_name_counts,
+        )
         if parameter_data is None:
             case["status"] = "unavailable"
             case["reason"] = "parameter_file_unavailable_or_too_large"
@@ -310,7 +314,12 @@ def _parse_experiment(
             case["status"] = "unavailable"
             case["reason"] = "stimuli_file_missing_or_ambiguous"
             return case
-        stimuli_data = _read_archive_file(archive, stimuli_path, MAX_STIMULI_FILE_BYTES)
+        stimuli_data = _read_archive_file(
+            archive,
+            stimuli_path,
+            MAX_STIMULI_FILE_BYTES,
+            member_counts=resource_name_counts,
+        )
         if stimuli_data is None:
             case["status"] = "unavailable"
             case["reason"] = "stimuli_file_unavailable_or_too_large"
@@ -377,47 +386,3 @@ def _parse_stimuli_csv(data: bytes, options: dict[str, Any]) -> list[dict[str, A
     if not schedule or abs(schedule[0]["time"] - start) > tolerance:
         raise ValueError("stimuli CSV must define inputs at startTime")
     return schedule
-
-
-def _resolve_archive_uri(base_archive_path: str, source: str) -> str | None:
-    if not source or len(source) > 2048 or "\\" in source or "\x00" in source:
-        return None
-    parsed = urlsplit(source)
-    if parsed.scheme or parsed.netloc or parsed.query or parsed.fragment or not parsed.path:
-        return None
-    decoded_path = unquote(parsed.path)
-    if "\\" in decoded_path or "\x00" in decoded_path or decoded_path.startswith("/"):
-        return None
-    normalized = posixpath.normpath(posixpath.join(posixpath.dirname(base_archive_path), decoded_path))
-    if normalized in {"", ".", ".."} or normalized.startswith(("../", "/")):
-        return None
-    return normalized
-
-
-def _read_archive_file(archive: zipfile.ZipFile, path: str, maximum_bytes: int) -> bytes | None:
-    try:
-        info = archive.getinfo(path)
-        if info.is_dir() or info.file_size > maximum_bytes:
-            return None
-        with archive.open(info) as source:
-            content = source.read(maximum_bytes + 1)
-        return content if len(content) <= maximum_bytes else None
-    except (OSError, KeyError, RuntimeError, EOFError, zlib.error):
-        return None
-
-
-def _safe_xml(data: bytes) -> bool:
-    try:
-        text = data.decode("utf-8-sig")
-    except UnicodeDecodeError:
-        return False
-    lowered = text.lower()
-    return "<!doctype" not in lowered and "<!entity" not in lowered
-
-
-def _local_name(element: ET.Element) -> str:
-    return element.tag.rsplit("}", 1)[-1]
-
-
-def _namespace(element: ET.Element) -> str:
-    return element.tag[1:].split("}", 1)[0] if element.tag.startswith("{") else ""

@@ -8,7 +8,7 @@ from unittest.mock import Mock
 import pytest
 from fastapi.testclient import TestClient
 
-from app import config, engine, fmu_storage, main, process_runner
+from app import config, engine, fmu_storage, main, process_runner, session_registry
 from tests.fmu_fixture import write_test_fmu
 
 
@@ -258,7 +258,7 @@ def test_simulation_routes_reject_unavailable_backends_before_allocating(route_c
     client, headers = route_client
     install_fake_fmu(monkeypatch, tmp_path)
     create = Mock(side_effect=AssertionError("session should not be allocated"))
-    monkeypatch.setattr(engine, "create_session", create)
+    monkeypatch.setattr(session_registry, "create_session", create)
 
     response = client.post(
         "/internal/fmu/simulations/run",
@@ -275,8 +275,8 @@ def test_run_route_returns_process_result_and_releases_capacity(route_client, mo
     fmu_path = install_fake_fmu(monkeypatch, tmp_path)
     capacity = object()
     released = Mock()
-    monkeypatch.setattr(engine, "reserve_capacity", lambda: capacity)
-    monkeypatch.setattr(engine, "release_capacity", released)
+    monkeypatch.setattr(session_registry, "reserve_capacity", lambda: capacity)
+    monkeypatch.setattr(session_registry, "release_capacity", released)
     process_run = Mock(return_value={"type": "sim.result", "time": 1.5, "outputs": {"x": 2}})
     monkeypatch.setattr(process_runner, "run", process_run)
     monkeypatch.setattr(config, "execution_mode", lambda: "process")
@@ -305,8 +305,8 @@ def test_run_route_maps_worker_errors_and_still_releases_capacity(route_client, 
     install_fake_fmu(monkeypatch, tmp_path)
     capacity = object()
     released = Mock()
-    monkeypatch.setattr(engine, "reserve_capacity", lambda: capacity)
-    monkeypatch.setattr(engine, "release_capacity", released)
+    monkeypatch.setattr(session_registry, "reserve_capacity", lambda: capacity)
+    monkeypatch.setattr(session_registry, "release_capacity", released)
     monkeypatch.setattr(process_runner, "run", Mock(side_effect=error))
     monkeypatch.setattr(config, "execution_mode", lambda: "process")
 
@@ -319,7 +319,7 @@ def test_run_route_maps_worker_errors_and_still_releases_capacity(route_client, 
 def test_run_route_rejects_exhausted_capacity(route_client, monkeypatch, tmp_path):
     client, headers = route_client
     install_fake_fmu(monkeypatch, tmp_path)
-    monkeypatch.setattr(engine, "reserve_capacity", Mock(side_effect=engine.CapacityExceededError("full")))
+    monkeypatch.setattr(session_registry, "reserve_capacity", Mock(side_effect=session_registry.CapacityExceededError("full")))
 
     response = client.post("/internal/fmu/simulations/run", headers=headers, json={"accessKey": "demo.fmu"})
 
@@ -334,8 +334,8 @@ def test_run_route_executes_in_process_mode(route_client, monkeypatch, tmp_path)
     monkeypatch.setattr(engine, "FmuSession", lambda *_args, **_kwargs: slot)
     capacity = object()
     released = Mock()
-    monkeypatch.setattr(engine, "reserve_capacity", lambda: capacity)
-    monkeypatch.setattr(engine, "release_capacity", released)
+    monkeypatch.setattr(session_registry, "reserve_capacity", lambda: capacity)
+    monkeypatch.setattr(session_registry, "release_capacity", released)
     monkeypatch.setattr(config, "execution_mode", lambda: "in-process")
 
     response = client.post(
@@ -358,8 +358,8 @@ def test_stream_route_yields_ndjson_and_releases_capacity(route_client, monkeypa
     install_fake_fmu(monkeypatch, tmp_path)
     capacity = object()
     released = Mock()
-    monkeypatch.setattr(engine, "reserve_capacity", lambda: capacity)
-    monkeypatch.setattr(engine, "release_capacity", released)
+    monkeypatch.setattr(session_registry, "reserve_capacity", lambda: capacity)
+    monkeypatch.setattr(session_registry, "release_capacity", released)
     monkeypatch.setattr(process_runner, "stream", lambda *args, **kwargs: iter([{"type": "sim.outputs", "simTime": 0.5}, {"type": "sim.done", "time": 1}]))
     monkeypatch.setattr(config, "execution_mode", lambda: "process")
 
@@ -377,7 +377,7 @@ def test_stream_route_yields_ndjson_and_releases_capacity(route_client, monkeypa
 def test_stream_route_reports_capacity_as_ndjson(route_client, monkeypatch, tmp_path):
     client, headers = route_client
     install_fake_fmu(monkeypatch, tmp_path)
-    monkeypatch.setattr(engine, "reserve_capacity", Mock(side_effect=engine.CapacityExceededError("full")))
+    monkeypatch.setattr(session_registry, "reserve_capacity", Mock(side_effect=session_registry.CapacityExceededError("full")))
 
     response = client.post("/internal/fmu/simulations/stream", headers=headers, json={"accessKey": "demo.fmu"})
 
@@ -391,9 +391,9 @@ def test_stream_route_in_process_and_exception_paths_are_closed(route_client, mo
     slot = FakeSlot()
     capacity = object()
     released = Mock()
-    monkeypatch.setattr(engine, "reserve_capacity", lambda: capacity)
+    monkeypatch.setattr(session_registry, "reserve_capacity", lambda: capacity)
     monkeypatch.setattr(engine, "FmuSession", lambda *_args, **_kwargs: slot)
-    monkeypatch.setattr(engine, "release_capacity", released)
+    monkeypatch.setattr(session_registry, "release_capacity", released)
     monkeypatch.setattr(config, "execution_mode", lambda: "in-process")
 
     response = client.post("/internal/fmu/simulations/stream", headers=headers, json={"accessKey": "demo.fmu", "options": {"stopTime": 2}})
@@ -450,8 +450,8 @@ def test_backend_and_startup_shutdown_routes_cover_lifecycle(route_client, monke
     monkeypatch.setattr(config, "log_level", lambda: "not-a-log-level")
     cleanup = Mock()
     terminate = Mock()
-    monkeypatch.setattr(engine, "cleanup_expired_sessions", cleanup)
-    monkeypatch.setattr(engine, "terminate_all", terminate)
+    monkeypatch.setattr(session_registry, "cleanup_expired_sessions", cleanup)
+    monkeypatch.setattr(session_registry, "terminate_all", terminate)
 
     with TestClient(main.app):
         pass

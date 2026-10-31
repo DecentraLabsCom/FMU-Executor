@@ -16,7 +16,7 @@ from uuid import uuid4
 
 from fastapi import HTTPException
 
-from . import auth, config, engine, fmu_storage, process_runner
+from . import auth, config, fmu_storage, process_runner, session_registry
 from .reproducibility import (
     applied_execution_policy,
     attach_evidence,
@@ -317,8 +317,8 @@ class SimulationJobManager:
         authorization_expires_at, reservation_ends_at = execution_deadlines(gateway_context)
         async with self._lock:
             try:
-                capacity_token = engine.reserve_capacity()
-            except engine.CapacityExceededError as exc:
+                capacity_token = session_registry.reserve_capacity()
+            except session_registry.CapacityExceededError as exc:
                 raise HTTPException(status_code=429, detail="STATION_CAPACITY_EXHAUSTED") from exc
             try:
                 source_path = fmu_storage.get_fmu_path(access_key)
@@ -378,22 +378,22 @@ class SimulationJobManager:
                     maximum_scenarios=maximum_scenarios,
                 )
             except QuotaExceededError as exc:
-                engine.release_capacity(capacity_token)
+                session_registry.release_capacity(capacity_token)
                 raise HTTPException(
                     status_code=429,
                     detail={"code": "RESERVATION_DAILY_SCENARIO_LIMIT", "remaining": max(0, int(exc.args[0]))},
                 ) from exc
             except sqlite3.IntegrityError as exc:
-                engine.release_capacity(capacity_token)
+                session_registry.release_capacity(capacity_token)
                 raise HTTPException(status_code=409, detail="SIMULATION_ID_ALREADY_EXISTS") from exc
             except HTTPException:
-                engine.release_capacity(capacity_token)
+                session_registry.release_capacity(capacity_token)
                 raise
             except (TypeError, ValueError) as exc:
-                engine.release_capacity(capacity_token)
+                session_registry.release_capacity(capacity_token)
                 raise HTTPException(status_code=422, detail="INVALID_SIMULATION_REQUEST") from exc
             except Exception:
-                engine.release_capacity(capacity_token)
+                session_registry.release_capacity(capacity_token)
                 raise
             cancel_event = threading.Event()
             self._cancel_events[job_id] = cancel_event
@@ -484,7 +484,7 @@ class SimulationJobManager:
                 result=payload, finish_reason="completed", warnings=[],
                 result_sha256=canonical_sha256(payload),
             )
-        except engine.CapacityExceededError:
+        except session_registry.CapacityExceededError:
             self._finish(
                 job_id, status="failed", kind=kind, results=results,
                 error_code="STATION_CAPACITY_EXHAUSTED",
@@ -519,7 +519,7 @@ class SimulationJobManager:
                 error_code="FMU_EXECUTION_FAILED", finish_reason="failed", warnings=["FMU_EXECUTION_FAILED"],
             )
         finally:
-            engine.release_capacity(capacity_token)
+            session_registry.release_capacity(capacity_token)
             self._cancel_events.pop(job_id, None)
             self._tasks.pop(job_id, None)
 

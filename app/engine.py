@@ -9,13 +9,12 @@ import logging
 import math
 import json
 import re
+import platform
 from functools import reduce
 from operator import mul
 import shutil
 import tempfile
-import threading
 import time as _time
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Generator, Optional
@@ -29,6 +28,7 @@ from fmpy.fmi1 import FMICallException
 from fmpy.fmi2 import fmi2Discard, fmi2LastSuccessfulTime, fmi2Pending, fmi2Terminated
 
 from . import config
+from .fmu_metadata import describe_model_description
 from .simulation_defaults import DEFAULT_STEP_SIZE, resolve_simulation_time_options
 
 logger = logging.getLogger(__name__)
@@ -113,12 +113,14 @@ class FmuSession:
         access_key: str | None = None,
         expires_at: float | int | str | None = None,
         gateway_context: dict[str, Any] | None = None,
+        fmu_sha256: str | None = None,
     ):
         self.session_id = session_id
         self.fmu_path = fmu_path
         self.access_key = access_key or fmu_path.name
         self.expires_at = expires_at
         self.gateway_context = dict(gateway_context or {})
+        self.fmu_sha256 = fmu_sha256
         self._extract_dir: Path | None = None
         self._slave: Any | None = None
         self._md = None
@@ -641,6 +643,115 @@ class FmuSession:
         validated = self._validate_values(values, phase="runtime")
         self._apply_validated_values(validated)
 
+    def capture_fmu_state(self) -> dict[str, Any]:
+        """Capture a serialized checkpoint when the source FMU supports it."""
+        slave = self._require_slave()
+        if not self._supports_serialized_fmu_state():
+            raise RuntimeError("FMU state capture is not supported by this model")
+        state = None
+        try:
+            state = slave.getFMUState()
+            serialized = slave.serializeFMUState(state)
+        except Exception as exc:
+            raise RuntimeError("The FMU could not serialize its current state") from exc
+        finally:
+            if state is not None:
+                try:
+                    slave.freeFMUState(state)
+                except Exception:
+                    logger.debug("Could not free captured FMU state for session %s", self.session_id, exc_info=True)
+        if not isinstance(serialized, (bytes, bytearray)) or not serialized:
+            raise RuntimeError("The FMU returned an invalid serialized state")
+        from .fmu_state import MAX_FMU_STATE_BYTES
+        if len(serialized) > MAX_FMU_STATE_BYTES:
+            raise ValueError("FMU state checkpoint exceeds the size limit")
+        return {
+            "fmuSha256": self.fmu_sha256,
+            "fmiVersion": str(getattr(self._md, "fmiVersion", "")),
+            "platform": f"{platform.system().lower()}/{platform.machine().lower()}",
+            "serializedState": base64.b64encode(bytes(serialized)).decode("ascii"),
+            "simulation": {
+                "time": self._time,
+                "startTime": self._start_time,
+                "stopTime": self._stop_time,
+                "stepSize": self._step_size,
+                "stepCount": self._step_count,
+                "timeMode": self._time_mode,
+                "playbackSpeed": self._playback_speed,
+                "earlyReturnAllowed": self._early_return_allowed,
+                "initialParameters": copy.deepcopy(self._initial_parameters),
+            },
+        }
+
+    def restore_fmu_state(self, snapshot: dict[str, Any]) -> dict[str, Any]:
+        """Restore a signed checkpoint into an initialized FMU instance."""
+        slave = self._require_slave()
+        if not self._supports_serialized_fmu_state():
+            raise RuntimeError("FMU state restore is not supported by this model")
+        if not isinstance(snapshot, dict):
+            raise ValueError("FMU state checkpoint is invalid or incompatible")
+        if snapshot.get("fmuSha256") != self.fmu_sha256:
+            raise ValueError("FMU state checkpoint belongs to a different model")
+        if str(snapshot.get("fmiVersion") or "") != str(getattr(self._md, "fmiVersion", "")):
+            raise ValueError("FMU state checkpoint belongs to a different FMI version")
+        expected_platform = f"{platform.system().lower()}/{platform.machine().lower()}"
+        if snapshot.get("platform") != expected_platform:
+            raise ValueError("FMU state checkpoint belongs to a different execution platform")
+        simulation = snapshot.get("simulation")
+        encoded_state = snapshot.get("serializedState")
+        if not isinstance(simulation, dict) or not isinstance(encoded_state, str) or not encoded_state:
+            raise ValueError("FMU state checkpoint is invalid or incompatible")
+        from .fmu_state import MAX_FMU_STATE_CHECKPOINT_JSON_BYTES
+        if len(encoded_state) > MAX_FMU_STATE_CHECKPOINT_JSON_BYTES:
+            raise ValueError("FMU state checkpoint exceeds the size limit")
+        try:
+            serialized = base64.b64decode(encoded_state, validate=True)
+            raw_time = simulation["time"]
+            raw_step_count = simulation["stepCount"]
+            if isinstance(raw_time, bool) or not isinstance(raw_time, (int, float)):
+                raise ValueError("invalid time")
+            if type(raw_step_count) is not int:
+                raise ValueError("invalid step count")
+            time_value = float(raw_time)
+            step_count = raw_step_count
+            initial_parameters = simulation["initialParameters"]
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("FMU state checkpoint is invalid or incompatible") from exc
+        if not math.isfinite(time_value) or time_value < self._start_time or time_value >= self._stop_time:
+            raise ValueError("FMU state checkpoint time must fall within the new simulation interval")
+        if step_count < 0 or step_count > self._max_simulation_steps:
+            raise ValueError("FMU state checkpoint exceeds the simulation step budget")
+        if not isinstance(initial_parameters, dict):
+            raise ValueError("FMU state checkpoint is invalid or incompatible")
+        state = None
+        try:
+            state = slave.deserializeFMUState(serialized)
+            slave.setFMUState(state)
+        except Exception as exc:
+            raise ValueError("The FMU could not restore the checkpoint") from exc
+        finally:
+            if state is not None:
+                try:
+                    slave.freeFMUState(state)
+                except Exception:
+                    logger.debug("Could not free restored FMU state for session %s", self.session_id, exc_info=True)
+        self._time = time_value
+        self._step_count = step_count
+        self._initial_parameters = copy.deepcopy(initial_parameters)
+        self._finished_reason = None
+        self._terminated = False
+        self._state = "paused"
+        return {"state": self._state, "simTime": self._time}
+
+    def _supports_serialized_fmu_state(self) -> bool:
+        interface = getattr(self._md, "coSimulation", None)
+        if interface is None:
+            return False
+        return bool(
+            getattr(interface, "canGetAndSetFMUstate", getattr(interface, "canGetAndSetFMUState", False))
+            and getattr(interface, "canSerializeFMUstate", getattr(interface, "canSerializeFMUState", False))
+        )
+
     def validate_initial_values(self, values: dict[str, Any]) -> dict[str, Any]:
         """Validate initialization parameters before a scenario is charged."""
         if self._terminated:
@@ -965,11 +1076,10 @@ class FmuSession:
         }
 
     def _describe(self) -> dict[str, Any]:
-        from . import fmu_storage
         # The isolated worker may only access the staged FMU path, not the
         # catalog root used to resolve access keys. Reuse its parsed model
         # description and avoid opening a large modelDescription.xml twice.
-        return fmu_storage.describe_model_description(self._md)
+        return describe_model_description(self._md)
 
     def _validate_values(self, params: dict[str, Any], *, phase: str) -> dict[str, Any]:
         if not isinstance(params, dict):
@@ -1234,130 +1344,3 @@ class FmuSession:
 
     def __del__(self) -> None:
         self.terminate()
-
-
-# ── session registry ─────────────────────────────────────────────
-
-_sessions: dict[str, Any] = {}
-_sessions_lock = threading.RLock()
-_capacity_reservations: set[str] = set()
-
-
-class CapacityExceededError(RuntimeError):
-    """Raised when the Station execution authority has no free slot."""
-
-
-def create_session(
-    fmu_path: Path,
-    *,
-    access_key: str | None = None,
-    expires_at: float | int | str | None = None,
-    gateway_context: dict[str, Any] | None = None,
-    session_factory: Any = None,
-    resource_policy: dict[str, Any] | None = None,
-) -> Any:
-    cleanup_expired_sessions()
-    with _sessions_lock:
-        if len(_sessions) + len(_capacity_reservations) >= config.MAX_CONCURRENT_SESSIONS:
-            raise CapacityExceededError(
-                f"Max concurrent sessions ({config.MAX_CONCURRENT_SESSIONS}) reached"
-            )
-        session_id = f"sess_{uuid.uuid4().hex[:12]}"
-        factory = session_factory or FmuSession
-        session_arguments = (session_id, fmu_path)
-        session_options = {
-            "access_key": access_key,
-            "expires_at": expires_at,
-            "gateway_context": gateway_context,
-        }
-        if resource_policy is not None:
-            session_options["resource_policy"] = resource_policy
-        session = factory(*session_arguments, **session_options)
-        # A newly created WebSocket session is actively being established.
-        # Do not let periodic cleanup reap it while its initial worker load RPC
-        # is still in flight; the owning connection is attached immediately
-        # after the create response is assembled.
-        session.mark_attached()
-        _sessions[session_id] = session
-        return session
-
-
-def reserve_capacity() -> str:
-    """Reserve one shared execution slot before charging a simulation job."""
-    cleanup_expired_sessions()
-    with _sessions_lock:
-        if len(_sessions) + len(_capacity_reservations) >= config.MAX_CONCURRENT_SESSIONS:
-            raise CapacityExceededError(
-                f"Max concurrent executions ({config.MAX_CONCURRENT_SESSIONS}) reached"
-            )
-        token = uuid.uuid4().hex
-        _capacity_reservations.add(token)
-        return token
-
-
-def release_capacity(token: str | None) -> None:
-    if not token:
-        return
-    with _sessions_lock:
-        _capacity_reservations.discard(token)
-
-
-def get_session(session_id: str) -> Any | None:
-    with _sessions_lock:
-        return _sessions.get(session_id)
-
-
-def get_attachable_session(session_id: str) -> Any | None:
-    with _sessions_lock:
-        session = _sessions.get(session_id)
-    if session is None or not session.can_attach():
-        if session is not None and not session.can_attach():
-            remove_session(session_id)
-        return None
-    return session
-
-
-def detach_session(
-    session_id: str,
-    grace_seconds: float,
-    *,
-    attachment_owner: object | None = None,
-) -> None:
-    with _sessions_lock:
-        session = _sessions.get(session_id)
-    if session is not None:
-        session.mark_detached(grace_seconds, attachment_owner)
-
-
-def cleanup_expired_sessions(now: float | None = None) -> None:
-    now = _time.time() if now is None else now
-    with _sessions_lock:
-        expired = [
-            session_id
-            for session_id, session in list(_sessions.items())
-            if session._terminated or (not session._attached and not session.can_attach(now))
-        ]
-    for session_id in expired:
-        remove_session(session_id)
-
-
-def remove_session(session_id: str) -> None:
-    with _sessions_lock:
-        session = _sessions.pop(session_id, None)
-    if session:
-        session.terminate()
-
-
-def active_session_count() -> int:
-    cleanup_expired_sessions()
-    with _sessions_lock:
-        return len(_sessions) + len(_capacity_reservations)
-
-
-def terminate_all() -> None:
-    with _sessions_lock:
-        session_ids = list(_sessions)
-    for sid in session_ids:
-        remove_session(sid)
-    with _sessions_lock:
-        _capacity_reservations.clear()

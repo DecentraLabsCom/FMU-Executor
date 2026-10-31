@@ -818,7 +818,7 @@ def test_terminated_realtime_session_remains_non_attachable():
 def test_registry_releases_crashed_worker_even_while_client_is_attached(monkeypatch):
     from unittest.mock import Mock
 
-    from app import engine
+    from app import engine, session_registry
 
     dead_session = SimpleNamespace(
         _terminated=True,
@@ -826,11 +826,11 @@ def test_registry_releases_crashed_worker_even_while_client_is_attached(monkeypa
         can_attach=lambda _now=None: True,
         terminate=Mock(),
     )
-    monkeypatch.setattr(engine, "_sessions", {"dead-session": dead_session})
+    monkeypatch.setattr(session_registry, "_sessions", {"dead-session": dead_session})
 
-    engine.cleanup_expired_sessions()
+    session_registry.cleanup_expired_sessions()
 
-    assert engine.get_session("dead-session") is None
+    assert session_registry.get_session("dead-session") is None
     dead_session.terminate.assert_called_once_with()
 
 
