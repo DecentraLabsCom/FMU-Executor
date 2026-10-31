@@ -108,10 +108,12 @@ async def _handle_sim_initialize(
     root_params = msg.get("parameters", {})
     if not isinstance(options, dict) or not isinstance(root_params, dict):
         raise HTTPException(status_code=422, detail="INVALID_SIMULATION_REQUEST")
-    option_params = options.get("inputs", root_params)
-    if not isinstance(option_params, dict) or (root_params and option_params != root_params):
+    option_inputs = options.get("inputs", {})
+    if not isinstance(option_inputs, dict):
+        raise HTTPException(status_code=422, detail="INVALID_SIMULATION_REQUEST")
+    if any(name in root_params and root_params[name] != value for name, value in option_inputs.items()):
         raise HTTPException(status_code=422, detail="INVALID_SIMULATION_REQUEST - conflicting inputs")
-    params = option_params
+    params = {**root_params, **option_inputs}
     checkpoint_snapshot = None
     if "checkpoint" in msg:
         try:

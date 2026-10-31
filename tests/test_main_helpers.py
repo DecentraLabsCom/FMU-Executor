@@ -93,11 +93,18 @@ def test_input_reservation_validates_payload_and_maps_quota(monkeypatch):
     assert missing_scope.value.detail == "RESERVATION_SCOPE_REQUIRED"
 
     monkeypatch.setattr(main, "_scope_key", lambda *_args: "scope-key")
+    monkeypatch.setattr(main, "model_execution_policy", lambda _context: {"maxInputUpdatesPerWindow": None})
     reserve = Mock(return_value={"remaining": 4})
     monkeypatch.setattr(main._simulation_store, "reserve_input_update", reserve)
 
     main._reserve_input_update(context, "model.fmu", {"temperature": "é"})
-    reserve.assert_called_once_with("scope-key", "model.fmu", len('{"temperature":"é"}'.encode("utf-8")))
+    reserve.assert_called_once_with(
+        "scope-key",
+        "model.fmu",
+        len('{"temperature":"é"}'.encode("utf-8")),
+        maximum_window_count=None,
+        window_seconds=main.config.INPUT_UPDATE_WINDOW_SECONDS,
+    )
 
     reserve.side_effect = InputUpdateQuotaExceededError("INPUT_UPDATE_TOO_LARGE", 0)
     with pytest.raises(HTTPException) as quota:
@@ -134,7 +141,13 @@ def test_input_reservation_validates_payload_and_maps_quota(monkeypatch):
         for event in scheduled_events
     ]
     assert result == {"reservationId": "reservation-1"}
-    reserve_scheduled.assert_called_once_with("scope-key", "model.fmu", payload_sizes)
+    reserve_scheduled.assert_called_once_with(
+        "scope-key",
+        "model.fmu",
+        payload_sizes,
+        maximum_window_count=None,
+        window_seconds=main.config.INPUT_UPDATE_WINDOW_SECONDS,
+    )
 
     reserve.side_effect = None
     with pytest.raises(HTTPException) as invalid:

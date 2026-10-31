@@ -78,7 +78,11 @@ def test_fmi3_event_mode_enters_step_mode_after_initialization(tmp_path: Path):
 
     model = _fmi3_model_description()
     model.coSimulation.hasEventMode = True
+    clock = _variable("heartbeat", 5, "Clock", "output")
+    model.modelVariables = [clock]
     fmu = MagicMock()
+    fmu.updateDiscreteStates.return_value = (False, False, False, False, False, 0.0)
+    fmu.getClock.return_value = [True]
 
     session = engine.FmuSession("fmi3-event-mode-test", tmp_path / "model.fmu")
     session._extract_dir = tmp_path
@@ -91,7 +95,11 @@ def test_fmi3_event_mode_enters_step_mode_after_initialization(tmp_path: Path):
         early_return_allowed=False, event_mode_used=True,
     )
     fmu.exitInitializationMode.assert_called_once_with()
+    fmu.updateDiscreteStates.assert_called_once_with()
     fmu.enterStepMode.assert_called_once_with()
+    assert session.get_outputs()["outputs"] == {"heartbeat": True}
+    calls = [call[0] for call in fmu.mock_calls]
+    assert calls.index("getClock") < calls.index("enterStepMode")
 
 
 def test_fmi_session_lifecycle_supports_pause_resume_and_reset(tmp_path: Path):

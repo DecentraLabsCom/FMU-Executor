@@ -41,6 +41,7 @@ def jobs(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "MAX_CONCURRENT_SESSIONS", 4)
     monkeypatch.setattr(config, "MAX_SIMULATION_STEPS", 1000)
     monkeypatch.setattr(config, "MAX_BATCH_CASES", 8)
+    monkeypatch.setattr(config, "MAX_SCENARIOS_PER_RESERVATION_PER_DAY", None)
     monkeypatch.setattr(fmu_storage, "describe", lambda _key: {
         "supportsCoSimulation": True, "defaultStepSize": 0.1,
     })

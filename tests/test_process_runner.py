@@ -263,6 +263,61 @@ def test_stream_yields_child_messages_until_done_and_cleans_up(monkeypatch, tmp_
     assert process.join_calls == []
 
 
+def test_stream_seals_checkpoint_with_a_restorable_time_and_sample(monkeypatch, tmp_path):
+    import base64
+
+    from app import fmu_state
+
+    digest = "a" * 64
+    context = {"claims": {"sub": "user", "labId": "lab", "reservationKey": "reservation"}}
+    output = FakeQueue({
+        "kind": "message",
+        "payload": {
+            "type": "sim.done",
+            "time": 0.02,
+            "finishReason": "stop_time_reached",
+            "checkpointTime": 0.01,
+            "checkpointOutputs": {"y": 2.5},
+            "checkpointSnapshot": {
+                "fmuSha256": digest,
+                "fmiVersion": "2.0",
+                "platform": "linux/x86_64",
+                "simulation": {"time": 0.01, "stepCount": 1, "initialParameters": {}},
+            },
+        },
+    })
+    process = FakeProcess()
+    worker_directory = install_stream_fakes(monkeypatch, tmp_path, output, process)
+    (worker_directory / "fmu-state-output.bin").write_bytes(b"serialized state")
+    state_dir = tmp_path / "state"
+    monkeypatch.setattr(process_runner.config, "STATE_DIR", state_dir)
+    monkeypatch.setattr(process_runner.config, "internal_token", lambda: "test-signing-secret")
+
+    events = list(process_runner.stream(
+        tmp_path / "demo.fmu",
+        access_key="demo.fmu",
+        parameters={},
+        options={},
+        fmu_sha256=digest,
+        gateway_context=context,
+        capture_fmu_state=True,
+    ))
+
+    completed = events[-1]
+    assert completed["time"] == 0.02
+    assert completed["checkpointTime"] == 0.01
+    assert completed["checkpointOutputs"] == {"y": 2.5}
+    restored = fmu_state.open_fmu_state_checkpoint(
+        completed["checkpoint"],
+        gateway_context=context,
+        signing_secret="test-signing-secret",
+        expected_fmu_sha256=digest,
+        state_dir=state_dir,
+    )
+    assert restored["simulation"]["time"] == 0.01
+    assert base64.b64decode(restored["serializedState"]) == b"serialized state"
+
+
 def test_stream_reports_child_error_without_exposing_extra_fields(monkeypatch, tmp_path):
     output = FakeQueue({"kind": "error", "code": "FMU_EXECUTION_FAILED", "message": "generic", "retryable": True, "secret": "hidden"})
     process = FakeProcess()
@@ -353,6 +408,80 @@ def test_execute_worker_streams_snapshots_and_completion(monkeypatch, tmp_path):
         {"kind": "message", "payload": {"type": "sim.outputs", "time": 0.5, "outputs": {}}},
         {"kind": "message", "payload": {"type": "sim.done", "time": 1.0, "finishReason": None}},
     ]
+
+
+@pytest.mark.parametrize(
+    ("stop_time", "step_times", "expected_checkpoint_time"),
+    [
+        (0.02, [0.01, 0.02], 0.01),
+        (0.01, [0.01], 0.0),
+    ],
+)
+def test_execute_worker_captures_a_resumable_state_before_the_final_step(
+    monkeypatch, tmp_path, stop_time, step_times, expected_checkpoint_time
+):
+    import base64
+
+    captured_times = []
+
+    class Session:
+        _time = 0.0
+        _finished_reason = None
+
+        def __init__(self, *_args, **_kwargs):
+            self.terminated = False
+
+        def load(self): return {}
+        def initialize(self, **_kwargs): pass
+        def get_outputs(self): return {"outputs": {"y": self._time}}
+        def capture_fmu_state(self):
+            captured_times.append(self._time)
+            return {
+                "fmuSha256": "a" * 64,
+                "fmiVersion": "2.0",
+                "platform": "linux/x86_64",
+                "simulation": {"time": self._time, "stepCount": round(self._time * 100), "initialParameters": {}},
+                "serializedState": base64.b64encode(str(self._time).encode()).decode("ascii"),
+            }
+        def run_until_streaming(self, _stop, step_size=None, input_schedule=None):
+            for time_value in step_times:
+                self._time = time_value
+                if self._time >= stop_time:
+                    self._finished_reason = "stop_time_reached"
+                yield {"type": "sim.step", "time": self._time, "outputs": {"y": self._time}}
+        def terminate(self): self.terminated = True
+
+    monkeypatch.setitem(sys.modules, "app.engine", SimpleNamespace(FmuSession=Session))
+    monkeypatch.setattr(process_runner, "apply_worker_limits", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        process_runner,
+        "resolve_simulation_time_options",
+        lambda _metadata, _options: {"startTime": 0.0, "stopTime": stop_time, "stepSize": 0.01},
+    )
+    output = FakeQueue()
+    state_path = tmp_path / "fmu-state-output.bin"
+
+    process_runner._execute_worker(
+        str(tmp_path / "demo.fmu"), "demo.fmu", {}, {"outputSampleEverySteps": 3}, output, True,
+        worker_directory=None,
+        fmu_sha256="a" * 64,
+        capture_fmu_state=True,
+        capture_state_output_path=str(state_path),
+    )
+
+    completed = output.items[-1]["payload"]
+    assert completed["type"] == "sim.done"
+    assert completed["checkpointSnapshot"]["simulation"]["time"] == expected_checkpoint_time
+    assert completed["checkpointTime"] == expected_checkpoint_time
+    assert completed["checkpointOutputs"] == {"y": expected_checkpoint_time}
+    assert captured_times[-1] == expected_checkpoint_time
+    assert state_path.read_bytes() == str(expected_checkpoint_time).encode()
+    if expected_checkpoint_time > 0:
+        assert any(
+            item["payload"].get("time") == expected_checkpoint_time
+            for item in output.items
+            if item.get("kind") == "message"
+        )
 
 
 def test_execute_worker_masks_native_error_details_and_terminates(monkeypatch, tmp_path):

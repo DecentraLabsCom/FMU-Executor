@@ -133,6 +133,7 @@ class FmuSession:
         self._playback_speed = 1.0
         self._early_return_allowed = False
         self._fmi3_event_mode_used = False
+        self._pending_event_outputs: dict[str, Any] | None = None
         self._finished_reason: str | None = None
         self._state: str = "new"
         self._initialised: bool = False
@@ -216,7 +217,29 @@ class FmuSession:
         if slave is None:
             raise RuntimeError("FMU instantiation returned no slave")
         self._slave = slave
+        structural_variables = [
+            variable for variable in self._md.modelVariables
+            if self._fmi_major() == "3"
+            and getattr(variable, "causality", None) == "structuralParameter"
+        ]
+        structural_parameters = {
+            name: value
+            for name, value in validated_parameters.items()
+            if any(variable.name == name for variable in structural_variables)
+        }
+        dimension_values = {
+            int(variable.valueReference): int(structural_parameters[variable.name])
+            for variable in structural_variables
+            if variable.name in structural_parameters
+        }
+        self._pending_event_outputs = None
         if self._fmi_major() == "3":
+            if structural_variables:
+                slave.enterConfigurationMode()
+                if structural_parameters:
+                    self._apply_validated_values(structural_parameters)
+                self._apply_structural_array_shapes(dimension_values)
+                slave.exitConfigurationMode()
             slave.enterInitializationMode(
                 startTime=self._start_time,
                 stopTime=self._stop_time,
@@ -228,14 +251,29 @@ class FmuSession:
             )
             slave.enterInitializationMode()
 
-        if validated_parameters:
-            self._apply_validated_values(validated_parameters)
+        remaining_parameters = {
+            name: value for name, value in validated_parameters.items()
+            if name not in structural_parameters
+        }
+        if remaining_parameters:
+            self._apply_validated_values(remaining_parameters)
 
         slave.exitInitializationMode()
         if self._fmi_major() == "3" and self._fmi3_event_mode_used:
             # FMI 3 Co-Simulation enters Event Mode when Event Mode is enabled.
-            # Transition into Step Mode before the first fmi3DoStep call.
-            slave.enterStepMode()
+            # Perform the initial discrete-state iteration before Step Mode.
+            if self._resolve_fmi3_event(slave, enter_event_mode=False):
+                self._finished_reason = "fmu_terminated"
+                self._state = "stopped"
+                self._initialised = True
+                self._terminated = False
+                return {
+                    "sessionId": self.session_id,
+                    "time": self._time,
+                    "state": self._state,
+                    "timeMode": self._time_mode,
+                    "playbackSpeed": self._playback_speed,
+                }
         self._initialised = True
         self._terminated = False
         self._state = "initialized"
@@ -1042,14 +1080,20 @@ class FmuSession:
             "terminateSimulation": bool(terminate_simulation),
         }
 
-    @staticmethod
-    def _handle_fmi3_event(slave: Any) -> bool:
-        slave.enterEventMode()
+    def _handle_fmi3_event(self, slave: Any) -> bool:
+        return self._resolve_fmi3_event(slave, enter_event_mode=True)
+
+    def _resolve_fmi3_event(self, slave: Any, *, enter_event_mode: bool) -> bool:
+        if enter_event_mode:
+            slave.enterEventMode()
         for _ in range(1000):
             needs_update, terminate, *_ = slave.updateDiscreteStates()
             if terminate:
                 return True
             if not needs_update:
+                # Triggered output Clocks are only observable in Event Mode.
+                # Preserve this snapshot before entering Step Mode.
+                self._pending_event_outputs = self._read_outputs()
                 slave.enterStepMode()
                 return False
         raise RuntimeError("FMI_EVENT_ITERATION_LIMIT_EXCEEDED")
@@ -1092,12 +1136,24 @@ class FmuSession:
             raise RuntimeError("FMU model description is not loaded")
         var_map = {v.name: v for v in self._md.modelVariables}
         normalized: dict[str, Any] = {}
+        dimension_values: dict[int, int] = {}
+        if phase == "initialization" and self._fmi_major() == "3":
+            for name, value in params.items():
+                var = var_map.get(name)
+                if var is None or getattr(var, "causality", None) != "structuralParameter":
+                    continue
+                self._validate_write_access(var, phase=phase)
+                values = self._coerce_values(var, value)
+                normalized[name] = values if self._is_array(var) else values[0]
+                dimension_values[int(var.valueReference)] = int(values[0])
         for name, value in params.items():
+            if name in normalized:
+                continue
             var = var_map.get(name)
             if var is None:
                 raise ValueError(f"Unknown FMU variable '{name}'")
             self._validate_write_access(var, phase=phase)
-            values = self._coerce_values(var, value)
+            values = self._coerce_values(var, value, dimension_values=dimension_values)
             normalized[name] = values if self._is_array(var) else values[0]
         return normalized
 
@@ -1108,6 +1164,12 @@ class FmuSession:
             allowed = (
                 causality == "input"
                 or (causality == "parameter" and variability != "constant")
+                or (
+                    self._fmi_major() == "3"
+                    and causality == "structuralParameter"
+                    and variability == "fixed"
+                    and str(getattr(var, "type", "")) == "UInt64"
+                )
             )
         elif phase == "runtime":
             allowed = causality == "input" or (
@@ -1146,10 +1208,19 @@ class FmuSession:
             unknown_refs = set(int(ref) for ref in refs) - output_refs
             if unknown_refs:
                 raise ValueError("Requested value reference is unknown or is not an output")
+        pending_event_outputs = self._pending_event_outputs
+        remaining_event_outputs = (
+            dict(pending_event_outputs) if pending_event_outputs is not None else None
+        )
         for var in self._md.modelVariables:
             if var.causality != "output":
                 continue
             if refs is not None and var.valueReference not in refs:
+                continue
+            if pending_event_outputs is not None and var.name in pending_event_outputs:
+                outputs[var.name] = pending_event_outputs[var.name]
+                if remaining_event_outputs is not None:
+                    remaining_event_outputs.pop(var.name, None)
                 continue
             vr = [int(var.valueReference)]
             vtype = self._variable_type(var)
@@ -1164,6 +1235,7 @@ class FmuSession:
                 raise RuntimeError(f"Could not read FMU output '{var.name}'") from exc
             normalised = [self._normalise_output(vtype, value) for value in list(values)]
             outputs[var.name] = normalised if self._is_array(var) else normalised[0]
+        self._pending_event_outputs = remaining_event_outputs or None
         return outputs
 
     @staticmethod
@@ -1177,8 +1249,53 @@ class FmuSession:
             return "Int64"
         return self._normalise_type(var)
 
-    @staticmethod
-    def _variable_size(var: Any) -> int:
+    def _variable_size(self, var: Any, dimension_values: dict[int, int] | None = None) -> int:
+        shape = getattr(var, "shape", None)
+        if dimension_values is None and isinstance(shape, (list, tuple)) and shape:
+            extents = []
+            for extent in shape:
+                try:
+                    normalised_extent = int(extent)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise ValueError(f"FMU array '{getattr(var, 'name', '')}' has an unresolved dimension") from exc
+                if normalised_extent <= 0 or normalised_extent != extent:
+                    raise ValueError(f"FMU array '{getattr(var, 'name', '')}' has an invalid dimension")
+                extents.append(normalised_extent)
+            return int(reduce(mul, extents, 1))
+
+        dimensions = getattr(var, "dimensions", None)
+        if isinstance(dimensions, (list, tuple)) and dimensions:
+            extents: list[int] = []
+            for dimension in dimensions:
+                value_reference = getattr(dimension, "valueReference", None)
+                extent: Any = None
+                if value_reference is not None:
+                    if dimension_values is not None:
+                        extent = dimension_values.get(int(value_reference))
+                    if extent is None and self._md is not None:
+                        referenced_variable = next(
+                            (
+                                item for item in self._md.modelVariables
+                                if int(item.valueReference) == int(value_reference)
+                            ),
+                            None,
+                        )
+                        extent = getattr(referenced_variable, "start", None)
+                if extent is None:
+                    extent = getattr(dimension, "start", None)
+                if extent is None:
+                    referenced_variable = getattr(dimension, "variable", None)
+                    extent = getattr(referenced_variable, "start", None)
+                try:
+                    normalised_extent = int(extent)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise ValueError(
+                        f"FMU array '{getattr(var, 'name', '')}' has an unresolved dimension"
+                    ) from exc
+                if normalised_extent <= 0:
+                    raise ValueError(f"FMU array '{getattr(var, 'name', '')}' has an invalid dimension")
+                extents.append(normalised_extent)
+            return int(reduce(mul, extents, 1))
         shape = getattr(var, "shape", None)
         if isinstance(shape, (list, tuple)) and shape:
             extents = []
@@ -1191,18 +1308,39 @@ class FmuSession:
                     raise ValueError(f"FMU array '{getattr(var, 'name', '')}' has an invalid dimension")
                 extents.append(normalised_extent)
             return int(reduce(mul, extents, 1))
-        dimensions = getattr(var, "dimensions", None)
-        if isinstance(dimensions, (list, tuple)) and dimensions:
-            extents: list[int] = []
-            for dimension in dimensions:
-                start = getattr(dimension, "start", None)
-                if start is None:
-                    raise ValueError(f"FMU array '{getattr(var, 'name', '')}' has an unresolved dimension")
-                if int(start) <= 0:
-                    raise ValueError(f"FMU array '{getattr(var, 'name', '')}' has an invalid dimension")
-                extents.append(int(start))
-            return int(reduce(mul, extents, 1))
         return 1
+
+    def _apply_structural_array_shapes(self, dimension_values: dict[int, int]) -> None:
+        if self._md is None:
+            return
+        for variable in self._md.modelVariables:
+            dimensions = getattr(variable, "dimensions", None)
+            if not isinstance(dimensions, (list, tuple)) or not dimensions:
+                continue
+            if not any(getattr(dimension, "valueReference", None) is not None for dimension in dimensions):
+                continue
+            self._variable_size(variable, dimension_values=dimension_values)
+            resolved_shape: list[int] = []
+            for dimension in dimensions:
+                value_reference = getattr(dimension, "valueReference", None)
+                if value_reference is not None and int(value_reference) in dimension_values:
+                    extent = dimension_values[int(value_reference)]
+                elif value_reference is not None:
+                    referenced_variable = next(
+                        (
+                            item for item in self._md.modelVariables
+                            if int(item.valueReference) == int(value_reference)
+                        ),
+                        None,
+                    )
+                    extent = int(getattr(referenced_variable, "start"))
+                elif getattr(dimension, "start", None) is not None:
+                    extent = int(dimension.start)
+                else:
+                    referenced_variable = getattr(dimension, "variable", None)
+                    extent = int(getattr(referenced_variable, "start"))
+                resolved_shape.append(extent)
+            variable.shape = tuple(resolved_shape)
 
     @staticmethod
     def _is_array(var: Any) -> bool:
@@ -1212,9 +1350,15 @@ class FmuSession:
         dimensions = getattr(var, "dimensions", None)
         return isinstance(dimensions, (list, tuple)) and bool(dimensions)
 
-    def _coerce_values(self, var: Any, value: Any) -> list[Any]:
+    def _coerce_values(
+        self,
+        var: Any,
+        value: Any,
+        *,
+        dimension_values: dict[int, int] | None = None,
+    ) -> list[Any]:
         vtype = self._variable_type(var)
-        size = self._variable_size(var)
+        size = self._variable_size(var, dimension_values=dimension_values)
         is_array = self._is_array(var)
         if is_array and (not isinstance(value, (list, tuple)) or len(value) != size):
             raise ValueError(f"Array input '{var.name}' expects exactly {size} values")

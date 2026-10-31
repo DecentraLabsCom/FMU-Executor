@@ -24,7 +24,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Iterator
 from uuid import uuid4
 
-from . import config, engine
+from . import config, engine, fmu_state
 from .isolation import (
     WindowsWorkerJob,
     WorkerIsolationError,
@@ -960,6 +960,26 @@ def _execute_worker(
                 return values
             return {name: values[name] for name in requested_outputs}
 
+        def capture_checkpoint_state(
+            output_values: dict[str, Any] | None = None,
+        ) -> tuple[dict[str, Any], float, dict[str, Any]]:
+            snapshot = session.capture_fmu_state()
+            simulation = snapshot.get("simulation") if isinstance(snapshot, dict) else None
+            raw_time = simulation.get("time") if isinstance(simulation, dict) else None
+            if (
+                isinstance(raw_time, bool)
+                or not isinstance(raw_time, (int, float))
+                or not math.isfinite(raw_time)
+                or not isinstance(snapshot.get("serializedState"), str)
+            ):
+                raise RuntimeError("FMU state checkpoint is invalid")
+            if not isinstance(output_values, dict):
+                current_outputs = session.get_outputs().get("outputs")
+                if not isinstance(current_outputs, dict):
+                    raise RuntimeError("FMU outputs are unavailable for checkpoint")
+                output_values = current_outputs
+            return snapshot, float(raw_time), select_outputs(output_values)
+
         def result_too_large(payload: Any) -> bool:
             encoded_size = len(json.dumps(payload, separators=(",", ":"), allow_nan=False).encode("utf-8"))
             return encoded_size > result_size_limit
@@ -968,6 +988,15 @@ def _execute_worker(
             result_bytes = 0
             sample_every = max(1, int(options.get("outputSampleEverySteps", 1)))
             step_index = 0
+            checkpoint_path: Path | None = None
+            checkpoint_snapshot = None
+            checkpoint_time = None
+            checkpoint_outputs = None
+            if capture_fmu_state:
+                if not capture_state_output_path:
+                    raise RuntimeError("FMU state checkpoint output is unavailable")
+                checkpoint_path = Path(capture_state_output_path)
+                checkpoint_snapshot, checkpoint_time, checkpoint_outputs = capture_checkpoint_state()
             for snapshot in session.run_until_streaming(
                 stop,
                 step_size=step_value,
@@ -975,7 +1004,19 @@ def _execute_worker(
             ):
                 step_index += 1
                 is_final = session._finished_reason is not None or snapshot["time"] >= stop
-                if step_index % sample_every != 0 and not is_final:
+                is_checkpoint_sample = False
+                if (
+                    capture_fmu_state
+                    and not is_final
+                    and fmu_state.is_checkpoint_before_final_step(
+                        snapshot["time"], stop, step_value
+                    )
+                ):
+                    checkpoint_snapshot, checkpoint_time, checkpoint_outputs = capture_checkpoint_state(
+                        snapshot.get("outputs")
+                    )
+                    is_checkpoint_sample = True
+                if step_index % sample_every != 0 and not is_final and not is_checkpoint_sample:
                     continue
                 snapshot = {**snapshot, "outputs": select_outputs(snapshot["outputs"])}
                 result_bytes += len(json.dumps(snapshot, separators=(",", ":"), allow_nan=False).encode("utf-8"))
@@ -989,20 +1030,26 @@ def _execute_worker(
                 "finishReason": session._finished_reason,
             }
             if capture_fmu_state:
-                if not capture_state_output_path:
-                    raise RuntimeError("FMU state checkpoint output is unavailable")
-                from . import fmu_state
-
-                checkpoint = session.capture_fmu_state()
-                serialized_state = base64.b64decode(checkpoint.pop("serializedState"), validate=True)
+                if not isinstance(checkpoint_snapshot, dict) or not isinstance(checkpoint_outputs, dict):
+                    raise RuntimeError("FMU state checkpoint could not be captured")
+                encoded_state = checkpoint_snapshot.pop("serializedState", None)
+                if not isinstance(encoded_state, str):
+                    raise RuntimeError("FMU state checkpoint is invalid")
+                serialized_state = base64.b64decode(encoded_state, validate=True)
                 if len(serialized_state) > fmu_state.MAX_FMU_STATE_BYTES:
                     raise ValueError("FMU state checkpoint exceeds the size limit")
-                checkpoint_path = Path(capture_state_output_path)
+                if result_too_large({"checkpointOutputs": checkpoint_outputs}):
+                    output_queue.put({"kind": "error", "code": "RESULT_SIZE_LIMIT_EXCEEDED"})
+                    return
+                if checkpoint_path is None:
+                    raise RuntimeError("FMU state checkpoint output is unavailable")
                 with checkpoint_path.open("xb") as checkpoint_file:
                     checkpoint_file.write(serialized_state)
                 if os.name != "nt":
                     checkpoint_path.chmod(0o600)
-                completed["checkpointSnapshot"] = checkpoint
+                completed["checkpointSnapshot"] = checkpoint_snapshot
+                completed["checkpointTime"] = checkpoint_time
+                completed["checkpointOutputs"] = checkpoint_outputs
             output_queue.put({"kind": "message", "payload": completed})
         elif capture_series:
             initial = session.get_outputs()
@@ -1381,11 +1428,27 @@ def stream(
                 payload = message.get("payload")
                 if isinstance(payload, dict):
                     if payload.get("type") == "sim.done" and capture_fmu_state:
-                        from . import fmu_state
-
                         checkpoint_metadata = payload.pop("checkpointSnapshot", None)
+                        checkpoint_outputs = payload.get("checkpointOutputs")
                         checkpoint_path = worker_directory / "fmu-state-output.bin"
-                        if not isinstance(checkpoint_metadata, dict) or not checkpoint_path.is_file():
+                        checkpoint_simulation = (
+                            checkpoint_metadata.get("simulation")
+                            if isinstance(checkpoint_metadata, dict)
+                            else None
+                        )
+                        checkpoint_time = (
+                            checkpoint_simulation.get("time")
+                            if isinstance(checkpoint_simulation, dict)
+                            else None
+                        )
+                        if (
+                            not isinstance(checkpoint_metadata, dict)
+                            or isinstance(checkpoint_time, bool)
+                            or not isinstance(checkpoint_time, (int, float))
+                            or not math.isfinite(checkpoint_time)
+                            or not isinstance(checkpoint_outputs, dict)
+                            or not checkpoint_path.is_file()
+                        ):
                             yield {
                                 "type": "error",
                                 "code": "FMU_STATE_CAPTURE_FAILED",
@@ -1404,6 +1467,7 @@ def stream(
                                 signing_secret=config.internal_token(),
                                 state_dir=config.STATE_DIR,
                             )
+                            payload["checkpointTime"] = float(checkpoint_time)
                         except (OSError, ValueError) as exc:
                             logger.warning("FMU state checkpoint could not be stored: %s", type(exc).__name__)
                             yield {

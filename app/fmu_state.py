@@ -6,6 +6,7 @@ import base64
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import time
@@ -22,6 +23,17 @@ _MAX_CHECKPOINTS_TOTAL = 512
 _MAX_STORED_FMU_STATE_BYTES = 1024 * 1024 * 1024
 _CHECKPOINT_ID_RE = re.compile(r"^[a-f0-9]{32}$")
 _SCOPE_CLAIMS = ("sub", "labId", "reservationKey", "pucHash", "targetGatewayId")
+
+
+def is_checkpoint_before_final_step(current_time: Any, stop_time: Any, step_size: Any) -> bool:
+    values = (current_time, stop_time, step_size)
+    if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in values):
+        return False
+    if not all(math.isfinite(value) for value in values) or step_size <= 0:
+        return False
+    tolerance = max(1e-12, abs(stop_time) * 1e-12)
+    remaining = stop_time - current_time
+    return remaining > tolerance and remaining <= step_size + tolerance
 
 
 def _canonical_json(value: Any) -> bytes:

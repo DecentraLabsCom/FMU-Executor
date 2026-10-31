@@ -197,6 +197,53 @@ def test_fmi2_discard_and_fmi3_event_mode_are_handled(tmp_path, monkeypatch):
     slave.enterStepMode.assert_called_once_with()
 
 
+def test_fmi3_triggered_clock_is_captured_before_step_mode(tmp_path):
+    session = make_live_session(tmp_path, version="3.0")
+    clock = SimpleNamespace(
+        name="heartbeat", type="Clock", causality="output", valueReference=2,
+        shape=None, dimensions=[],
+    )
+    session._md.modelVariables = [clock]
+    session._fmi3_event_mode_used = True
+    slave = cast(Any, session._slave)
+    slave.doStep.return_value = (True, False, False, 0.1)
+    slave.updateDiscreteStates.return_value = (False, False, False, False, False, 0.0)
+    slave.getClock.side_effect = ([True], [False])
+
+    reached, flags = session._do_step(slave, 0.1)
+
+    assert reached == 0.1 and flags["eventOccurred"] is True
+    assert session._read_outputs() == {"heartbeat": True}
+    assert session._read_outputs() == {"heartbeat": False}
+    calls = [call[0] for call in slave.mock_calls]
+    assert calls.index("getClock") < calls.index("enterStepMode")
+
+
+def test_fmi3_fixed_structural_parameter_controls_initial_array_size(tmp_path):
+    session = make_live_session(tmp_path, version="3.0")
+    structural_size = SimpleNamespace(
+        name="n", type="UInt64", causality="structuralParameter", variability="fixed",
+        valueReference=7, min="1", max=None, start="2", declaredType=None, shape=None, dimensions=[],
+    )
+    input_array = SimpleNamespace(
+        name="u", type="Float64", causality="input", variability="continuous",
+        valueReference=8, min=None, max=None, declaredType=None, shape=(2,),
+        dimensions=[SimpleNamespace(start=None, valueReference=7, variable=structural_size)],
+    )
+    session._md.modelVariables = [structural_size, input_array]
+    session._initialised = False
+
+    assert session.validate_initial_values({"n": 3, "u": [1.0, 2.0, 3.0]}) == {
+        "n": 3,
+        "u": [1.0, 2.0, 3.0],
+    }
+    session._apply_structural_array_shapes({7: 3})
+    assert input_array.shape == (3,)
+    assert session._variable_size(input_array) == 3
+    with pytest.raises(ValueError, match="expects exactly 3 values"):
+        session.validate_initial_values({"n": 3, "u": [1.0, 2.0]})
+
+
 def test_value_validation_and_output_reads_cover_fmi_types(tmp_path):
     session = make_live_session(tmp_path, version="3.0")
     integer = SimpleNamespace(

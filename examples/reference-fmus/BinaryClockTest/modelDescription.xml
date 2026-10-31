@@ -10,13 +10,14 @@
   <CoSimulation
       modelIdentifier="BinaryClockTest"
       canHandleVariableCommunicationStepSize="true"
+      hasEventMode="true"
       canGetAndSetFMUState="false"
       canSerializeFMUState="false"/>
 
   <ModelVariables>
     <!-- Independent variable: simulation time -->
     <Float64 name="time"
-             valueReference="4"
+             valueReference="5"
              causality="independent"
              variability="continuous"/>
 
@@ -39,7 +40,7 @@
            valueReference="2"
            causality="output"
            variability="discrete"
-           intervalVariability="constant"/>
+           intervalVariability="triggered"/>
 
     <!-- Float64 output: step counter -->
     <Float64 name="stepCount"
@@ -48,12 +49,35 @@
              variability="discrete"
              initial="exact"
              start="0"/>
+
+    <!-- Fixed structural parameter resizes the following FMI 3 arrays. -->
+    <UInt64 name="sampleCount"
+            valueReference="4"
+            causality="structuralParameter"
+            variability="fixed"
+            start="2"/>
+
+    <Float64 name="samplesIn"
+             valueReference="6"
+             causality="input"
+             variability="continuous"
+             start="1 2">
+      <Dimension valueReference="4"/>
+    </Float64>
+
+    <Float64 name="samplesOut"
+             valueReference="7"
+             causality="output"
+             variability="continuous">
+      <Dimension valueReference="4"/>
+    </Float64>
   </ModelVariables>
 
   <ModelStructure>
     <Output valueReference="1"/>
     <Output valueReference="2"/>
     <Output valueReference="3"/>
+    <Output valueReference="7"/>
   </ModelStructure>
 
 </fmiModelDescription>

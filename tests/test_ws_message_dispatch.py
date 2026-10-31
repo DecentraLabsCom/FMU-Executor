@@ -78,8 +78,20 @@ def test_live_session_commands_cover_state_model_and_data_operations(dispatch, m
     response = call({"type": "model.describe"})
     assert response["type"] == "model.description" and response["modelName"] == "demo"
 
-    stopped = call({"type": "sim.initialize", "options": {"startTime": 2, "stopTime": 4, "stepSize": 0.25}, "parameters": {"x": 3}}, stop_runner=lambda: asyncio.sleep(0))
-    assert stopped["state"] == "initialized" and session.initialized_with == (2.0, 4.0, 0.25, {"x": 3})
+    stopped = call({
+        "type": "sim.initialize",
+        "options": {
+            "startTime": 2,
+            "stopTime": 4,
+            "stepSize": 0.25,
+            "inputs": {"command": [1.0, 2.0]},
+        },
+        "parameters": {"sampleCount": 2},
+    }, stop_runner=lambda: asyncio.sleep(0))
+    assert stopped["state"] == "initialized"
+    assert session.initialized_with == (
+        2.0, 4.0, 0.25, {"sampleCount": 2, "command": [1.0, 2.0]},
+    )
     started = call({"type": "sim.start"}, start_runner=lambda: None)
     assert started["state"] == "running"
     assert call({"type": "sim.pause"}, stop_runner=lambda: asyncio.sleep(0))["state"] == "paused"

@@ -365,7 +365,7 @@ class SimulationJobManager:
                     for scenario in scenarios
                 ]
                 maximum_scenarios = policy["maxDailyScenarios"]
-                if type(maximum_scenarios) is not int:
+                if maximum_scenarios is not None and type(maximum_scenarios) is not int:
                     raise HTTPException(status_code=403, detail="INVALID_FMU_EXECUTION_POLICY")
                 self.store.create_job(
                     job_id=job_id,

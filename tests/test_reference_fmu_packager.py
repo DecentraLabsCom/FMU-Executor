@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib.util
+import os
+import stat
 import zipfile
 from pathlib import Path
 
@@ -54,6 +56,9 @@ def test_packager_normalizes_existing_fmu_member_paths(tmp_path: Path, monkeypat
     monkeypatch.setattr(packager, "FMU_PATH", archive_path)
     monkeypatch.setattr(packager, "MODEL_DESCRIPTION", model_description)
     packager.package("linux", linux_binary)
+
+    if os.name == "posix":
+        assert stat.S_IMODE(archive_path.stat().st_mode) & 0o444 == 0o444
 
     with zipfile.ZipFile(archive_path) as archive:
         names = set(archive.namelist())

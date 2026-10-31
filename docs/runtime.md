@@ -18,7 +18,7 @@ or FMI 3 Co-Simulation implementation described by the FMU.
 | FMI 2 Co-Simulation | Supported | Realtime, one-shot and streaming execution. |
 | FMI 3 Co-Simulation | Supported | Realtime, one-shot and streaming execution, including event handling supported by the FMU/runtime. |
 | Scalar Real/Float32/Float64, integer, Boolean and String | Supported | Inputs and outputs exposed by the runtime. |
-| FMI 3 fixed-size arrays | Supported | Resolved by FMPy. |
+| FMI 3 arrays | Supported | Fixed dimensions and arrays sized by fixed `UInt64` structural parameters set in Configuration Mode. |
 | FMI 3 Binary and Clock | Supported | Where the FMU runtime exposes the corresponding API; Binary uses base64 in JSON. |
 | FMI 3 `Int64` and `UInt64` | Supported | Serialized as strings in JSON to avoid JavaScript precision loss. |
 | FMI 2/FMI 3 Model Exchange | Not executable | The Station execution contract is limited to Co-Simulation. |
@@ -68,9 +68,11 @@ public caller may read or write.
 
 At initialization, values are validated against declared variable names,
 causality, types, ranges and array lengths. Initial values can be supplied for
-FMU inputs and non-constant parameters. In a realtime session the preferred
-location is `sim.initialize.options.inputs`; the top-level `parameters` field
-is also accepted for compatibility with the internal request contract.
+FMU inputs and non-constant parameters. FMI 3 Co-Simulation fixed `UInt64`
+structural parameters are applied in Configuration Mode before Initialization
+Mode, and their values determine dependent array lengths. In a realtime session
+the preferred location is `sim.initialize.options.inputs`; the top-level
+`parameters` field carries parameters and structural parameters.
 
 During execution, writes are allowed to declared `input` variables. FMI 2 and
 FMI 3 Co-Simulation also allow runtime writes to variables declared with
@@ -105,7 +107,9 @@ greater than the start time and a positive step size. The configured maximum
 step budget still applies.
 
 FMI 3 Event Mode is negotiated with the FMU and handled inside the isolated
-Executor before returning a step. Step responses include the last successful
+Executor, including the initial discrete-state iteration after initialization,
+before returning a step. Triggered Clock outputs are captured during Event
+Mode. Step responses include the last successful
 simulation time, early-return and termination flags, and whether an event
 occurred. `sim.advance` returns a bounded set of intermediate samples in one
 request; see the [WebSocket API reference](api.md#realtime-websocket-protocol).

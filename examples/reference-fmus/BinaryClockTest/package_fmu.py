@@ -56,6 +56,9 @@ def package(platform: str, binary: Path) -> None:
             required = {"modelDescription.xml", binary_entry}
             if not required.issubset(names):
                 raise OSError("The packaged FMU is missing its model description or platform binary.")
+        # mkstemp creates mode 0600 on POSIX. Keep a packaged FMU readable by
+        # the non-root Executor when the archive is written to shared storage.
+        os.chmod(temporary_path, 0o644)
         os.replace(temporary_path, FMU_PATH)
     finally:
         temporary_path.unlink(missing_ok=True)

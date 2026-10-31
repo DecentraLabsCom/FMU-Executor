@@ -50,6 +50,7 @@ typedef void (*fmi3IntermediateUpdateCallback)(fmi3InstanceEnvironment, fmi3Floa
 
 #define HEARTBEAT_PERIOD 10
 #define MAX_BIN_SIZE     4096
+#define MAX_ARRAY_SIZE   256
 
 typedef struct {
     /* Binary input  vr=0 */
@@ -65,9 +66,18 @@ typedef struct {
 
     /* Float64 output vr=3 */
     double   step_count;
+    double   current_time;
+
+    /* Fixed structural array size and FMI 3 array variables. */
+    uint64_t sample_count;
+    double   samples_in[MAX_ARRAY_SIZE];
+    double   samples_out[MAX_ARRAY_SIZE];
+    int      configuration_mode;
 
     /* Internal */
     int      step_counter;
+    int      event_mode_used;
+    int      in_event_mode;
 } ModelInstance;
 
 /* ------------------------------------------------------------------ */
@@ -81,10 +91,13 @@ static void update_outputs(ModelInstance* m) {
         memcpy(m->data_out + 1, m->data_in, m->data_in_size);
     m->data_out_size = 1 + m->data_in_size;
 
-    /* heartbeat ticks every HEARTBEAT_PERIOD steps */
-    m->heartbeat = (m->step_counter % HEARTBEAT_PERIOD == 0) ? fmi3True : fmi3False;
+    /* Triggered output clocks are inactive outside their event tick. */
+    m->heartbeat = (m->step_counter > 0 && m->step_counter % HEARTBEAT_PERIOD == 0)
+        ? fmi3True : fmi3False;
 
     m->step_count = (double)m->step_counter;
+    for (uint64_t i = 0; i < m->sample_count; ++i)
+        m->samples_out[i] = 2.0 * m->samples_in[i];
 }
 
 /* ------------------------------------------------------------------ */
@@ -115,13 +128,17 @@ EXPORT fmi3Instance fmi3InstantiateCoSimulation(
     fmi3IntermediateUpdateCallback intermediateUpdate)
 {
     (void)instanceName; (void)instantiationToken; (void)resourcePath;
-    (void)visible; (void)loggingOn; (void)eventModeUsed;
+    (void)visible; (void)loggingOn;
     (void)earlyReturnAllowed; (void)requiredIntermediateVariables;
     (void)nRequiredIntermediateVariables; (void)instanceEnvironment;
     (void)logMessage; (void)intermediateUpdate;
 
     ModelInstance* m = (ModelInstance*)calloc(1, sizeof(ModelInstance));
     if (!m) return NULL;
+    m->event_mode_used = eventModeUsed != fmi3False;
+    m->sample_count = 2;
+    m->samples_in[0] = 1.0;
+    m->samples_in[1] = 2.0;
 
     /* Default dataIn: 3 bytes {0x01, 0x02, 0x03} matching modelDescription start */
     m->data_in[0] = 0x01; m->data_in[1] = 0x02; m->data_in[2] = 0x03;
@@ -148,17 +165,33 @@ EXPORT fmi3Status fmi3EnterInitializationMode(
     fmi3Instance inst, fmi3Boolean tolDef, fmi3Float64 tol,
     fmi3Float64 startTime, fmi3Boolean stopDef, fmi3Float64 stopTime)
 {
-    (void)inst;(void)tolDef;(void)tol;(void)startTime;(void)stopDef;(void)stopTime;
+    ModelInstance* m = (ModelInstance*)inst;
+    (void)tolDef;(void)tol;(void)startTime;(void)stopDef;(void)stopTime;
+    if (!m || m->configuration_mode) return fmi3Error;
+    m->current_time = startTime;
     return fmi3OK;
 }
 
 EXPORT fmi3Status fmi3ExitInitializationMode(fmi3Instance inst) {
-    (void)inst;
+    ModelInstance* m = (ModelInstance*)inst;
+    if (!m || m->configuration_mode) return fmi3Error;
+    /* FMI 3 Co-Simulation enters Event Mode after initialization when requested. */
+    m->in_event_mode = m->event_mode_used ? 1 : 0;
+    update_outputs(m);
     return fmi3OK;
 }
 
 EXPORT fmi3Status fmi3EnterEventMode(fmi3Instance inst) {
-    (void)inst;
+    ModelInstance* m = (ModelInstance*)inst;
+    if (!m || !m->event_mode_used) return fmi3Error;
+    m->in_event_mode = 1;
+    return fmi3OK;
+}
+
+EXPORT fmi3Status fmi3EnterStepMode(fmi3Instance inst) {
+    ModelInstance* m = (ModelInstance*)inst;
+    if (!m || !m->event_mode_used || !m->in_event_mode) return fmi3Error;
+    m->in_event_mode = 0;
     return fmi3OK;
 }
 
@@ -170,9 +203,14 @@ EXPORT fmi3Status fmi3Terminate(fmi3Instance inst) {
 EXPORT fmi3Status fmi3Reset(fmi3Instance inst) {
     ModelInstance* m = (ModelInstance*)inst;
     if (!m) return fmi3Error;
+    const int event_mode_used = m->event_mode_used;
     memset(m, 0, sizeof(ModelInstance));
+    m->event_mode_used = event_mode_used;
     m->data_in[0] = 0x01; m->data_in[1] = 0x02; m->data_in[2] = 0x03;
     m->data_in_size = 3;
+    m->sample_count = 2;
+    m->samples_in[0] = 1.0;
+    m->samples_in[1] = 2.0;
     update_outputs(m);
     return fmi3OK;
 }
@@ -199,9 +237,12 @@ EXPORT fmi3Status fmi3DoStep(
     (void)noSetFMUStatePriorToCurrentPoint;
 
     m->step_counter++;
+    m->current_time = currentCommunicationPoint + communicationStepSize;
     update_outputs(m);
 
-    if (eventHandlingNeeded) *eventHandlingNeeded = fmi3False;
+    if (eventHandlingNeeded) {
+        *eventHandlingNeeded = m->event_mode_used && m->heartbeat ? fmi3True : fmi3False;
+    }
     if (terminateSimulation)  *terminateSimulation  = fmi3False;
     if (earlyReturn)          *earlyReturn          = fmi3False;
     if (lastSuccessfulTime)   *lastSuccessfulTime   = currentCommunicationPoint + communicationStepSize;
@@ -222,6 +263,13 @@ EXPORT fmi3Status fmi3GetFloat64(
     (void)nv;
     for (size_t i = 0; i < nvr; i++) {
         if (vr[i] == 3) values[i] = m->step_count;
+        else if (vr[i] == 5) values[i] = m->current_time;
+        else if (vr[i] == 7) {
+            if (nv != m->sample_count) return fmi3Error;
+            for (size_t element = 0; element < nv; ++element)
+                values[element] = m->samples_out[element];
+            return fmi3OK;
+        }
         else return fmi3Error;
     }
     return fmi3OK;
@@ -260,7 +308,10 @@ EXPORT fmi3Status fmi3GetClock(
     ModelInstance* m = (ModelInstance*)inst;
     if (!m) return fmi3Error;
     for (size_t i = 0; i < nvr; i++) {
-        if (vr[i] == 2) values[i] = m->heartbeat;
+        if (vr[i] == 2) {
+            values[i] = m->in_event_mode && m->heartbeat ? fmi3True : fmi3False;
+            if (values[i]) m->heartbeat = fmi3False;
+        }
         else return fmi3Error;
     }
     return fmi3OK;
@@ -275,8 +326,15 @@ EXPORT fmi3Status fmi3SetFloat64(
     const fmi3ValueReference vr[], size_t nvr,
     const fmi3Float64 values[], size_t nv)
 {
-    (void)inst;(void)vr;(void)nvr;(void)values;(void)nv;
-    return fmi3OK; /* no float inputs */
+    ModelInstance* m = (ModelInstance*)inst;
+    if (!m || !vr || !values) return fmi3Error;
+    for (size_t i = 0; i < nvr; ++i) {
+        if (vr[i] != 6 || nv != m->sample_count) return fmi3Error;
+        for (size_t element = 0; element < nv; ++element)
+            m->samples_in[element] = values[element];
+    }
+    update_outputs(m);
+    return fmi3OK;
 }
 
 EXPORT fmi3Status fmi3SetBinary(
@@ -331,7 +389,15 @@ EXPORT fmi3Status fmi3GetUInt32(fmi3Instance i, const fmi3ValueReference v[],
 EXPORT fmi3Status fmi3GetInt64(fmi3Instance i, const fmi3ValueReference v[],
     size_t n, int64_t val[], size_t nv) { (void)i;(void)v;(void)n;(void)val;(void)nv; return fmi3Error; }
 EXPORT fmi3Status fmi3GetUInt64(fmi3Instance i, const fmi3ValueReference v[],
-    size_t n, uint64_t val[], size_t nv) { (void)i;(void)v;(void)n;(void)val;(void)nv; return fmi3Error; }
+    size_t n, uint64_t val[], size_t nv) {
+    ModelInstance* m = (ModelInstance*)i;
+    if (!m || !v || !val || nv != n) return fmi3Error;
+    for (size_t index = 0; index < n; ++index) {
+        if (v[index] != 4) return fmi3Error;
+        val[index] = m->sample_count;
+    }
+    return fmi3OK;
+}
 EXPORT fmi3Status fmi3GetBoolean(fmi3Instance i, const fmi3ValueReference v[],
     size_t n, int val[], size_t nv) { (void)i;(void)v;(void)n;(void)val;(void)nv; return fmi3Error; }
 EXPORT fmi3Status fmi3GetString(fmi3Instance i, const fmi3ValueReference v[],
@@ -354,7 +420,16 @@ EXPORT fmi3Status fmi3SetUInt32(fmi3Instance i, const fmi3ValueReference v[],
 EXPORT fmi3Status fmi3SetInt64(fmi3Instance i, const fmi3ValueReference v[],
     size_t n, const int64_t val[], size_t nv) { (void)i;(void)v;(void)n;(void)val;(void)nv; return fmi3OK; }
 EXPORT fmi3Status fmi3SetUInt64(fmi3Instance i, const fmi3ValueReference v[],
-    size_t n, const uint64_t val[], size_t nv) { (void)i;(void)v;(void)n;(void)val;(void)nv; return fmi3OK; }
+    size_t n, const uint64_t val[], size_t nv) {
+    ModelInstance* m = (ModelInstance*)i;
+    if (!m || !v || !val || !m->configuration_mode || nv != n) return fmi3Error;
+    for (size_t index = 0; index < n; ++index) {
+        if (v[index] != 4 || val[index] == 0 || val[index] > MAX_ARRAY_SIZE) return fmi3Error;
+        m->sample_count = val[index];
+    }
+    update_outputs(m);
+    return fmi3OK;
+}
 EXPORT fmi3Status fmi3SetBoolean(fmi3Instance i, const fmi3ValueReference v[],
     size_t n, const int val[], size_t nv) { (void)i;(void)v;(void)n;(void)val;(void)nv; return fmi3OK; }
 EXPORT fmi3Status fmi3SetString(fmi3Instance i, const fmi3ValueReference v[],
@@ -404,12 +479,10 @@ EXPORT fmi3Status fmi3ActivateModelPartition(
     fmi3Instance i, fmi3ValueReference clockRef, fmi3Float64 activationTime)
     { (void)i;(void)clockRef;(void)activationTime; return fmi3Error; }
 
-EXPORT fmi3Status fmi3EnterStepMode(fmi3Instance i)
-    { (void)i; return fmi3OK; }
 EXPORT fmi3Status fmi3EnterConfigurationMode(fmi3Instance i)
-    { (void)i; return fmi3OK; }
+    { ModelInstance* m=(ModelInstance*)i; if(!m || m->configuration_mode) return fmi3Error; m->configuration_mode=1; return fmi3OK; }
 EXPORT fmi3Status fmi3ExitConfigurationMode(fmi3Instance i)
-    { (void)i; return fmi3OK; }
+    { ModelInstance* m=(ModelInstance*)i; if(!m || !m->configuration_mode) return fmi3Error; m->configuration_mode=0; update_outputs(m); return fmi3OK; }
 EXPORT fmi3Status fmi3EnterContinuousTimeMode(fmi3Instance i)
     { (void)i; return fmi3Error; }
 
@@ -452,14 +525,16 @@ EXPORT fmi3Status fmi3EvaluateDiscreteStates(fmi3Instance i)
 EXPORT fmi3Status fmi3UpdateDiscreteStates(
     fmi3Instance i, fmi3Boolean* discreteStatesNeedUpdate,
     fmi3Boolean* terminateSimulation, fmi3Boolean* nominalsChanged,
-    fmi3Boolean* valuesChanged, fmi3Float64* nextEventTime)
+    fmi3Boolean* valuesChanged, fmi3Boolean* nextEventTimeDefined,
+    fmi3Float64* nextEventTime)
 {
     (void)i;
     if (discreteStatesNeedUpdate) *discreteStatesNeedUpdate = fmi3False;
     if (terminateSimulation) *terminateSimulation = fmi3False;
     if (nominalsChanged) *nominalsChanged = fmi3False;
     if (valuesChanged) *valuesChanged = fmi3False;
-    if (nextEventTime) *nextEventTime = 1e30;
+    if (nextEventTimeDefined) *nextEventTimeDefined = fmi3False;
+    if (nextEventTime) *nextEventTime = 0.0;
     return fmi3OK;
 }
 
