@@ -173,7 +173,11 @@ def _validate_options(
         raise HTTPException(status_code=422, detail="INVALID_OUTPUT_SAMPLING")
     selected = options.get("outputVariables")
     if selected is not None:
-        if not isinstance(selected, list) or len(selected) > 128 or any(not isinstance(name, str) or not name or len(name) > 256 for name in selected):
+        if (
+            not isinstance(selected, list)
+            or len(selected) > 512
+            or any(not isinstance(name, str) or not name or len(name) > 256 for name in selected)
+        ):
             raise HTTPException(status_code=422, detail="INVALID_OUTPUT_SELECTION")
         if len(set(selected)) != len(selected):
             raise HTTPException(status_code=422, detail="INVALID_OUTPUT_SELECTION")
