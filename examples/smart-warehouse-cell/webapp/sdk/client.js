@@ -24,6 +24,38 @@ const VALID_ADVANCE_STOP_REASONS = new Set([
   'target_reached', 'max_samples', 'compute_budget', 'early_return', 'simulation_finished',
 ])
 
+function setNativeControlProperty(element, property, value) {
+  const setter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(element), property)?.set
+  if (setter) setter.call(element, value)
+  else element[property] = value
+}
+
+function applyModelValuesToNamedControls(modelValues) {
+  const document = globalThis.document
+  if (!isRecord(modelValues) || !document?.querySelectorAll) return
+  const window = document.defaultView
+  const controls = document.querySelectorAll('input[name], select[name], textarea[name]')
+  for (const control of controls) {
+    if (!Object.prototype.hasOwnProperty.call(modelValues, control.name)) continue
+    const value = modelValues[control.name]
+    const input = String(control.tagName).toLowerCase() === 'input' ? control : null
+    if (input?.type === 'checkbox') {
+      setNativeControlProperty(control, 'checked', Boolean(value))
+    } else if (input?.type === 'radio') {
+      setNativeControlProperty(control, 'checked', String(control.value) === String(value))
+    } else if (!input || !['button', 'file', 'image', 'reset', 'submit'].includes(input.type)) {
+      setNativeControlProperty(control, 'value', String(value))
+    } else {
+      continue
+    }
+    const Event = window?.Event || globalThis.Event
+    if (Event) {
+      control.dispatchEvent(new Event('input', { bubbles: true }))
+      control.dispatchEvent(new Event('change', { bubbles: true }))
+    }
+  }
+}
+
 function isValidRunInputSchedule(value) {
   return Array.isArray(value) && value.length <= MAX_RUN_INPUT_SCHEDULE_EVENTS
     && value.every((event) => isRecord(event)
@@ -91,7 +123,7 @@ const wait = (ms, signal) => new Promise((resolve, reject) => {
 export function createDigitalTwinAppClient({
   getConnection, onHostReady, onSample, onSamples, onReset, onSimulationState,
   onFmiLsParameterPreset, onFmiLsExperiment,
-  onFmuStateCheckpoint,
+  onFmuStateCheckpoint, onFmuStateLoaded,
   onBatchRendered,
   onResultsComplete, onPlaybackRate, onRunAccepted, onRunRejected, onRunCancelled, onError,
   defaultPlaybackRate, playbackControlPosition, runRequestTimeoutMs = 30_000,
@@ -108,6 +140,7 @@ export function createDigitalTwinAppClient({
   let selectedFmuStateCheckpoint = null
   let resumeFromFmuStateCheckpoint = false
   let captureFmuStateOnCompletion = false
+  let lastLoadedCheckpointId = null
   const grants = new Map()
   const capabilities = [DIGITAL_TWIN_CAPABILITY.EXECUTION_CONTROL]
   capabilities.push(DIGITAL_TWIN_CAPABILITY.FMI_LS_EXPERIMENTS)
@@ -176,6 +209,30 @@ export function createDigitalTwinAppClient({
       selectedFmuStateCheckpoint = message.checkpoint
       resumeFromFmuStateCheckpoint = message.resume
       captureFmuStateOnCompletion = message.captureOnCompletion
+      if (!message.resume) {
+        lastLoadedCheckpointId = null
+      } else if (message.checkpoint
+        && (message.checkpoint.sample || message.checkpoint.modelValues)
+        && message.checkpoint.checkpoint.checkpointId !== lastLoadedCheckpointId) {
+        lastLoadedCheckpointId = message.checkpoint.checkpoint.checkpointId
+        const modelValues = message.checkpoint.modelValues
+          ? { ...message.checkpoint.modelValues }
+          : undefined
+        applyModelValuesToNamedControls(modelValues)
+        if (message.checkpoint.sample) {
+          const sample = {
+            time: message.checkpoint.sample.time,
+            outputs: { ...message.checkpoint.sample.outputs },
+          }
+          try {
+            Promise.resolve(onFmuStateLoaded?.(sample, {
+              checkpointId: lastLoadedCheckpointId,
+              simTime: message.checkpoint.simTime,
+              ...(modelValues ? { modelValues } : {}),
+            })).catch(report)
+          } catch (error) { report(error) }
+        }
+      }
     } else if (message.type === MESSAGE.FMU_STATE_CAPTURE) {
       void captureState().catch(report)
     } else if (message.type === MESSAGE.EXECUTION_CANCEL && active?.runId === message.runId) cancel(message.runId)
@@ -217,6 +274,8 @@ export function createDigitalTwinAppClient({
     else for (const sample of samples) { context.signal.throwIfAborted(); await onSample?.(sample, context) }
     run.controller.signal.throwIfAborted()
     run.sampleCount += samples.length
+    const lastSample = samples.at(-1)
+    run.lastSample = { time: lastSample.time, outputs: { ...lastSample.outputs } }
     return batch
   }
   async function operation(run, type, expected, payload) {
@@ -238,7 +297,10 @@ export function createDigitalTwinAppClient({
           rateLimitWaitMs += performance.now() - throttleWaitStartedAt
         }
         const response = await run.session.request(type, expected, payload)
-        if (writesInputs) run.lastInputUpdateAt = performance.now()
+        if (writesInputs) {
+          run.lastInputUpdateAt = performance.now()
+          run.modelValues = { ...run.modelValues, ...payload.values }
+        }
         if (readsOutputs) {
           if (tracksAdaptiveResponse) {
             run.lastOutputMetrics = {
@@ -272,7 +334,22 @@ export function createDigitalTwinAppClient({
   async function captureState(run = active || completedRun) {
     if (!run?.session) throw errorWithCode('There is no active FMU session to capture.', 'RUN_UNAVAILABLE')
     try {
-      const bundle = await run.session.captureState()
+      const capturedBundle = await run.session.captureState()
+      const bundleWithDisplay = {
+        ...capturedBundle,
+        ...(run.lastSample ? { sample: run.lastSample } : {}),
+        ...(run.modelValues && Object.keys(run.modelValues).length ? { modelValues: run.modelValues } : {}),
+      }
+      const bundleWithValues = {
+        ...capturedBundle,
+        ...(run.modelValues && Object.keys(run.modelValues).length ? { modelValues: run.modelValues } : {}),
+      }
+      const bundleWithSample = run.lastSample ? { ...capturedBundle, sample: run.lastSample } : capturedBundle
+      const bundle = isValidFmuStateCheckpointBundle(bundleWithDisplay)
+        ? bundleWithDisplay
+        : isValidFmuStateCheckpointBundle(bundleWithValues)
+          ? bundleWithValues
+          : isValidFmuStateCheckpointBundle(bundleWithSample) ? bundleWithSample : capturedBundle
       notifyCheckpoint(bundle)
       if (run === completedRun) releaseCompletedRun()
       return bundle
@@ -437,6 +514,9 @@ export function createDigitalTwinAppClient({
           if (firstUnappliedEvent && firstUnappliedEvent.time < result.simTime - tolerance) {
             throw errorWithCode('The FMU advanced past a scheduled input that it did not apply.', 'INVALID_FMU_RESPONSE')
           }
+          for (const event of scheduleBatch.events.slice(0, appliedEvents)) {
+            run.modelValues = { ...run.modelValues, ...event.values }
+          }
           eventIndex += appliedEvents
         }
         run.lastSampleSequence = Number.isSafeInteger(previousSequence) ? previousSequence : null
@@ -565,6 +645,13 @@ export function createDigitalTwinAppClient({
       if (!isValidParameters(modelParameters)) throw errorWithCode('The FMU model produced invalid initialization parameters.', 'INVALID_INPUT')
       const runParameters = { ...modelParameters, ...parameters }
       if (!isValidParameters(runParameters)) throw errorWithCode('The FMU initialization parameters exceed the supported limits.', 'INVALID_INPUT')
+      const checkpointModelValues = {
+        ...runParameters,
+        ...(checkpointBundle?.modelValues || {}),
+      }
+      current.modelValues = isValidParameters(checkpointModelValues)
+        ? checkpointModelValues
+        : { ...(checkpointBundle?.modelValues || {}) }
       current.options = {
         startTime: options.startTime ?? model.defaultStartTime ?? 0,
         stopTime: options.stopTime ?? model.defaultStopTime ?? 1,

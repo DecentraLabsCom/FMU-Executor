@@ -1,4 +1,4 @@
-import { createProtocolId, isValidConnectionConfig, MAX_SAMPLE_BATCH_JSON_CHARS } from './index.js'
+import { createProtocolId, isValidConnectionConfig, isValidParameters, MAX_SAMPLE_BATCH_JSON_CHARS } from './index.js'
 import { getInputUpdateQuota, getInputUpdateRetryDelayMs } from './input-update-quota.js'
 import { omitParametersMatchingFmiStart } from './parameter-defaults.js'
 
@@ -19,9 +19,18 @@ export function isValidFmuStateCheckpoint(value) {
 
 export function isValidFmuStateCheckpointBundle(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)
-    || Object.keys(value).length !== 3 || !['version', 'simTime', 'checkpoint'].every((key) => key in value)
+    || Object.keys(value).some((key) => !['version', 'simTime', 'checkpoint', 'sample', 'modelValues'].includes(key))
+    || !['version', 'simTime', 'checkpoint'].every((key) => key in value)
     || value.version !== 1 || !Number.isFinite(value.simTime)
     || !isValidFmuStateCheckpoint(value.checkpoint)) return false
+  if (value.sample !== undefined && (!value.sample || typeof value.sample !== 'object' || Array.isArray(value.sample)
+    || Object.keys(value.sample).length !== 2 || !('time' in value.sample) || !('outputs' in value.sample)
+    || !Number.isFinite(value.sample.time) || !value.sample.outputs || typeof value.sample.outputs !== 'object'
+    || Array.isArray(value.sample.outputs)
+    || Object.keys(value.sample.outputs).length > 512
+    || Object.entries(value.sample.outputs).some(([name, item]) => !name || name.length > 256
+      || !(typeof item === 'boolean' || (typeof item === 'number' && Number.isFinite(item)))))) return false
+  if (value.modelValues !== undefined && !isValidParameters(value.modelValues)) return false
   try { return new TextEncoder().encode(JSON.stringify(value)).length <= 4096 } catch { return false }
 }
 

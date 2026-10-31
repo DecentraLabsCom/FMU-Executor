@@ -65,8 +65,14 @@ export function isValidFmuStateCheckpoint(v) {
     && typeof v.signature === 'string' && /^[a-f\d]{64}$/.test(v.signature)
 }
 export function isValidFmuStateCheckpointBundle(v) {
-  if (!isRecord(v) || !keys(v, ['version', 'simTime', 'checkpoint']) || v.version !== 1
+  if (!isRecord(v) || !keys(v, ['version', 'simTime', 'checkpoint', 'sample', 'modelValues']) || v.version !== 1
     || !Number.isFinite(v.simTime) || !isValidFmuStateCheckpoint(v.checkpoint)) return false
+  if (v.sample !== undefined && (!isRecord(v.sample) || !keys(v.sample, ['time', 'outputs'])
+    || !Number.isFinite(v.sample.time) || !isRecord(v.sample.outputs)
+    || Object.keys(v.sample.outputs).length > MAX_OUTPUTS_PER_SAMPLE
+    || !Object.entries(v.sample.outputs).every(([name, value]) => text(name, 256)
+      && (typeof value === 'boolean' || (typeof value === 'number' && Number.isFinite(value)))))) return false
+  if (v.modelValues !== undefined && !isValidParameters(v.modelValues)) return false
   try { return new TextEncoder().encode(JSON.stringify(v)).length <= 4096 } catch { return false }
 }
 export function isValidConnectionConfig(v) {

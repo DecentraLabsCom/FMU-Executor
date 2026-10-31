@@ -319,6 +319,32 @@ const twinClient = createDigitalTwinAppClient({
     }
     applySample({ time: Number.isFinite(sample.time) ? sample.time : null, outputs })
   },
+  onFmuStateLoaded(sample) {
+    if (!sample?.outputs || typeof sample.outputs !== 'object' || Array.isArray(sample.outputs)
+      || !Number.isFinite(sample.time)) return
+
+    const loadedSample = {
+      time: sample.time,
+      outputs: Object.fromEntries(Object.entries(sample.outputs).filter(([, value]) => (
+        typeof value === 'boolean' || (typeof value === 'number' && Number.isFinite(value))
+      ))),
+    }
+    setPlaybackPlaying(false)
+    playback.simulationRunning = false
+    playback.autoPlayPending = false
+    let sampleIndex = playback.samples.findIndex((entry) => Math.abs(entry.time - loadedSample.time) <= 1e-12)
+    if (sampleIndex >= 0) {
+      playback.samples[sampleIndex] = loadedSample
+    } else {
+      sampleIndex = playback.samples.findIndex((entry) => entry.time > loadedSample.time)
+      if (sampleIndex < 0) sampleIndex = playback.samples.length
+      playback.samples.splice(sampleIndex, 0, loadedSample)
+    }
+    playback.sampleIndex = sampleIndex
+    playback.modelTime = loadedSample.time
+    applySample(loadedSample)
+    updatePlaybackButton()
+  },
   onError(error) {
     console.error('Digital twin app bridge error.', error)
   },

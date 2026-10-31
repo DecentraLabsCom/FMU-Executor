@@ -73,6 +73,8 @@ def build(three_root: Path) -> None:
         raise ValueError("The sandboxed Smart Warehouse app must start simulations from a button click")
     if "simulationForm?.addEventListener('submit', requestSimulation)" in app_script:
         raise ValueError("The sandboxed Smart Warehouse app must not depend on form submission")
+    if "onFmuStateLoaded(sample)" not in app_script:
+        raise ValueError("The Smart Warehouse app must restore its scene from a loaded FMU state")
 
     vendor = WEBAPP_ROOT / "vendor"
     if vendor.exists():
