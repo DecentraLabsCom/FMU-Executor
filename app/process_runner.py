@@ -227,7 +227,7 @@ def _realtime_snapshot(session: Any, *, include_model: bool = True) -> dict[str,
         "state": session.state,
         "time": float(session._time),
         "startTime": float(session._start_time),
-        "stopTime": float(session._stop_time),
+        "stopTime": float(session._stop_time) if session._stop_time is not None else None,
         "stepSize": float(session._step_size),
         "timeMode": str(getattr(session, "_time_mode", "simtime")),
         "playbackSpeed": float(getattr(session, "_playback_speed", 1.0)),
@@ -387,7 +387,7 @@ class RealtimeSession:
         self._state = "new"
         self._time = 0.0
         self._start_time = 0.0
-        self._stop_time = 1.0
+        self._stop_time: float | None = None
         self._step_size = DEFAULT_STEP_SIZE
         self._time_mode = "simtime"
         self._playback_speed = 1.0
@@ -491,7 +491,8 @@ class RealtimeSession:
         self._state = str(snapshot.get("state", self._state))
         self._time = float(snapshot.get("time", self._time))
         self._start_time = float(snapshot.get("startTime", self._start_time))
-        self._stop_time = float(snapshot.get("stopTime", self._stop_time))
+        snapshot_stop_time = snapshot.get("stopTime", self._stop_time)
+        self._stop_time = float(snapshot_stop_time) if snapshot_stop_time is not None else None
         self._step_size = float(snapshot.get("stepSize", self._step_size))
         self._time_mode = str(snapshot.get("timeMode", self._time_mode))
         self._playback_speed = float(snapshot.get("playbackSpeed", self._playback_speed))

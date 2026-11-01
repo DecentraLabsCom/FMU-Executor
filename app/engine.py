@@ -63,12 +63,12 @@ def _ceil_step_count(expected_steps: float, current_time: float, target_time: fl
 def estimate_advance_samples(
     current_time: float,
     target_time: float,
-    stop_time: float,
+    stop_time: float | None,
     step_size: float,
     output_sample_every_steps: int,
 ) -> int:
     """Estimate output samples with the same time-boundary tolerance as the engine."""
-    effective_target = min(target_time, stop_time)
+    effective_target = min(target_time, stop_time) if stop_time is not None else target_time
     expected_steps = max(0.0, effective_target - current_time) / step_size
     if not math.isfinite(expected_steps):
         raise ValueError("targetTime and stepSize produce an invalid step count")
@@ -128,7 +128,7 @@ class FmuSession:
         self._time: float = 0.0
         self._step_size: float = 0.001
         self._start_time: float = 0.0
-        self._stop_time: float = 1.0
+        self._stop_time: float | None = None
         self._initial_parameters: dict[str, Any] = {}
         self._time_mode = "simtime"
         self._playback_speed = 1.0
@@ -167,7 +167,7 @@ class FmuSession:
     def initialize(
         self,
         start_time: float = 0.0,
-        stop_time: float = 1.0,
+        stop_time: float | None = None,
         step_size: float | None = None,
         parameters: dict[str, Any] | None = None,
         time_mode: str = "simtime",
@@ -187,15 +187,20 @@ class FmuSession:
             {"defaultStepSize": default_step_size},
         )["stepSize"]
         self._start_time = float(start_time)
-        self._stop_time = float(stop_time)
-        if not all(math.isfinite(value) for value in (self._start_time, self._stop_time, self._step_size)):
-            raise ValueError("startTime, stopTime and stepSize must be finite")
-        if self._stop_time <= self._start_time:
+        self._stop_time = None if stop_time is None else float(stop_time)
+        times_to_validate = (self._start_time, self._step_size)
+        if self._stop_time is not None:
+            times_to_validate += (self._stop_time,)
+        if not all(math.isfinite(value) for value in times_to_validate):
+            raise ValueError("startTime and stepSize must be finite; stopTime must be finite when provided")
+        if self._stop_time is not None and self._stop_time <= self._start_time:
             raise ValueError("stopTime must be greater than startTime")
-        if not math.isfinite(self._stop_time - self._start_time):
+        if self._stop_time is not None and not math.isfinite(self._stop_time - self._start_time):
             raise ValueError("Simulation duration must be finite")
         if self._step_size <= 0:
             raise ValueError("stepSize must be positive")
+        if self._stop_time is None:
+            self._max_simulation_steps = None
         if time_mode not in {"simtime", "realtime", "external"}:
             raise ValueError("timeMode must be simtime, realtime, or external")
         if not math.isfinite(playback_speed) or not 0.1 <= playback_speed <= 100.0:
@@ -299,11 +304,11 @@ class FmuSession:
         requested_time = self._time + requested_h
         if not math.isfinite(requested_time) or requested_time <= self._time:
             raise ValueError("stepSize does not produce a finite later time")
-        remaining = max(0.0, self._stop_time - self._time)
-        tolerance = max(1e-12, abs(self._stop_time) * 1e-12)
-        if self._time_mode == "external" and requested_h > remaining + tolerance:
+        remaining = max(0.0, self._stop_time - self._time) if self._stop_time is not None else requested_h
+        tolerance = max(1e-12, abs(self._stop_time) * 1e-12) if self._stop_time is not None else 1e-12
+        if self._time_mode == "external" and self._stop_time is not None and requested_h > remaining + tolerance:
             raise ValueError("stepSize would advance past stopTime")
-        h = min(requested_h, remaining)
+        h = min(requested_h, remaining) if self._stop_time is not None else requested_h
         if h <= 0.0:
             self._state = "stopped"
             self._finished_reason = self._finished_reason or "stop_time_reached"
@@ -319,7 +324,7 @@ class FmuSession:
         if result["terminateSimulation"]:
             self._state = "stopped"
             self._finished_reason = "fmu_termination_requested"
-        elif self._time >= self._stop_time - 1e-12:
+        elif self._stop_time is not None and self._time >= self._stop_time - 1e-12:
             self._state = "stopped"
             self._finished_reason = "stop_time_reached"
         else:
@@ -337,7 +342,8 @@ class FmuSession:
         if self._state in {"paused", "stopped", "error"}:
             raise RuntimeError(f"Session cannot run from state {self._state}")
         requested_target = target_time
-        target_time = min(target_time, self._stop_time)
+        if self._stop_time is not None:
+            target_time = min(target_time, self._stop_time)
         h = self._step_size if step_size is None else step_size
         if not math.isfinite(h) or h <= 0:
             raise ValueError("stepSize must be positive")
@@ -345,7 +351,9 @@ class FmuSession:
         if not math.isfinite(expected_steps):
             raise ValueError("MAX_SIMULATION_STEPS_EXCEEDED")
         estimated_steps = _ceil_step_count(expected_steps, self._time, target_time, h)
-        if estimated_steps > self._max_simulation_steps:
+        if estimated_steps > config.MAX_SIMULATION_STEPS:
+            raise ValueError("MAX_SIMULATION_STEPS_EXCEEDED")
+        if self._max_simulation_steps is not None and estimated_steps > self._max_simulation_steps:
             raise ValueError("MAX_SIMULATION_STEPS_EXCEEDED")
         self._ensure_step_budget(estimated_steps)
         self._state = "running"
@@ -379,7 +387,7 @@ class FmuSession:
             else:
                 consecutive_no_progress_events = 0
         if self._state != "stopped":
-            self._state = "stopped" if self._time >= self._stop_time - 1e-12 else "initialized"
+            self._state = "stopped" if self._stop_time is not None and self._time >= self._stop_time - 1e-12 else "initialized"
             if self._state == "stopped":
                 self._finished_reason = "stop_time_reached"
         return {
@@ -459,7 +467,8 @@ class FmuSession:
             raise ValueError("targetTime must not be earlier than current simulation time")
         if self._state in {"paused", "stopped", "error"}:
             raise RuntimeError(f"Session cannot run from state {self._state}")
-        target_time = min(target_time, self._stop_time)
+        if self._stop_time is not None:
+            target_time = min(target_time, self._stop_time)
         h = self._step_size if step_size is None else step_size
         if not math.isfinite(h) or h <= 0:
             raise ValueError("stepSize must be positive")
@@ -467,7 +476,9 @@ class FmuSession:
         if not math.isfinite(expected_steps):
             raise ValueError("MAX_SIMULATION_STEPS_EXCEEDED")
         estimated_steps = _ceil_step_count(expected_steps, self._time, target_time, h)
-        if estimated_steps > self._max_simulation_steps:
+        if estimated_steps > config.MAX_SIMULATION_STEPS:
+            raise ValueError("MAX_SIMULATION_STEPS_EXCEEDED")
+        if self._max_simulation_steps is not None and estimated_steps > self._max_simulation_steps:
             raise ValueError("MAX_SIMULATION_STEPS_EXCEEDED")
         self._ensure_step_budget(estimated_steps)
         self._state = "running"
@@ -488,7 +499,8 @@ class FmuSession:
                     raise RuntimeError("FMI step returned repeatedly without advancing simulation time")
             else:
                 consecutive_no_progress_events = 0
-            finished = step_result["terminateSimulation"] or self._time >= self._stop_time - 1e-12
+            stop_time_reached = self._stop_time is not None and self._time >= self._stop_time - 1e-12
+            finished = step_result["terminateSimulation"] or stop_time_reached
             if step_result["terminateSimulation"]:
                 self._state = "stopped"
                 self._finished_reason = "fmu_termination_requested"
@@ -524,14 +536,14 @@ class FmuSession:
                 return
             if finished:
                 return
-        if self._time >= self._stop_time - 1e-12:
+        if self._stop_time is not None and self._time >= self._stop_time - 1e-12:
             self._state = "stopped"
             self._finished_reason = "stop_time_reached"
         else:
             self._state = "initialized"
 
     def _ensure_step_budget(self, additional_steps: int) -> None:
-        if self._step_count + additional_steps > self._max_simulation_steps:
+        if self._max_simulation_steps is not None and self._step_count + additional_steps > self._max_simulation_steps:
             raise ValueError("MAX_SIMULATION_STEPS_EXCEEDED")
 
     def advance(
@@ -564,6 +576,15 @@ class FmuSession:
             raise AdvancePreExecutionError("targetTime must be later than the current simulation time")
         input_events_applied = [0]
         try:
+            effective_target = min(target_time, self._stop_time) if self._stop_time is not None else target_time
+            requested_steps = _ceil_step_count(
+                max(0.0, effective_target - self._time) / h,
+                self._time,
+                effective_target,
+                h,
+            )
+            if requested_steps > config.MAX_SIMULATION_STEPS:
+                raise AdvancePreExecutionError("MAX_SIMULATION_STEPS_EXCEEDED")
             expected_samples = estimate_advance_samples(
                 self._time,
                 target_time,
@@ -758,9 +779,11 @@ class FmuSession:
             initial_parameters = simulation["initialParameters"]
         except (KeyError, TypeError, ValueError, OverflowError) as exc:
             raise ValueError("FMU state checkpoint is invalid or incompatible") from exc
-        if not math.isfinite(time_value) or time_value < self._start_time or time_value >= self._stop_time:
+        if not math.isfinite(time_value) or time_value < self._start_time or (
+            self._stop_time is not None and time_value >= self._stop_time
+        ):
             raise ValueError("FMU state checkpoint time must fall within the new simulation interval")
-        if step_count < 0 or step_count > self._max_simulation_steps:
+        if step_count < 0 or (self._max_simulation_steps is not None and step_count > self._max_simulation_steps):
             raise ValueError("FMU state checkpoint exceeds the simulation step budget")
         if not isinstance(initial_parameters, dict):
             raise ValueError("FMU state checkpoint is invalid or incompatible")

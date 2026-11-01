@@ -102,9 +102,10 @@ async def handle_execution_command(
                 current_tolerance = max(1e-12, abs(session._time) * 1e-12)
                 if abs(current_point - session._time) > current_tolerance:
                     raise ValueError("currentCommunicationPoint does not match simulation time")
-                tolerance = max(1e-12, abs(session._stop_time) * 1e-12)
-                if target_time > session._stop_time + tolerance:
-                    raise ValueError("targetTime would advance past stopTime")
+                if session._stop_time is not None:
+                    tolerance = max(1e-12, abs(session._stop_time) * 1e-12)
+                    if target_time > session._stop_time + tolerance:
+                        raise ValueError("targetTime would advance past stopTime")
             schedule_start = session._time
             previous_time = schedule_start
             wire_schedule = []

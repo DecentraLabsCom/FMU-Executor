@@ -131,17 +131,24 @@ async def _handle_sim_initialize(
         raise HTTPException(status_code=400, detail="INVALID_TIME_MODE")
     try:
         model_metadata = await asyncio.to_thread(session.load)
-        time_options = resolve_simulation_time_options(model_metadata, options)
+        time_options = resolve_simulation_time_options(
+            model_metadata,
+            options,
+            allow_undefined_stop=True,
+        )
         start_time = services.strict_number(time_options["startTime"], "startTime")
-        stop_time = services.strict_number(time_options["stopTime"], "stopTime")
+        stop_time = (
+            services.strict_number(time_options["stopTime"], "stopTime")
+            if time_options["stopTime"] is not None else None
+        )
         step_value = services.strict_number(time_options["stepSize"], "stepSize")
         playback_speed = services.strict_number(options.get("playbackSpeed", 1.0), "playbackSpeed")
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail="INVALID_SIMULATION_OPTIONS") from exc
     if (
-        not all(math.isfinite(value) for value in (start_time, stop_time, step_value, playback_speed))
-        or stop_time <= start_time
-        or not math.isfinite(stop_time - start_time)
+        not all(math.isfinite(value) for value in (start_time, step_value, playback_speed))
+        or (stop_time is not None and (not math.isfinite(stop_time) or stop_time <= start_time
+            or not math.isfinite(stop_time - start_time)))
         or step_value <= 0
         or not 0.1 <= playback_speed <= 100.0
     ):
