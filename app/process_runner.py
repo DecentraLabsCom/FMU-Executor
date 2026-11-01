@@ -154,29 +154,26 @@ def _worker_process(
     return context.Process(target=target, args=args, name=name)
 
 
-def _sanitize_worker_environment(access_key: str) -> None:
+def _sanitize_worker_environment() -> None:
     for name in list(os.environ):
         upper_name = name.upper()
         if any(marker in upper_name for marker in _SECRET_ENV_MARKERS):
             os.environ.pop(name, None)
-    if access_key in config.NATIVE_THREAD_LIMIT_ACCESS_KEYS:
-        for name in _NATIVE_THREAD_ENVIRONMENT:
-            os.environ[name] = "1"
+    thread_limit = str(config.NATIVE_THREAD_LIMIT)
+    for name in _NATIVE_THREAD_ENVIRONMENT:
+        os.environ[name] = thread_limit
 
 
-def _start_worker_process(process: Any, access_key: str) -> None:
-    """Pass per-model native thread limits to a spawned worker before Python imports its target."""
-    if access_key not in config.NATIVE_THREAD_LIMIT_ACCESS_KEYS:
-        process.start()
-        return
-
+def _start_worker_process(process: Any) -> None:
+    """Pass consistent native thread limits before a spawned worker imports its target."""
     # multiprocessing inherits the parent environment at process creation.
     # Serialize these short snapshots and restore the API process immediately.
     with _WORKER_ENVIRONMENT_LOCK:
         previous = {name: os.environ.get(name) for name in _NATIVE_THREAD_ENVIRONMENT}
         try:
+            thread_limit = str(config.NATIVE_THREAD_LIMIT)
             for name in _NATIVE_THREAD_ENVIRONMENT:
-                os.environ[name] = "1"
+                os.environ[name] = thread_limit
             process.start()
         finally:
             for name, value in previous.items():
@@ -268,7 +265,7 @@ def _realtime_session_worker(
         if start_gate is not None:
             start_gate.wait()
         apply_worker_limits(resource_policy, worker_directory, str(fmu_path), access_key)
-        _sanitize_worker_environment(access_key)
+        _sanitize_worker_environment()
         if worker_directory:
             os.chdir(worker_directory)
             os.environ["TMP"] = worker_directory
@@ -330,6 +327,10 @@ def _realtime_session_worker(
                     "snapshot": _realtime_snapshot(session, include_model=method == "load"),
                 })
             except Exception as exc:
+                logger.exception(
+                    "FMU realtime worker command failed",
+                    extra={"method": method, "error_type": type(exc).__name__},
+                )
                 failure = {
                     "requestId": request_id,
                     "ok": False,
@@ -435,7 +436,7 @@ class RealtimeSession:
             worker_directory=self._worker_directory,
         )
         try:
-            _start_worker_process(self._process, self.access_key)
+            _start_worker_process(self._process)
             worker_pid = self._process.pid
             if worker_pid is None:
                 raise ProcessExecutionError(
@@ -902,7 +903,7 @@ def _execute_worker(
         if start_gate is not None:
             start_gate.wait()
         apply_worker_limits(resource_policy, worker_directory, fmu_path, access_key)
-        _sanitize_worker_environment(access_key)
+        _sanitize_worker_environment()
         if worker_directory:
             os.chdir(worker_directory)
             os.environ["TMP"] = worker_directory
@@ -1221,7 +1222,7 @@ def _new_process(
         worker_directory=worker_directory,
     )
     try:
-        _start_worker_process(process, access_key)
+        _start_worker_process(process)
         worker_pid = process.pid
         if worker_pid is None:
             raise RuntimeError("FMU worker did not receive a process ID")

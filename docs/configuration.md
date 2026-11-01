@@ -152,7 +152,8 @@ remain enforced independently.
 | `FMU_MAX_ARCHIVE_ENTRIES` | `20,000` | `1–200,000` | ZIP entry count. |
 | `FMU_MAX_MODEL_DESCRIPTION_BYTES` | `32 MiB` | `1 KiB–128 MiB` | `modelDescription.xml` size. |
 | `FMU_WORKER_CPU_SECONDS` | `300` | `1–86,400` | Per-worker CPU time limit. |
-| `FMU_WORKER_MEMORY_MIB` | `1,024 MiB` | `128–16,384 MiB` | Per-worker memory limit. |
+| `FMU_WORKER_MEMORY_MIB` | `1,536 MiB` | `128–16,384 MiB` | Per-worker memory limit. |
+| `FMU_NATIVE_THREAD_LIMIT` | `2` | `1–32` | Maximum native BLAS/OpenMP threads in every isolated FMU worker. |
 | `FMU_WORKER_FILE_MIB` | `128 MiB` | `1–4,096 MiB` | Linux per-file write limit. Windows AppContainer workers do not have this per-file quota. |
 
 ### Optional OMSimulator discovery

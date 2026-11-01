@@ -205,7 +205,8 @@ class FmuSession:
         if parameters is not None and not isinstance(parameters, dict):
             raise ValueError("Initialization values must be an object")
         original_parameters = parameters if parameters is not None else {}
-        validated_parameters = self._validate_values(original_parameters, phase="initialization")
+        initialization_values = self._merge_declared_start_values(original_parameters)
+        validated_parameters = self._validate_values(initialization_values, phase="initialization")
         self._initial_parameters = copy.deepcopy(original_parameters)
         self._time_mode = time_mode
         self._playback_speed = float(playback_speed)
@@ -1128,6 +1129,112 @@ class FmuSession:
         # catalog root used to resolve access keys. Reuse its parsed model
         # description and avoid opening a large modelDescription.xml twice.
         return describe_model_description(self._md)
+
+    def _merge_declared_start_values(self, values: dict[str, Any]) -> dict[str, Any]:
+        """Seed writable FMI starts before applying explicit initialization values."""
+        if self._md is None:
+            raise RuntimeError("FMU model description is not loaded")
+
+        defaults: dict[str, Any] = {}
+        is_fmi3 = self._fmi_major() == "3"
+        for variable in self._md.modelVariables:
+            start = getattr(variable, "start", None)
+            if start is None:
+                continue
+
+            causality = str(getattr(variable, "causality", ""))
+            variability = str(getattr(variable, "variability", ""))
+            variable_type = str(getattr(variable, "type", ""))
+            writable_start = (
+                causality == "input"
+                or (causality == "parameter" and variability != "constant")
+                or (
+                    is_fmi3
+                    and causality == "structuralParameter"
+                    and variability == "fixed"
+                    and variable_type == "UInt64"
+                )
+            )
+            if writable_start:
+                fmi_type = self._variable_type(variable)
+                is_array = self._is_array(variable)
+
+                def normalize_scalar(value: Any) -> Any:
+                    if fmi_type in ("Real", "Float32", "Float64") and isinstance(value, str):
+                        return float(value)
+                    if fmi_type == "Binary" and isinstance(value, str):
+                        return base64.b64encode(bytes.fromhex(value)).decode("ascii")
+                    if fmi_type in ("Boolean", "Clock") and isinstance(value, str):
+                        normalised = value.lower()
+                        if normalised in {"true", "1"}:
+                            return True
+                        if normalised in {"false", "0"}:
+                            return False
+                    return value
+
+                if is_array:
+                    if isinstance(start, str):
+                        raw_values = start.split()
+                    else:
+                        raw_values = []
+
+                        def append_array_values(value: Any) -> None:
+                            if isinstance(value, (list, tuple)):
+                                for item in value:
+                                    append_array_values(item)
+                            else:
+                                raw_values.append(value)
+
+                        append_array_values(start)
+                    normalized_start = [normalize_scalar(value) for value in raw_values]
+                else:
+                    normalized_start = normalize_scalar(start)
+
+                numeric_types = (
+                    "Real", "Float32", "Float64", "Integer", "Int8", "UInt8", "Int16", "UInt16",
+                    "Int32", "UInt32", "Int64", "UInt64",
+                )
+                if fmi_type in numeric_types and not self._declared_start_within_range(variable, normalized_start):
+                    # A malformed FMU can declare a start outside its own
+                    # min/max. Do not turn that metadata defect into an
+                    # implicit write that prevents the model from loading.
+                    # Explicit client values still pass through strict
+                    # range validation below.
+                    continue
+                defaults[str(variable.name)] = normalized_start
+
+        # Explicit values take precedence, even when they happen to equal the
+        # XML start. Some FMUs declare starts in modelDescription.xml without
+        # initializing their internal value-reference storage from them.
+        return {**defaults, **values}
+
+    @staticmethod
+    def _declared_start_within_range(variable: Any, value: Any) -> bool:
+        """Return whether every numeric start value respects declared min/max."""
+        minimum = getattr(variable, "min", None)
+        maximum = getattr(variable, "max", None)
+        declared_type = getattr(variable, "declaredType", None)
+        if minimum is None and declared_type is not None:
+            minimum = getattr(declared_type, "min", None)
+        if maximum is None and declared_type is not None:
+            maximum = getattr(declared_type, "max", None)
+        try:
+            values = value if isinstance(value, (list, tuple)) else [value]
+            for item in values:
+                if isinstance(item, str):
+                    item = int(item) if re.fullmatch(r"-?(?:0|[1-9][0-9]*)", item) else float(item)
+                if isinstance(item, bool) or not isinstance(item, (int, float)) or not math.isfinite(float(item)):
+                    return False
+                integer_value = isinstance(item, int)
+                lower = int(minimum) if minimum is not None and integer_value else float(minimum) if minimum is not None else None
+                upper = int(maximum) if maximum is not None and integer_value else float(maximum) if maximum is not None else None
+                if lower is not None and item < lower:
+                    return False
+                if upper is not None and item > upper:
+                    return False
+            return True
+        except (TypeError, ValueError, OverflowError):
+            return False
 
     def _validate_values(self, params: dict[str, Any], *, phase: str) -> dict[str, Any]:
         if not isinstance(params, dict):

@@ -74,6 +74,12 @@ Mode, and their values determine dependent array lengths. In a realtime session
 the preferred location is `sim.initialize.options.inputs`; the top-level
 `parameters` field carries parameters and structural parameters.
 
+For writable inputs, non-constant parameters and FMI 3 fixed `UInt64` structural
+parameters, the Executor seeds declared FMI `start` values before applying
+explicit initialization values. Explicit values override those defaults. This
+also ensures an FMU receives a declared start when a client omits a value that
+matches the start in `modelDescription.xml`.
+
 During execution, writes are allowed to declared `input` variables. FMI 2 and
 FMI 3 Co-Simulation also allow runtime writes to variables declared with
 `causality="parameter"` and `variability="tunable"`. Other parameter
@@ -184,6 +190,13 @@ that provide isolation elsewhere.
 
 Workers receive private temporary directories, and inherited environment
 variables with credential-like names are removed. Platform controls include:
+
+Before spawning each worker, the Executor sets native BLAS/OpenMP thread-pool
+environment variables to `FMU_NATIVE_THREAD_LIMIT` (default `2`). The same
+limit applies to every FMU so native libraries do not reserve a host-sized
+thread pool inside each worker. `FMU_WORKER_MEMORY_MIB` defaults to `1536 MiB`
+per worker; deployment-level container limits and authorized model policies
+can impose lower effective limits.
 
 - **Linux:** CPU, memory, per-file and descriptor limits; Landlock write
   restrictions and read access limited to the Python/system runtime and pinned
