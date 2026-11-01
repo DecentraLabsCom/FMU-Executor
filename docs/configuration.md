@@ -188,7 +188,7 @@ the FMU worker remains restricted by its filesystem and resource limits.
 ## Container image
 
 The repository `Dockerfile` builds the optional Executor image used by Lab
-Gateway's local Executor profile. It uses the Docker Official Python 3.11 slim
+Gateway's local Executor profile. It uses the Docker Official Python 3.12 slim
 image from Amazon ECR Public. A `vX.Y.Z` tag publishes
 `ghcr.io/decentralabscom/fmu-executor:X.Y.Z`; the tag must match `VERSION` and
 the package version in `pyproject.toml`. The publishing workflow builds the
