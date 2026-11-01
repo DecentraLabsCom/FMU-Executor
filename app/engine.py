@@ -28,6 +28,7 @@ from fmpy.fmi1 import FMICallException
 from fmpy.fmi2 import fmi2Discard, fmi2LastSuccessfulTime, fmi2Pending, fmi2Terminated
 
 from . import config
+from .fmi3_cosimulation import instantiate_fmi3_cosimulation
 from .fmu_metadata import describe_model_description
 from .simulation_defaults import DEFAULT_STEP_SIZE, resolve_simulation_time_options
 
@@ -1018,12 +1019,17 @@ class FmuSession:
         self._fmi3_event_mode_used = bool(
             self._fmi_major() == "3" and getattr(co_simulation, "hasEventMode", False)
         )
+        if self._fmi_major() == "3":
+            return instantiate_fmi3_cosimulation(
+                self._extract_dir,
+                self._md,
+                early_return_allowed=self._early_return_allowed,
+                event_mode_used=self._fmi3_event_mode_used,
+            )
         return fmpy_instantiate_fmu(
             str(self._extract_dir),
             self._md,
             fmi_type="CoSimulation",
-            early_return_allowed=self._fmi_major() == "3" and self._early_return_allowed,
-            event_mode_used=self._fmi3_event_mode_used,
         )
 
     def _do_step(self, slave: Any, step_size: float) -> tuple[float, dict[str, Any]]:

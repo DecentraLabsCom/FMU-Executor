@@ -10,8 +10,11 @@ for public access and AAS policy behavior.
 
 ## FMI execution scope
 
-FMU Executor uses FMPy `0.3.32` through `instantiate_fmu`. It selects the FMI 2
-or FMI 3 Co-Simulation implementation described by the FMU.
+FMU Executor uses FMPy `0.3.32`. FMI 2 Co-Simulation uses FMPy's standard
+factory. FMI 3 Co-Simulation uses a small interface-aware factory because
+FMPy `0.3.32` otherwise requires Model Exchange and Scheduled Execution symbols
+even when an FMU declares only Co-Simulation. Functions belonging exclusively
+to those other FMI 3 interfaces are not required for a Co-Simulation session.
 
 | Capability | Status | Scope |
 |---|---|---|
