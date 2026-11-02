@@ -80,17 +80,20 @@ public caller may read or write.
 
 At initialization, values are validated against declared variable names,
 causality, types, ranges and array lengths. Initial values can be supplied for
-FMU inputs and non-constant parameters. FMI 3 Co-Simulation fixed `UInt64`
-structural parameters are applied in Configuration Mode before Initialization
-Mode, and their values determine dependent array lengths. In a realtime session
+FMU inputs and non-constant parameters. FMI 3 fixed `UInt64` structural
+parameters are applied in Configuration Mode before Initialization Mode and
+determine dependent array lengths. FMI-LS-DAE's scalar tunable Boolean
+structural selector is also applied in Configuration Mode before
+Initialization. In a realtime session
 the preferred location is `sim.initialize.options.inputs`; the top-level
 `parameters` field carries parameters and structural parameters.
 
-For writable inputs, non-constant parameters and FMI 3 fixed `UInt64` structural
-parameters, the Executor seeds declared FMI `start` values before applying
-explicit initialization values. Explicit values override those defaults. This
-also ensures an FMU receives a declared start when a client omits a value that
-matches the start in `modelDescription.xml`.
+For writable inputs, non-constant parameters, FMI 3 fixed `UInt64` structural
+parameters and tunable Boolean structural selectors, the Executor seeds
+declared FMI `start` values before applying explicit initialization values.
+Explicit values override those defaults. This also ensures an FMU receives a
+declared start when a client omits a value that matches the start in
+`modelDescription.xml`.
 
 During execution, writes are allowed to declared `input` variables. FMI 2 and
 FMI 3 Co-Simulation also allow runtime writes to variables declared with

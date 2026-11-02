@@ -267,10 +267,19 @@ class FmuSession:
             for name, value in validated_parameters.items()
             if any(variable.name == name for variable in structural_variables)
         }
+        dimension_value_references = {
+            int(dimension.valueReference)
+            for variable in self._md.modelVariables
+            for dimension in (getattr(variable, "dimensions", None) or [])
+            if getattr(dimension, "valueReference", None) is not None
+        }
         dimension_values = {
             int(variable.valueReference): int(structural_parameters[variable.name])
             for variable in structural_variables
             if variable.name in structural_parameters
+            and int(variable.valueReference) in dimension_value_references
+            and str(getattr(variable, "type", "")) == "UInt64"
+            and not isinstance(structural_parameters[variable.name], bool)
         }
         self._pending_event_outputs = None
         if self._fmi_major() == "3":
@@ -757,6 +766,22 @@ class FmuSession:
         if self._state in {"stopped", "error"}:
             raise RuntimeError(f"Session cannot accept inputs from state {self._state}")
         validated = self._validate_values(values, phase="runtime")
+        if self._dae_integrator is not None and validated:
+            try:
+                if self._dae_change_requires_event_mode(validated):
+                    terminated = self._apply_dae_event_mode_values(validated)
+                    if terminated:
+                        self._state = "stopped"
+                        self._finished_reason = "fmu_termination_requested"
+                else:
+                    self._apply_validated_values(validated)
+                if self._state != "stopped":
+                    self._dae_integrator.restart_after_input_change(self._time, step_size=self._step_size)
+            except Exception:
+                self._state = "error"
+                raise
+            return
+
         if self._me_integrator is not None and validated:
             terminated = self._me_integrator.apply_input_change(
                 self._time,
@@ -767,8 +792,49 @@ class FmuSession:
                 self._finished_reason = "fmu_termination_requested"
         else:
             self._apply_validated_values(validated)
-        if self._dae_integrator is not None and validated:
-            self._dae_integrator.restart_after_input_change(self._time, step_size=self._step_size)
+
+    def _dae_change_requires_event_mode(self, values: dict[str, Any]) -> bool:
+        """Return whether FMI 3 Model Exchange requires an event for these writes."""
+        if self._md is None:
+            raise RuntimeError("FMU model description is not loaded")
+        variables = {str(variable.name): variable for variable in self._md.modelVariables}
+        for name in values:
+            variable = variables.get(name)
+            if variable is None:
+                continue
+            causality = str(getattr(variable, "causality", ""))
+            variability = str(getattr(variable, "variability", ""))
+            if (causality == "parameter" and variability == "tunable") or (
+                causality == "input" and variability in {"discrete", "tunable"}
+            ):
+                return True
+        return False
+
+    def _apply_dae_event_mode_values(self, values: dict[str, Any]) -> bool:
+        """Apply tunable/discrete DAE changes through FMI 3 Event Mode."""
+        slave = self._require_slave()
+        if self._fmi_major() != "3":
+            raise RuntimeError("FMI-LS-DAE event updates require FMI 3")
+
+        slave.enterEventMode()
+        self._apply_validated_values(values)
+        for _ in range(1000):
+            (
+                needs_update,
+                terminate,
+                _nominals_changed,
+                _states_changed,
+                next_event_time_defined,
+                _next_event_time,
+            ) = slave.updateDiscreteStates()
+            if terminate:
+                return True
+            if next_event_time_defined:
+                raise RuntimeError("FMI-LS-DAE runtime does not support time events")
+            if not needs_update:
+                slave.enterContinuousTimeMode()
+                return False
+        raise RuntimeError("FMI_EVENT_ITERATION_LIMIT_EXCEEDED")
 
     def capture_fmu_state(self) -> dict[str, Any]:
         """Capture a serialized checkpoint when the source FMU supports it."""
@@ -1338,8 +1404,10 @@ class FmuSession:
                 or (
                     is_fmi3
                     and causality == "structuralParameter"
-                    and variability == "fixed"
-                    and variable_type == "UInt64"
+                    and (
+                        (variability == "fixed" and variable_type == "UInt64")
+                        or (variability == "tunable" and variable_type == "Boolean")
+                    )
                 )
             )
             if writable_start:
@@ -1432,6 +1500,12 @@ class FmuSession:
         normalized: dict[str, Any] = {}
         dimension_values: dict[int, int] = {}
         if phase == "initialization" and self._fmi_major() == "3":
+            dimension_value_references = {
+                int(dimension.valueReference)
+                for variable in self._md.modelVariables
+                for dimension in (getattr(variable, "dimensions", None) or [])
+                if getattr(dimension, "valueReference", None) is not None
+            }
             for name, value in params.items():
                 var = var_map.get(name)
                 if var is None or getattr(var, "causality", None) != "structuralParameter":
@@ -1439,7 +1513,11 @@ class FmuSession:
                 self._validate_write_access(var, phase=phase)
                 values = self._coerce_values(var, value)
                 normalized[name] = values if self._is_array(var) else values[0]
-                dimension_values[int(var.valueReference)] = int(values[0])
+                value_reference = int(var.valueReference)
+                if value_reference in dimension_value_references:
+                    if str(getattr(var, "type", "")) != "UInt64" or isinstance(values[0], bool):
+                        raise ValueError(f"Structural dimension '{name}' must be UInt64")
+                    dimension_values[value_reference] = int(values[0])
         for name, value in params.items():
             if name in normalized:
                 continue
@@ -1461,8 +1539,10 @@ class FmuSession:
                 or (
                     self._fmi_major() == "3"
                     and causality == "structuralParameter"
-                    and variability == "fixed"
-                    and str(getattr(var, "type", "")) == "UInt64"
+                    and (
+                        (variability == "fixed" and str(getattr(var, "type", "")) == "UInt64")
+                        or (variability == "tunable" and str(getattr(var, "type", "")) == "Boolean")
+                    )
                 )
             )
         elif phase == "runtime":

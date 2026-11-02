@@ -33,6 +33,12 @@ def make_live_session(tmp_path: Path, *, version="2.0", state="initialized", tim
     return session
 
 
+def _set_model_variables(session: engine.FmuSession, variables: list[SimpleNamespace]) -> None:
+    model = session._md
+    assert model is not None
+    setattr(model, "modelVariables", variables)
+
+
 def _step_result(*, early=False, event=False, event_needed=False, terminate=False):
     return {
         "requestedTime": 0,
@@ -115,6 +121,7 @@ def test_step_clamps_to_stop_and_enforces_state_and_external_time(tmp_path, monk
         session.step(0)
 
     session._time_mode = "simtime"
+    assert session._stop_time is not None
     session._time = session._stop_time
     result = session.step()
     assert result["finished"] is True
@@ -203,7 +210,7 @@ def test_fmi3_triggered_clock_is_captured_before_step_mode(tmp_path):
         name="heartbeat", type="Clock", causality="output", valueReference=2,
         shape=None, dimensions=[],
     )
-    session._md.modelVariables = [clock]
+    _set_model_variables(session, [clock])
     session._fmi3_event_mode_used = True
     slave = cast(Any, session._slave)
     slave.doStep.return_value = (True, False, False, 0.1)
@@ -230,7 +237,7 @@ def test_fmi3_fixed_structural_parameter_controls_initial_array_size(tmp_path):
         valueReference=8, min=None, max=None, declaredType=None, shape=(2,),
         dimensions=[SimpleNamespace(start=None, valueReference=7, variable=structural_size)],
     )
-    session._md.modelVariables = [structural_size, input_array]
+    _set_model_variables(session, [structural_size, input_array])
     session._initialised = False
 
     assert session.validate_initial_values({"n": 3, "u": [1.0, 2.0, 3.0]}) == {
@@ -242,6 +249,21 @@ def test_fmi3_fixed_structural_parameter_controls_initial_array_size(tmp_path):
     assert session._variable_size(input_array) == 3
     with pytest.raises(ValueError, match="expects exactly 3 values"):
         session.validate_initial_values({"n": 3, "u": [1.0, 2.0]})
+
+
+def test_fmi3_tunable_boolean_structural_parameter_is_valid_at_initialization(tmp_path):
+    session = make_live_session(tmp_path, version="3.0")
+    dae_selector = SimpleNamespace(
+        name="enableDAE", type="Boolean", causality="structuralParameter", variability="tunable",
+        valueReference=7, min=None, max=None, start=False, declaredType=None, shape=None, dimensions=[],
+    )
+    _set_model_variables(session, [dae_selector])
+    session._initialised = False
+
+    assert session.validate_initial_values({"enableDAE": True}) == {"enableDAE": True}
+    assert session._merge_declared_start_values({}) == {"enableDAE": False}
+    with pytest.raises(ValueError, match="cannot be modified during runtime"):
+        session.validate_runtime_input_values({"enableDAE": True})
 
 
 def test_value_validation_and_output_reads_cover_fmi_types(tmp_path):
