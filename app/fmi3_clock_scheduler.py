@@ -1,4 +1,4 @@
-"""Time-based FMI 3 input-clock scheduling for Model Exchange importers."""
+"""Time-based FMI 3 input-clock scheduling for FMI importers."""
 
 from __future__ import annotations
 
@@ -61,13 +61,42 @@ def read_fmi3_input_clock_schedules(
         ):
             raise ValueError(f"FMI 3 aperiodic input Clock {reference} must obtain its interval from the FMU")
 
-        interval = _read_interval(fmu, variable, reference)
-        interval_from_fmu = variability in _APERIODIC_VARIABILITIES or variability == "tunable"
         supports_fraction = bool(_clock_attribute(variable, "supportsFraction"))
+        # FMI 3's fixed/tunable rules key off intervalDecimal: when it is
+        # absent the importer obtains both interval and shift from the FMU.
+        interval_is_declared = _clock_attribute(variable, "intervalDecimal") is not None
+        if variability == "constant":
+            # A constant periodic Clock declares its interval and shift in the
+            # model description; there is no importer-selected interval.
+            if not interval_is_declared:
+                raise ValueError(f"FMI 3 constant periodic input Clock {reference} must declare intervalDecimal")
+            interval = _read_declared_interval(variable, reference)
+            interval_from_fmu = False
+        elif variability in {"fixed", "tunable"}:
+            interval = (
+                _read_declared_interval(variable, reference)
+                if interval_is_declared
+                else _read_interval_from_fmu(fmu, reference, supports_fraction=supports_fraction)
+            )
+            if interval is None:
+                raise ValueError(f"FMI 3 periodic input Clock {reference} has no initial interval")
+            # FMI 3 requires the importer to call SetInterval for every fixed
+            # and tunable periodic Clock. If the FMU supplied the initial
+            # interval because intervalDecimal was omitted, pass that value
+            # back to the FMU as the negotiated interval.
+            _set_interval(fmu, reference, interval)
+            interval_from_fmu = variability == "tunable" and not interval_is_declared
+        else:
+            interval = _read_interval_from_fmu(fmu, reference, supports_fraction=supports_fraction)
+            interval_from_fmu = True
         if variability in _PERIODIC_VARIABILITIES:
             if interval is None or not math.isfinite(interval) or interval <= 0:
                 raise ValueError(f"FMI 3 periodic input Clock {reference} has no positive interval")
-            shift = _read_shift(fmu, variable, reference)
+            shift = (
+                _read_shift(variable, reference)
+                if variability == "constant" or interval_is_declared
+                else _read_shift_from_fmu(fmu, reference, supports_fraction=supports_fraction)
+            )
             if shift < 0:
                 raise ValueError(f"FMI 3 periodic input Clock {reference} has a negative shift")
             next_time = start_time + shift
@@ -164,7 +193,56 @@ def consume_fmi3_clock_ticks(
             raise RuntimeError("FMI 3 input Clock schedule moved backwards")
 
 
-def _read_interval(fmu: Any, variable: Any, reference: int) -> float | None:
+def refresh_fmi3_clock_schedules(
+    fmu: Any,
+    schedules: list[Fmi3InputClockSchedule],
+    current_time: float,
+    activated_clocks: set[int],
+    *,
+    refresh_tunable_clocks: bool = False,
+) -> None:
+    """Refresh FMU-provided intervals after the Clock or parameter event."""
+    for schedule in schedules:
+        if schedule.variability == "changing" and schedule.value_reference not in activated_clocks:
+            continue
+        is_aperiodic = schedule.variability in _APERIODIC_VARIABILITIES
+        is_tunable_periodic = (
+            refresh_tunable_clocks
+            and schedule.variability == "tunable"
+            and schedule.interval_from_fmu
+        )
+        if not is_aperiodic and not is_tunable_periodic:
+            continue
+        qualifier, interval = read_fmi3_clock_interval_update(
+            fmu,
+            schedule.value_reference,
+            supports_fraction=schedule.supports_fraction,
+        )
+        if qualifier == FMI3_INTERVAL_NOT_YET_KNOWN:
+            if schedule.variability != "countdown":
+                raise RuntimeError("FMU returned NotYetKnown for a Clock that is not countdown")
+            schedule.interval = None
+            schedule.next_time = None
+            continue
+        if qualifier != FMI3_INTERVAL_CHANGED:
+            if schedule.variability == "countdown" and schedule.interval is not None:
+                # Countdown intervals are measured from the current Event Mode
+                # instant, even when the interval value itself is unchanged.
+                schedule.next_time = current_time + schedule.interval
+            continue
+        if interval is None:
+            raise RuntimeError("FMU marked a Clock interval as changed without returning a value")
+        if not math.isfinite(interval) or interval < (0 if is_aperiodic else 1e-15):
+            raise RuntimeError("FMU returned an invalid Clock interval")
+        schedule.interval = interval
+        if is_tunable_periodic:
+            if schedule.has_ticked:
+                schedule.next_time = max(current_time, schedule.last_tick_time + interval)
+        else:
+            schedule.next_time = current_time + interval
+
+
+def _read_declared_interval(variable: Any, reference: int) -> float:
     raw_decimal = _clock_attribute(variable, "intervalDecimal")
     if raw_decimal is not None:
         return _finite_number(raw_decimal, f"FMI 3 input Clock {reference} interval")
@@ -172,11 +250,19 @@ def _read_interval(fmu: Any, variable: Any, reference: int) -> float | None:
     raw_counter = _clock_attribute(variable, "intervalCounter")
     resolution = _clock_attribute(variable, "resolution")
     if raw_counter is not None and resolution:
-        counter = _positive_integer(raw_counter, f"FMI 3 input Clock {reference} intervalCounter", allow_zero=True)
+        counter = _positive_integer(raw_counter, f"FMI 3 input Clock {reference} intervalCounter")
         divisor = _positive_integer(resolution, f"FMI 3 input Clock {reference} resolution")
         return counter / divisor
 
-    supports_fraction = bool(_clock_attribute(variable, "supportsFraction"))
+    raise ValueError(f"FMI 3 input Clock {reference} has no declared interval")
+
+
+def _read_interval_from_fmu(
+    fmu: Any,
+    reference: int,
+    *,
+    supports_fraction: bool,
+) -> float | None:
     if supports_fraction and hasattr(fmu, "getIntervalFraction"):
         from fmpy.fmi3 import fmi3IntervalQualifier, fmi3UInt64, fmi3ValueReference
 
@@ -195,7 +281,7 @@ def _read_interval(fmu: Any, variable: Any, reference: int) -> float | None:
         return int(counters[0]) / int(resolutions[0])
 
     if not hasattr(fmu, "getIntervalDecimal"):
-        return None
+        raise ValueError(f"FMI 3 input Clock {reference} has no interval getter")
     from fmpy.fmi3 import fmi3Float64, fmi3IntervalQualifier, fmi3ValueReference
 
     references = (fmi3ValueReference * 1)(reference)
@@ -210,7 +296,7 @@ def _read_interval(fmu: Any, variable: Any, reference: int) -> float | None:
     return _finite_number(intervals[0], f"FMI 3 input Clock {reference} interval")
 
 
-def _read_shift(fmu: Any, variable: Any, reference: int) -> float:
+def _read_shift(variable: Any, reference: int) -> float:
     raw_decimal = _clock_attribute(variable, "shiftDecimal")
     if raw_decimal is not None:
         return _finite_number(raw_decimal, f"FMI 3 input Clock {reference} shift")
@@ -222,7 +308,10 @@ def _read_shift(fmu: Any, variable: Any, reference: int) -> float:
         divisor = _positive_integer(resolution, f"FMI 3 input Clock {reference} resolution")
         return counter / divisor
 
-    supports_fraction = bool(_clock_attribute(variable, "supportsFraction"))
+    return 0.0
+
+
+def _read_shift_from_fmu(fmu: Any, reference: int, *, supports_fraction: bool) -> float:
     if supports_fraction and hasattr(fmu, "getShiftFraction"):
         from fmpy.fmi3 import fmi3UInt64, fmi3ValueReference
 
@@ -235,13 +324,26 @@ def _read_shift(fmu: Any, variable: Any, reference: int) -> float:
         return int(counters[0]) / int(resolutions[0])
 
     if not hasattr(fmu, "getShiftDecimal"):
-        return 0.0
+        raise ValueError(f"FMI 3 input Clock {reference} has no shift getter")
     from fmpy.fmi3 import fmi3Float64, fmi3ValueReference
 
     references = (fmi3ValueReference * 1)(reference)
     shifts = (fmi3Float64 * 1)()
     fmu.getShiftDecimal(references, shifts)
     return _finite_number(shifts[0], f"FMI 3 input Clock {reference} shift")
+
+
+def _set_interval(fmu: Any, reference: int, interval: float) -> None:
+    if not math.isfinite(interval) or interval <= 0:
+        raise ValueError(f"FMI 3 input Clock {reference} interval must be positive and finite")
+    setter = getattr(fmu, "setIntervalDecimal", None)
+    if setter is None:
+        raise ValueError(f"FMI 3 input Clock {reference} has no interval setter")
+    from fmpy.fmi3 import fmi3Float64, fmi3ValueReference
+
+    references = (fmi3ValueReference * 1)(reference)
+    intervals = (fmi3Float64 * 1)(interval)
+    setter(references, intervals)
 
 
 def _clock_attribute(variable: Any, name: str) -> Any:

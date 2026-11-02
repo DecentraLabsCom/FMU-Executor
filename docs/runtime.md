@@ -19,11 +19,11 @@ to those other FMI 3 interfaces are not required for a Co-Simulation session.
 
 | Capability | Status | Scope |
 |---|---|---|
-| FMI 2 Co-Simulation | Supported | Realtime, one-shot and streaming execution. |
-| FMI 3 Co-Simulation | Supported | Realtime, one-shot and streaming execution, including event handling supported by the FMU/runtime. |
-| FMI 2 Model Exchange | Supported | ODE integration with FMPy's SUNDIALS CVode solver, including FMI event indicators, scheduled time events, and runtime input/tunable-parameter changes. |
-| FMI 3 Model Exchange | Supported | ODE integration with FMPy's SUNDIALS CVode solver, including FMI Event Mode iteration, event indicators, scheduled time events, and runtime input/tunable-parameter changes. |
-| FMI 3 Model Exchange + FMI-LS-DAE `1.0.0-alpha.1` | Experimental support | Semi-explicit index-1 equations in Continuous-Time Mode, integrated by SUNDIALS IDAS. Continuous algebraic variables and residuals may use FMI 3 Float32 or Float64 scalars and arrays; equation cardinality is checked after structural array dimensions are applied. The manifest's ordered `Output`, `ContinuousStateDerivative`, `ClockedState`, `InitialUnknown`, `EventIndicator` and `Residual` lists are consumed as the DAE ModelStructure: they determine reported output order, solver state/derivative order, initialization guesses, clocked-state clock associations, event-indicator order and residual equations. Declared dependencies are validated against the known variables for each mode and used to reject algebraic variables absent from all residual equations. The Executor also applies FMI 3 Model Exchange event indicators, Event Mode iteration, time events, periodic and aperiodic input Clocks (including triggered input activations), clocked outputs/states, and solver reinitialization after state or input discontinuities. These hybrid behaviors use FMI 3 core semantics; alpha.1 itself leaves event handling and discontinuities outside its scope. When an FMI-LS-DAE FMU declares Clocks, execute it in DAE mode; the alternate ODE mode does not schedule Clocks. |
+| FMI 2 Co-Simulation | Supported | Realtime, one-shot and streaming execution. The FMU handles its internal events; when it cannot complete a requested step, the Executor uses FMI's discard status and last-successful-time reporting where available. |
+| FMI 3 Co-Simulation | Supported | Realtime, one-shot and streaming execution. If Event Mode is negotiated, the Executor handles event requests, scheduled time events, input Clock activations and clocked output reads. Without Event Mode, the FMU handles events internally. FMI 3 Co-Simulation FMUs with Clocks must declare `hasEventMode=true`. |
+| FMI 2 Model Exchange | Supported | ODE integration with FMPy's SUNDIALS CVode solver, including FMI event indicators, scheduled time events, `completedIntegratorStep`, and runtime input/tunable-parameter changes. |
+| FMI 3 Model Exchange | Supported | ODE integration with FMPy's SUNDIALS CVode solver, including FMI Event Mode iteration, event indicators, scheduled time events, periodic and aperiodic input Clock scheduling, triggered input Clock activations, clocked outputs, `completedIntegratorStep`, and runtime input/tunable-parameter changes. |
+| FMI 3 Model Exchange + FMI-LS-DAE `1.0.0-alpha.1` | Experimental support | Semi-explicit index-1 equations in Continuous-Time Mode, integrated by SUNDIALS IDAS. Continuous algebraic variables and residuals may use FMI 3 Float32 or Float64 scalars and arrays; equation cardinality is checked after structural array dimensions are applied. The manifest's ordered `Output`, `ContinuousStateDerivative`, `ClockedState`, `InitialUnknown`, `EventIndicator` and `Residual` lists are consumed as the DAE ModelStructure: they determine reported output order, solver state/derivative order, initialization guesses, clocked-state clock associations, event-indicator order and residual equations. Declared dependencies are validated against the known variables for each mode and used to reject algebraic variables absent from all residual equations. FMI 3 Clock scheduling, clocked values and hybrid event handling use FMI core behavior and are not prerequisites of the alpha.1 equation profile. |
 | Scalar Real/Float32/Float64, integer, Boolean and String | Supported | Inputs and outputs exposed by the runtime. |
 | FMI 3 arrays | Supported | Fixed dimensions and arrays sized by structural parameters set in Configuration Mode, including zero-length dimensions. |
 | FMI 3 Binary and Clock | Supported | Where the FMU runtime exposes the corresponding API; Binary uses base64 in JSON. |
@@ -41,11 +41,10 @@ Co-Simulation. Initialization may explicitly request `executionInterface` to
 select either available interface. Model Exchange uses CVode for ordinary ODE
 models and the experimental IDAS path only when a valid supported FMI-LS-DAE
 declaration is present. For an FMI-LS-DAE Model Exchange run, the Executor
-enables the declared DAE selector by default; passing `false` keeps ODE mode,
-except that a model declaring Clocks must use DAE mode because ODE mode does
-not schedule those Clocks. FMI-LS-DAE is an additional equation profile, not a
-prerequisite for ordinary FMI 2/3 Model Exchange. Parsing and validation still
-inspect the full `modelDescription.xml`.
+enables the declared DAE selector by default; passing `false` keeps ODE mode.
+Both ODE and DAE execution schedule FMI 3 Model Exchange Clocks. FMI-LS-DAE is
+an additional equation profile, not a prerequisite for ordinary FMI 2/3 Model
+Exchange. Parsing and validation still inspect the full `modelDescription.xml`.
 
 ## Model description and variables
 
@@ -98,7 +97,8 @@ parameters and tunable Boolean structural selectors, the Executor seeds
 declared FMI `start` values before applying explicit initialization values.
 Explicit values override those defaults. This also ensures an FMU receives a
 declared start when a client omits a value that matches the start in
-`modelDescription.xml`.
+`modelDescription.xml`. FMI 3 Clock inputs are excluded from that seeding;
+their activations are sent through the Clock API in Event Mode.
 
 During execution, writes are allowed to declared `input` variables. FMI 2/3
 Co-Simulation and Model Exchange also allow runtime writes to variables
@@ -134,10 +134,15 @@ default experiment where available. Requests must have a finite stop time
 greater than the start time and a positive step size. The configured maximum
 step budget still applies.
 
-FMI 3 Event Mode is negotiated with the FMU and handled inside the isolated
-Executor, including the initial discrete-state iteration after initialization,
-before returning a step. Triggered Clock outputs are captured during Event
-Mode. Step responses include the last successful
+FMI 3 Co-Simulation Event Mode is negotiated from the FMU's `hasEventMode`
+capability and handled inside the isolated Executor, including event requests
+and discrete input writes. A Co-Simulation FMU that does not negotiate Event
+Mode is expected to handle its events internally. For FMI 3 Model Exchange,
+the Executor handles FMI 3 Event Mode as required by the integration algorithm.
+In both interfaces, FMI 3 time-based input Clocks are scheduled from their
+declared or FMU-provided intervals, and output Clocks and clocked values are
+read only while valid in Event Mode. Scheduled Execution is a separate FMI
+interface and is not implied by this support. Step responses include the last successful
 simulation time, early-return and termination flags, and whether an event
 occurred. `sim.advance` returns a bounded set of intermediate samples in one
 request; see the [WebSocket API reference](api.md#realtime-websocket-protocol).

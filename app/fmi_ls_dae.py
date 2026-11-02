@@ -12,12 +12,10 @@ import logging
 import math
 
 from .fmi3_clock_scheduler import (
-    FMI3_INTERVAL_CHANGED,
-    FMI3_INTERVAL_NOT_YET_KNOWN,
     Fmi3InputClockSchedule,
     consume_fmi3_clock_ticks,
     due_fmi3_clock_references,
-    read_fmi3_clock_interval_update,
+    refresh_fmi3_clock_schedules,
 )
 
 logger = logging.getLogger(__name__)
@@ -758,6 +756,7 @@ class Fmi3DaeIntegrator:
         internal_step_limit: int = 10_000,
         input_clock_references: list[int] | None = None,
         clock_schedules: list[Fmi3InputClockSchedule] | None = None,
+        initial_input_clock_references: set[int] | None = None,
         initial_clocked_outputs: dict[str, Any] | None = None,
         initial_unknown_values: dict[int, Any] | None = None,
     ):
@@ -777,6 +776,7 @@ class Fmi3DaeIntegrator:
             raise ValueError("FMI-LS-DAE initialization data contains an undeclared InitialUnknown")
         self._input_clock_references = list(input_clock_references or [])
         self._clock_schedules = list(clock_schedules or [])
+        self._initial_input_clock_references = set(initial_input_clock_references or [])
         self._next_event_time_defined = False
         self._next_event_time: float | None = None
         self._event_states_changed = False
@@ -871,6 +871,7 @@ class Fmi3DaeIntegrator:
             variable
             for variable in (getattr(model_description, "modelVariables", []) or [])
             if getattr(variable, "causality", None) == "output"
+            and getattr(variable, "type", None) != "Clock"
             and bool(getattr(variable, "clocks", None))
             and getattr(variable, "valueReference", None) in self._output_value_references
         )
@@ -1003,7 +1004,12 @@ class Fmi3DaeIntegrator:
     def _initialize_event_mode(self, start_time: float) -> None:
         """Resolve FMI 3 initialization events and clocks due at simulation start."""
         initial_clocks = set(due_fmi3_clock_references(self._clock_schedules, start_time))
-        terminated = self._resolve_event_mode(start_time, initial_clocks)
+        initial_clocks.update(self._initial_input_clock_references)
+        terminated = self._resolve_event_mode(
+            start_time,
+            initial_clocks,
+            defer_clock_activation=bool(initial_clocks),
+        )
         if terminated:
             raise RuntimeError("FMI Model Exchange requested termination during DAE initialization")
 
@@ -1067,23 +1073,38 @@ class Fmi3DaeIntegrator:
                 [True] * len(active),
             )
 
-    def _process_event(self, current_time: float, active_clock_references: list[int]) -> bool:
+    def _process_event(
+        self,
+        current_time: float,
+        active_clock_references: list[int],
+        *,
+        defer_clock_activation: bool = False,
+    ) -> bool:
         self._fmu.enterEventMode()
-        return self._resolve_event_mode(current_time, set(active_clock_references))
+        return self._resolve_event_mode(
+            current_time,
+            set(active_clock_references),
+            defer_clock_activation=defer_clock_activation,
+        )
 
     def _resolve_event_mode(
         self,
         current_time: float,
         active_clock_references: set[int],
         *,
+        defer_clock_activation: bool = False,
         refresh_tunable_clocks: bool = False,
     ) -> bool:
         """Iterate discrete events, including zero-delay aperiodic clock ticks."""
-        activated_clocks = set(active_clock_references)
+        pending_clocks = set(active_clock_references)
+        clock_activation_deferred = bool(defer_clock_activation and pending_clocks)
         for _ in range(1000):
-            self._set_input_clock_activations(activated_clocks)
-            if activated_clocks:
+            activated_clocks: set[int] = set()
+            if pending_clocks and not clock_activation_deferred:
+                activated_clocks = pending_clocks
+                self._set_input_clock_activations(activated_clocks)
                 consume_fmi3_clock_ticks(self._clock_schedules, activated_clocks, current_time)
+                pending_clocks = set()
             terminated = self._update_discrete_states(
                 current_time,
                 activated_clocks=activated_clocks,
@@ -1096,14 +1117,20 @@ class Fmi3DaeIntegrator:
             # updateDiscreteStates. Re-activate only when an aperiodic Clock
             # reports another tick at this same simulation time. An FMU may
             # also announce another super-dense time event at this instant.
-            activated_clocks = set(due_fmi3_clock_references(self._clock_schedules, current_time))
+            due_clocks = set(due_fmi3_clock_references(self._clock_schedules, current_time))
             tolerance = max(1e-12, abs(current_time) * 1e-12)
             time_event_due = (
                 self._next_event_time_defined
                 and self._next_event_time is not None
                 and self._next_event_time <= current_time + tolerance
             )
-            if not activated_clocks and not time_event_due:
+            if clock_activation_deferred:
+                if time_event_due:
+                    continue
+                clock_activation_deferred = False
+                continue
+            pending_clocks = due_clocks
+            if not pending_clocks and not time_event_due:
                 break
         else:
             raise RuntimeError("FMI_EVENT_ITERATION_LIMIT_EXCEEDED")
@@ -1117,38 +1144,13 @@ class Fmi3DaeIntegrator:
         *,
         refresh_tunable_clocks: bool = False,
     ) -> None:
-        for schedule in self._clock_schedules:
-            if schedule.variability == "changing" and schedule.value_reference not in activated_clocks:
-                continue
-            is_aperiodic = schedule.variability in {"changing", "countdown"}
-            is_tunable_periodic = (
-                refresh_tunable_clocks
-                and schedule.variability == "tunable"
-                and schedule.interval_from_fmu
-            )
-            if not is_aperiodic and not is_tunable_periodic:
-                continue
-            qualifier, interval = read_fmi3_clock_interval_update(
-                self._fmu,
-                schedule.value_reference,
-                supports_fraction=schedule.supports_fraction,
-            )
-            if qualifier == FMI3_INTERVAL_NOT_YET_KNOWN:
-                schedule.interval = None
-                schedule.next_time = None
-                continue
-            if qualifier != FMI3_INTERVAL_CHANGED:
-                continue
-            if interval is None:
-                raise RuntimeError("FMU marked a Clock interval as changed without returning a value")
-            if not math.isfinite(interval) or interval < (0 if is_aperiodic else 1e-15):
-                raise RuntimeError("FMU returned an invalid Clock interval")
-            schedule.interval = interval
-            if is_tunable_periodic:
-                if schedule.has_ticked:
-                    schedule.next_time = max(current_time, schedule.last_tick_time + interval)
-            else:
-                schedule.next_time = current_time + interval
+        refresh_fmi3_clock_schedules(
+            self._fmu,
+            self._clock_schedules,
+            current_time,
+            activated_clocks,
+            refresh_tunable_clocks=refresh_tunable_clocks,
+        )
 
     def _next_time_event(self) -> float | None:
         event_times = [
@@ -1215,9 +1217,18 @@ class Fmi3DaeIntegrator:
         )
         tolerance = max(1e-12, abs(current_time) * 1e-12)
         due_clocks = due_fmi3_clock_references(self._clock_schedules, current_time)
+        model_time_event_due = (
+            self._next_event_time_defined
+            and self._next_event_time is not None
+            and self._next_event_time <= current_time + tolerance
+        )
         next_event_time = self._next_time_event()
         if next_event_time is not None and next_event_time <= current_time + tolerance:
-            terminated = self._process_event(current_time, due_clocks)
+            terminated = self._process_event(
+                current_time,
+                due_clocks,
+                defer_clock_activation=model_time_event_due,
+            )
             if not terminated:
                 self._restart_solver(current_time, step_size)
             return {
@@ -1267,15 +1278,20 @@ class Fmi3DaeIntegrator:
             }
 
         root_event = status == getattr(self._idas, "IDA_ROOT_RETURN", 2)
-        reached_scheduled_time = bool(
-            time_event_due
-            and next_event_time is not None
-            and abs(reached_time - next_event_time) <= max(tolerance, 1e-10)
+        reached_model_time_event = bool(
+            self._next_event_time_defined
+            and self._next_event_time is not None
+            and abs(reached_time - self._next_event_time) <= max(tolerance, 1e-10)
         )
-        event_occurred = bool(root_event or reached_scheduled_time or enter_event_mode)
+        scheduled_clocks = due_fmi3_clock_references(self._clock_schedules, reached_time)
+        clock_event_reached = bool(scheduled_clocks)
+        event_occurred = bool(root_event or reached_model_time_event or clock_event_reached or enter_event_mode)
         if event_occurred:
-            scheduled_clocks = due_fmi3_clock_references(self._clock_schedules, reached_time)
-            terminate_simulation = self._process_event(reached_time, scheduled_clocks)
+            terminate_simulation = self._process_event(
+                reached_time,
+                scheduled_clocks,
+                defer_clock_activation=bool(root_event or reached_model_time_event or enter_event_mode),
+            )
             if not terminate_simulation:
                 self._restart_solver(reached_time, step_size)
         return {
@@ -1355,7 +1371,10 @@ class Fmi3DaeIntegrator:
                 clock_values[reference] = active
                 variable = clock_variables[reference]
                 if getattr(variable, "causality", None) == "output":
-                    self._pending_event_outputs[str(variable.name)] = active
+                    name = str(variable.name)
+                    self._pending_event_outputs[name] = bool(
+                        self._pending_event_outputs.get(name, False) or active
+                    )
 
         for variable in self._clocked_output_variables:
             associated_references = {
@@ -1376,9 +1395,10 @@ class Fmi3DaeIntegrator:
             if getter is None:
                 raise RuntimeError(f"FMI clocked output '{variable.name}' has an unsupported type")
             size = self._variable_size(variable, self._variables_by_reference)
-            values = getter([value_reference], nValues=size) if size > 1 else getter([value_reference])
+            is_array = self._is_array(variable)
+            values = getter([value_reference], nValues=size) if is_array else getter([value_reference])
             normalized = [self._normalise_clocked_output(value_type, value) for value in values]
-            normalized_value = normalized if size > 1 else normalized[0]
+            normalized_value = normalized if is_array else normalized[0]
             self._clocked_output_cache[str(variable.name)] = normalized_value
             self._pending_event_outputs[str(variable.name)] = normalized_value
 
@@ -1453,14 +1473,17 @@ class Fmi3DaeIntegrator:
             if value_type == "Enumeration":
                 value_type = "Int64"
             size = self._variable_size(variable, self._variables_by_reference)
-            raw_values = value if size > 1 and isinstance(value, list) else [value]
+            is_array = self._is_array(variable)
+            if is_array and not isinstance(value, list):
+                raise ValueError("FMU state checkpoint has an invalid DAE clocked output array")
+            raw_values = value if is_array else [value]
             if len(raw_values) != size:
                 raise ValueError("FMI state checkpoint has an invalid DAE clocked output size")
             try:
                 normalized = [self._normalise_clocked_output(value_type, item) for item in raw_values]
             except (TypeError, ValueError, OverflowError) as exc:
                 raise ValueError("FMI state checkpoint has an invalid DAE clocked output value") from exc
-            normalized_clocked_outputs[name] = normalized if size > 1 else normalized[0]
+            normalized_clocked_outputs[name] = normalized if is_array else normalized[0]
         by_reference = {schedule.value_reference: schedule for schedule in self._clock_schedules}
         restored: set[int] = set()
         for item in raw_schedules:
@@ -1657,6 +1680,15 @@ class Fmi3DaeIntegrator:
     @staticmethod
     def _variable_size(variable: Any, variables_by_reference: dict[int, Any]) -> int:
         return _model_variable_size(variable, variables_by_reference)
+
+    @staticmethod
+    def _is_array(variable: Any) -> bool:
+        shape = getattr(variable, "shape", None)
+        dimensions = getattr(variable, "dimensions", None)
+        return bool(
+            (isinstance(shape, (list, tuple)) and shape)
+            or (isinstance(dimensions, (list, tuple)) and dimensions)
+        )
 
     def _read_real_values(self, specs: tuple[_RealVariableSpec, ...]) -> list[float]:
         result = [0.0] * sum(spec.size for spec in specs)
