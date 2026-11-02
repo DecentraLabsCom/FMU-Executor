@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import platform
 import zipfile
 from pathlib import Path
+from fmpy import platform_tuple, sharedLibraryExtension
 
 
 def write_test_fmu(path: Path, *, model_description: str | None = None) -> Path:
@@ -18,12 +18,7 @@ def write_test_fmu(path: Path, *, model_description: str | None = None) -> Path:
   <ModelStructure><Outputs><Unknown index="2"/></Outputs></ModelStructure>
 </fmiModelDescription>
 """
-    if platform.system().lower() == "windows":
-        binary_path = "binaries/win64/TestModel.dll"
-    elif platform.system().lower() == "darwin":
-        binary_path = "binaries/darwin64/TestModel.dylib"
-    else:
-        binary_path = "binaries/linux64/TestModel.so"
+    binary_path = f"binaries/{platform_tuple}/TestModel{sharedLibraryExtension}"
 
     path.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(path, "w") as archive:

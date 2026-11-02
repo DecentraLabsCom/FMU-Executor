@@ -1,4 +1,4 @@
-import { createProtocolId, isValidConnectionConfig, isValidParameters, MAX_SAMPLE_BATCH_JSON_CHARS } from './index.js'
+import { createProtocolId, isValidConnectionConfig, isValidParameters, MAX_MODEL_DESCRIPTION_JSON_BYTES, MAX_SAMPLE_BATCH_JSON_CHARS } from './index.js'
 import { getInputUpdateQuota, getInputUpdateRetryDelayMs } from './input-update-quota.js'
 import { omitParametersMatchingFmiStart } from './parameter-defaults.js'
 
@@ -89,11 +89,21 @@ export async function connectFmuSession(connection, { signal, timeoutMs = 120_00
   socket.addEventListener('close', () => close(failure('The provider FMU session disconnected.', 'FMU_DISCONNECTED')))
   socket.addEventListener('message', (event) => {
     try {
-      if (typeof event.data !== 'string' || new TextEncoder().encode(event.data).length > MAX_SAMPLE_BATCH_JSON_CHARS) {
+      if (typeof event.data !== 'string') {
+        throw failure('The FMU response exceeds the frame limit.', 'INVALID_FMU_RESPONSE')
+      }
+      const responseBytes = new TextEncoder().encode(event.data).length
+      if (responseBytes > MAX_MODEL_DESCRIPTION_JSON_BYTES) {
         throw failure('The FMU response exceeds the frame limit.', 'INVALID_FMU_RESPONSE')
       }
       const response = JSON.parse(event.data)
       if (!response || typeof response !== 'object' || typeof response.type !== 'string') throw failure('Invalid FMU response.')
+      const responseLimit = response.type === 'model.description'
+        ? MAX_MODEL_DESCRIPTION_JSON_BYTES
+        : MAX_SAMPLE_BATCH_JSON_CHARS
+      if (responseBytes > responseLimit) {
+        throw failure('The FMU response exceeds the frame limit.', 'INVALID_FMU_RESPONSE')
+      }
       if (response.type === 'session.closed') { close(failure('The FMU session ended.', response.reason)); return }
       const item = pending.get(response.requestId)
       if (!item) return

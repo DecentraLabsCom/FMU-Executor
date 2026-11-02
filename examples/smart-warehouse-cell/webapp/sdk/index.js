@@ -7,6 +7,7 @@ export const MAX_PARAMETER_STRING_LENGTH = 1024
 export const MAX_OUTPUTS_PER_SAMPLE = 512
 export const MAX_SAMPLES_PER_BATCH = 256
 export const MAX_SAMPLE_BATCH_JSON_CHARS = 1_000_000
+export const MAX_MODEL_DESCRIPTION_JSON_BYTES = 32 * 1024 * 1024
 export const DIGITAL_TWIN_MESSAGE = Object.freeze({
   HOST_READY: 'decentralabs:digital-twin-host-ready',
   APP_READY: 'decentralabs:digital-twin-ready',
@@ -28,6 +29,7 @@ export const DIGITAL_TWIN_MESSAGE = Object.freeze({
 })
 export const DIGITAL_TWIN_CAPABILITY = Object.freeze({
   PLAYBACK_RATE: 'playback-rate',
+  EXECUTION_PACE: 'execution-pace',
   EXECUTION_CONTROL: 'execution-control',
   FMI_LS_PARAMETER_PRESETS: 'fmi-ls-parameter-presets',
   FMI_LS_EXPERIMENTS: 'fmi-ls-experiments',
@@ -94,10 +96,12 @@ export function isValidSample(v) {
     && (v.finishReason === undefined || text(v.finishReason))
 }
 export function isValidAppReadyMessage(v) {
+  const capabilities = Array.isArray(v?.capabilities) ? v.capabilities : []
   return isProtocolEnvelope(v) && v.type === DIGITAL_TWIN_MESSAGE.APP_READY
-    && keys(v, ['type', 'version', 'capabilities', 'defaultPlaybackRate', 'playbackControlPosition'])
+    && keys(v, ['type', 'version', 'capabilities', 'defaultPlaybackRate', 'defaultExecutionPace', 'playbackControlPosition'])
     && (v.capabilities === undefined || (Array.isArray(v.capabilities) && v.capabilities.length <= 32 && new Set(v.capabilities).size === v.capabilities.length && v.capabilities.every((c) => text(c))))
     && (v.defaultPlaybackRate === undefined || (Number.isFinite(v.defaultPlaybackRate) && v.defaultPlaybackRate > 0 && v.defaultPlaybackRate <= 100000))
+    && (v.defaultExecutionPace === undefined || (['fastest', 'realtime'].includes(v.defaultExecutionPace) && capabilities.includes(DIGITAL_TWIN_CAPABILITY.EXECUTION_PACE)))
     && (v.playbackControlPosition === undefined || ['top-left', 'top-right', 'bottom-left', 'bottom-right'].includes(v.playbackControlPosition))
 }
 export const isValidAppErrorMessage = (v) => isProtocolEnvelope(v) && v.type === DIGITAL_TWIN_MESSAGE.APP_ERROR && keys(v, ['type', 'version', 'code']) && (v.code === undefined || text(v.code))
@@ -127,7 +131,7 @@ export function isValidHostMessage(v) {
     case DIGITAL_TWIN_MESSAGE.HOST_READY:
       return keys(v, ['type', 'version', 'extensions']) && (v.extensions === undefined || (isRecord(v.extensions) && Object.keys(v.extensions).length <= 32))
     case DIGITAL_TWIN_MESSAGE.CONNECTION_READY:
-      return keys(v, ['type', 'version', 'requestId', 'connection', 'inputSchedule']) && isValidProtocolId(v.requestId) && isValidConnectionConfig(v.connection) && (v.inputSchedule === undefined || isValidInputSchedule(v.inputSchedule))
+      return keys(v, ['type', 'version', 'requestId', 'connection', 'inputSchedule', 'executionPace']) && isValidProtocolId(v.requestId) && isValidConnectionConfig(v.connection) && (v.inputSchedule === undefined || isValidInputSchedule(v.inputSchedule)) && (v.executionPace === undefined || ['fastest', 'realtime'].includes(v.executionPace))
     case DIGITAL_TWIN_MESSAGE.CONNECTION_ERROR:
       return keys(v, ['type', 'version', 'requestId', 'code']) && isValidProtocolId(v.requestId) && text(v.code)
     case DIGITAL_TWIN_MESSAGE.EXECUTION_CANCEL:

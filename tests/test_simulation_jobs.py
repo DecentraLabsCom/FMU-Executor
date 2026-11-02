@@ -43,7 +43,8 @@ def jobs(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "MAX_BATCH_CASES", 8)
     monkeypatch.setattr(config, "MAX_SCENARIOS_PER_RESERVATION_PER_DAY", None)
     monkeypatch.setattr(fmu_storage, "describe", lambda _key: {
-        "supportsCoSimulation": True, "defaultStepSize": 0.1,
+        "supportsCoSimulation": True, "supportsModelExchange": False,
+        "supportsExecution": True, "defaultStepSize": 0.1,
     })
     monkeypatch.setattr(auth, "validate_gateway_context", lambda _context, _key: None)
     fmu_path = write_test_fmu(tmp_path / "model.fmu")
@@ -58,7 +59,8 @@ def jobs(monkeypatch, tmp_path):
     })
     monkeypatch.setattr(fmu_storage, "snapshot_fmu", lambda path: (path, "a" * 64))
     model_metadata = {
-        "supportsCoSimulation": True, "defaultStepSize": 0.1,
+        "supportsCoSimulation": True, "supportsModelExchange": False,
+        "supportsExecution": True, "defaultStepSize": 0.1,
         "modelVariables": [{"name": "speed", "causality": "output"}],
     }
     monkeypatch.setattr(fmu_storage, "describe_path", lambda _path: model_metadata)
@@ -93,9 +95,10 @@ def test_job_id_generates_default_and_rejects_unsafe_values():
         assert error.value.detail == "INVALID_SIMULATION_ID"
 
 
-def test_options_require_cosimulation_and_a_supported_finite_time_range(monkeypatch):
+def test_options_accept_model_exchange_and_require_a_supported_finite_time_range(monkeypatch):
     monkeypatch.setattr(fmu_storage, "describe", lambda _key: {
-        "supportsCoSimulation": True, "defaultStepSize": 0.1,
+        "supportsCoSimulation": False, "supportsModelExchange": True,
+        "supportsExecution": True, "defaultStepSize": 0.1,
     })
     assert _validate_options("model.fmu", {"stopTime": 1, "stepSize": 0.2}) == 5
     for value in (
@@ -105,12 +108,18 @@ def test_options_require_cosimulation_and_a_supported_finite_time_range(monkeypa
         with pytest.raises(HTTPException):
             _validate_options("model.fmu", value)
 
-    monkeypatch.setattr(fmu_storage, "describe", lambda _key: {"supportsCoSimulation": False})
+    monkeypatch.setattr(fmu_storage, "describe", lambda _key: {
+        "supportsCoSimulation": False, "supportsModelExchange": False,
+        "supportsExecution": False,
+    })
     with pytest.raises(HTTPException) as error:
         _validate_options("model.fmu", {})
-    assert error.value.detail == "FMU_COSIMULATION_REQUIRED"
+    assert error.value.detail == "FMU_EXECUTION_UNSUPPORTED"
 
-    monkeypatch.setattr(fmu_storage, "describe", lambda _key: {"supportsCoSimulation": True})
+    monkeypatch.setattr(fmu_storage, "describe", lambda _key: {
+        "supportsCoSimulation": True, "supportsModelExchange": False,
+        "supportsExecution": True,
+    })
     monkeypatch.setattr(config, "MAX_SIMULATION_STEPS", 2)
     with pytest.raises(HTTPException) as error:
         _validate_options("model.fmu", {"stopTime": 1, "stepSize": 0.1})

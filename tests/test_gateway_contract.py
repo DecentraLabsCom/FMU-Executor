@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import time
+import zipfile
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -111,6 +113,21 @@ def _make_mock_md():
 def _provision_fmu(fmu_root: Path, name: str = "BouncingBall.fmu"):
     fmu = fmu_root / name
     return write_test_fmu(fmu)
+
+
+def _extract_test_fmu(fmu_root: Path, name: str = "BouncingBall.fmu") -> Path:
+    extracted_dir = fmu_root / f"{Path(name).stem}-extracted"
+    with zipfile.ZipFile(fmu_root / name) as archive:
+        archive.extractall(extracted_dir)
+    return extracted_dir
+
+
+def _copy_extracted_fmu(extracted_dir: Path):
+    def extract(_fmu_path: str, *, unzipdir: str) -> str:
+        shutil.copytree(extracted_dir, unzipdir, dirs_exist_ok=True)
+        return unzipdir
+
+    return extract
 
 
 # ===================================================================
@@ -533,12 +550,13 @@ class TestWsSimOutputsContract:
     def test_outputs_shape_from_get_outputs(self, client, _isolate_config):
         """Test via sim.getOutputs (synchronous) — validates the per-message shape."""
         _provision_fmu(_isolate_config)
+        extracted_dir = _extract_test_fmu(_isolate_config)
         md = _make_mock_md()
         mock_fmu = MagicMock()
         mock_fmu.getReal.return_value = [3.14]
 
         with patch("app.engine.read_model_description", return_value=md), \
-             patch("app.engine.fmpy_extract", return_value=str(_isolate_config)), \
+             patch("app.engine.fmpy_extract", side_effect=_copy_extracted_fmu(extracted_dir)), \
              patch("fmpy.read_model_description", return_value=md), \
              patch("app.engine.fmpy_instantiate_fmu", return_value=mock_fmu):
             with client.websocket_connect(
@@ -619,12 +637,13 @@ class TestWsSimOutputsContract:
     def test_subscription_outputs_shape(self, client, _isolate_config):
         """Subscription events expose the fields consumed by the Gateway proxy."""
         _provision_fmu(_isolate_config)
+        extracted_dir = _extract_test_fmu(_isolate_config)
         md = _make_mock_md()
         mock_fmu = MagicMock()
         mock_fmu.getReal.return_value = [3.14]
 
         with patch("app.engine.read_model_description", return_value=md), \
-             patch("app.engine.fmpy_extract", return_value=str(_isolate_config)), \
+             patch("app.engine.fmpy_extract", side_effect=_copy_extracted_fmu(extracted_dir)), \
              patch("fmpy.read_model_description", return_value=md), \
              patch("app.engine.fmpy_instantiate_fmu", return_value=mock_fmu):
             with client.websocket_connect(

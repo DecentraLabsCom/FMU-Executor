@@ -46,8 +46,9 @@ export function createAdaptiveBatchController({
   presentationReserveMs = DEFAULT_PRESENTATION_RESERVE_MS,
   safetyMarginMs = DEFAULT_SAFETY_MARGIN_MS,
 }) {
-  if (![startTime, stopTime, stepSize, maxSamples, targetResponseMs, maxComputeMs, presentationReserveMs, safetyMarginMs].every(Number.isFinite)
-    || stopTime <= startTime || stepSize <= 0 || !Number.isInteger(maxSamples) || maxSamples < 1
+  if (![startTime, stepSize, maxSamples, targetResponseMs, maxComputeMs, presentationReserveMs, safetyMarginMs].every(Number.isFinite)
+    || (stopTime !== undefined && stopTime !== null && (!Number.isFinite(stopTime) || stopTime <= startTime))
+    || stepSize <= 0 || !Number.isInteger(maxSamples) || maxSamples < 1
     || targetResponseMs < 1 || maxComputeMs < 1 || maxComputeMs > 1000
     || presentationReserveMs < 0 || safetyMarginMs < 0) {
     throw new TypeError('A valid simulation interval and adaptive batch budget are required.')

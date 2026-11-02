@@ -19,6 +19,7 @@ import {
 const errorWithCode = (message, code) => Object.assign(new Error(message), { code })
 const MAX_RUN_INPUT_SCHEDULE_EVENTS = 200_000
 const ADVANCE_INPUT_SCHEDULE_TOLERANCE = 1e-12
+const VALID_EXECUTION_PACES = new Set(['fastest', 'realtime'])
 const UTF8_ENCODER = new TextEncoder()
 const VALID_ADVANCE_STOP_REASONS = new Set([
   'target_reached', 'max_samples', 'compute_budget', 'early_return', 'simulation_finished',
@@ -119,6 +120,17 @@ const wait = (ms, signal) => new Promise((resolve, reject) => {
   if (signal.aborted) aborted()
 })
 
+async function waitForRealtimeTarget(run, targetTime) {
+  if (run.executionPace !== 'realtime' || !run.paceClock) return
+  const targetWallTime = run.paceClock.wallTime + Math.max(0, targetTime - run.paceClock.simTime) * 1000
+  while (true) {
+    run.controller.signal.throwIfAborted()
+    const remainingMs = targetWallTime - performance.now()
+    if (remainingMs <= 0) return
+    await wait(Math.max(1, Math.min(remainingMs, 100)), run.controller.signal)
+  }
+}
+
 /** Optional host UI integration composed with the independent direct FMU client. */
 export function createDigitalTwinAppClient({
   getConnection, onHostReady, onSample, onSamples, onReset, onSimulationState,
@@ -126,8 +138,14 @@ export function createDigitalTwinAppClient({
   onFmuStateCheckpoint, onFmuStateLoaded,
   onBatchRendered,
   onResultsComplete, onPlaybackRate, onRunAccepted, onRunRejected, onRunCancelled, onError,
+  executionPaceControl = false, defaultExecutionPace, onExecutionPace,
   defaultPlaybackRate, playbackControlPosition, runRequestTimeoutMs = 30_000,
 } = {}) {
+  if (typeof executionPaceControl !== 'boolean') throw errorWithCode('executionPaceControl must be a boolean.', 'INVALID_INPUT')
+  const configuredExecutionPace = defaultExecutionPace ?? (executionPaceControl ? 'realtime' : 'fastest')
+  if (!VALID_EXECUTION_PACES.has(configuredExecutionPace)) {
+    throw errorWithCode('defaultExecutionPace must be fastest or realtime.', 'INVALID_INPUT')
+  }
   let disposed = false
   let hostReady = typeof getConnection === 'function'
   let sceneReady = false
@@ -145,6 +163,7 @@ export function createDigitalTwinAppClient({
   const capabilities = [DIGITAL_TWIN_CAPABILITY.EXECUTION_CONTROL]
   capabilities.push(DIGITAL_TWIN_CAPABILITY.FMI_LS_EXPERIMENTS)
   capabilities.push(DIGITAL_TWIN_CAPABILITY.FMU_STATE_CHECKPOINTS)
+  if (executionPaceControl) capabilities.push(DIGITAL_TWIN_CAPABILITY.EXECUTION_PACE)
   if (typeof onPlaybackRate === 'function') capabilities.push(DIGITAL_TWIN_CAPABILITY.PLAYBACK_RATE)
   if (typeof onFmiLsParameterPreset === 'function') capabilities.push(DIGITAL_TWIN_CAPABILITY.FMI_LS_PARAMETER_PRESETS)
   const report = (error) => { try { onError?.(error) } catch { /* The app owns its error presentation. */ } }
@@ -163,6 +182,7 @@ export function createDigitalTwinAppClient({
       readySent = postToHost(MESSAGE.APP_READY, {
         capabilities,
         ...(defaultPlaybackRate === undefined ? {} : { defaultPlaybackRate }),
+        ...(executionPaceControl ? { defaultExecutionPace: configuredExecutionPace } : {}),
         ...(playbackControlPosition === undefined ? {} : { playbackControlPosition }),
       })
     }
@@ -185,7 +205,11 @@ export function createDigitalTwinAppClient({
       if (startupError) postToHost(MESSAGE.APP_ERROR, { code: startupError })
       else sendReady()
     } else if (message.type === MESSAGE.CONNECTION_READY) {
-      finishGrant(message.requestId, null, { connection: message.connection, inputSchedule: message.inputSchedule || [] })
+      finishGrant(message.requestId, null, {
+        connection: message.connection,
+        inputSchedule: message.inputSchedule || [],
+        ...(message.executionPace === undefined ? {} : { executionPace: message.executionPace }),
+      })
     } else if (message.type === MESSAGE.CONNECTION_ERROR) {
       finishGrant(message.requestId, errorWithCode('The provider connection could not be authorized.', message.code))
     } else if (message.type === MESSAGE.PLAYBACK_CONTROL) {
@@ -422,7 +446,9 @@ export function createDigitalTwinAppClient({
     try {
       let time = run.resumeTime ?? run.options.startTime
       let eventIndex = 0
-      while (time < run.options.stopTime - 1e-12) {
+      const stopTime = run.options.stopTime
+      const hasStopTime = Number.isFinite(stopTime)
+      while (!hasStopTime || time < stopTime - 1e-12) {
         run.controller.signal.throwIfAborted()
         const scheduleTolerance = Math.max(1e-9, Math.abs(run.options.stepSize) * 1e-7)
         while (eventIndex < run.schedule.length && run.schedule[eventIndex].time <= time + scheduleTolerance) {
@@ -434,7 +460,9 @@ export function createDigitalTwinAppClient({
             run.inputControllerTimes[run.inputControllerTimeIndex] ?? Infinity,
           )
           : Infinity
-        const controllerTargetTime = Math.min(run.options.stopTime, nextControllerTime)
+        const controllerTargetTime = hasStopTime
+          ? Math.min(stopTime, nextControllerTime)
+          : nextControllerTime
         const controllerSampleLimit = run.inputController && run.inputControllerInterval
           ? Math.max(1, Math.ceil((controllerTargetTime - time) / run.options.stepSize) + 1)
           : 1
@@ -444,10 +472,9 @@ export function createDigitalTwinAppClient({
             ? Math.min(run.maxBatchSamples, controllerSampleLimit)
             : run.maxBatchSamples
         const outputSampleEverySteps = run.advanceOptions.outputSampleEverySteps ?? 1
-        const maxSampleTargetTime = Math.min(
-          run.options.stopTime,
-          time + maxSamples * outputSampleEverySteps * run.options.stepSize,
-        )
+        const maxSampleTargetTime = hasStopTime
+          ? Math.min(stopTime, time + maxSamples * outputSampleEverySteps * run.options.stepSize)
+          : time + maxSamples * outputSampleEverySteps * run.options.stepSize
         // Scheduled advances are rejected before execution when their time
         // span would produce more samples than maxSamples. Keep the schedule
         // horizon within the current batch budget, including the first
@@ -459,8 +486,13 @@ export function createDigitalTwinAppClient({
           ? scheduleBatch.events.at(-1).time
           : Infinity
         let targetTime = Math.min(controllerTargetTime, maxSampleTargetTime, scheduledTargetTime)
-        if (!Number.isFinite(targetTime)) targetTime = run.options.stopTime
-        if (targetTime <= time + scheduleTolerance) targetTime = Math.min(run.options.stopTime, time + run.options.stepSize)
+        if (!Number.isFinite(targetTime)) targetTime = maxSampleTargetTime
+        if (targetTime <= time + scheduleTolerance) {
+          targetTime = hasStopTime
+            ? Math.min(stopTime, time + run.options.stepSize)
+            : time + run.options.stepSize
+        }
+        await waitForRealtimeTarget(run, targetTime)
         const result = await operation(run, 'sim.advance', 'sim.samples', {
           targetTime,
           maxSamples,
@@ -552,6 +584,7 @@ export function createDigitalTwinAppClient({
   async function run({
     parameters = {}, options = {}, inputSchedule, composeInputSchedule, inputController, batchPolicy = 'fixed',
     maxBatchSamples = MAX_SAMPLES_PER_BATCH, adaptiveBatchOptions = {}, advanceOptions = {},
+    executionPace: requestedExecutionPace,
     validateModel, parametersFromModel,
     inputControllerInterval, inputControllerTimes = [],
     checkpoint: requestedCheckpoint, captureFmuStateOnComplete: requestedCaptureOnComplete,
@@ -581,6 +614,9 @@ export function createDigitalTwinAppClient({
         || inputControllerTimes.some((time) => !Number.isFinite(time)))) {
       throw errorWithCode('inputControllerTimes must be a bounded list of finite simulation times.', 'INVALID_INPUT')
     }
+    if (requestedExecutionPace !== undefined && !VALID_EXECUTION_PACES.has(requestedExecutionPace)) {
+      throw errorWithCode('executionPace must be fastest or realtime.', 'INVALID_INPUT')
+    }
     const effectiveInputControllerTimes = checkpointBundle
       ? inputControllerTimes.filter((time) => time >= checkpointBundle.simTime - 1e-12)
       : inputControllerTimes
@@ -601,8 +637,6 @@ export function createDigitalTwinAppClient({
     if (!isRecord(adaptiveBatchOptions)) throw errorWithCode('Invalid adaptive batch options.', 'INVALID_INPUT')
     if (!isValidAdvanceOptions(advanceOptions)) throw errorWithCode('Invalid FMU advance options.', 'INVALID_INPUT')
     if (!Number.isInteger(maxBatchSamples) || maxBatchSamples < 1 || maxBatchSamples > MAX_SAMPLES_PER_BATCH) throw errorWithCode(`maxBatchSamples must be an integer from 1 to ${MAX_SAMPLES_PER_BATCH}.`, 'INVALID_INPUT')
-    if (batchPolicy === 'adaptive' && inputController) throw errorWithCode('Adaptive batching cannot be combined with a per-sample input controller.', 'INVALID_INPUT')
-    if (inputController && !inputControllerInterval && maxBatchSamples !== MAX_SAMPLES_PER_BATCH && maxBatchSamples !== 1) throw errorWithCode('maxBatchSamples must be 1 when using a per-sample input controller without an update interval.', 'INVALID_INPUT')
     releaseCompletedRun()
     const current = {
       runId: createProtocolId('run'), controller: new AbortController(), sampleCount: 0,
@@ -621,6 +655,20 @@ export function createDigitalTwinAppClient({
     try {
       const grant = await requestConnection(options, current.controller.signal)
       current.controller.signal.throwIfAborted()
+      if (grant.executionPace !== undefined && !VALID_EXECUTION_PACES.has(grant.executionPace)) {
+        throw errorWithCode('The host returned an invalid execution pace.', 'INVALID_HOST_MESSAGE')
+      }
+      current.executionPace = grant.executionPace ?? requestedExecutionPace ?? configuredExecutionPace
+      current.batchPolicy = current.executionPace === 'realtime' ? 'fixed' : batchPolicy
+      current.maxBatchSamples = current.executionPace === 'realtime' ? 1 : maxBatchSamples
+      if (current.batchPolicy === 'adaptive' && inputController) {
+        throw errorWithCode('Adaptive batching cannot be combined with a per-sample input controller.', 'INVALID_INPUT')
+      }
+      if (inputController && !inputControllerInterval
+        && current.maxBatchSamples !== MAX_SAMPLES_PER_BATCH && current.maxBatchSamples !== 1) {
+        throw errorWithCode('maxBatchSamples must be 1 when using a per-sample input controller without an update interval.', 'INVALID_INPUT')
+      }
+      try { onExecutionPace?.(current.executionPace) } catch (error) { report(error) }
       current.session = await connectFmuSession(grant.connection, { signal: current.controller.signal })
       if ((checkpointBundle || shouldCaptureFmuState)
         && (current.session.capabilities.fmuState?.getAndSet !== true
@@ -628,10 +676,10 @@ export function createDigitalTwinAppClient({
         throw errorWithCode('The provider FMU runtime does not support serialized FMU states.', 'UNSUPPORTED_FMU_STATE')
       }
       if (current.session.capabilities.advanceSamples !== true) throw errorWithCode('The provider FMU runtime needs batched WebSocket support.', 'UNSUPPORTED_FMU_RUNTIME')
-      if (batchPolicy === 'adaptive' && current.session.capabilities.advanceComputeBudget !== true) {
+      if (current.batchPolicy === 'adaptive' && current.session.capabilities.advanceComputeBudget !== true) {
         throw errorWithCode('The provider FMU runtime needs compute-bounded advance support for adaptive batching.', 'UNSUPPORTED_ADAPTIVE_FMU_RUNTIME')
       }
-      if (batchPolicy === 'adaptive' && current.session.capabilities.advanceSampleSequences !== true) {
+      if (current.batchPolicy === 'adaptive' && current.session.capabilities.advanceSampleSequences !== true) {
         throw errorWithCode('The provider FMU runtime needs sequenced advance samples for adaptive batching.', 'UNSUPPORTED_ADAPTIVE_FMU_RUNTIME')
       }
       const outputHz = current.session.capabilities.maxOutputHz
@@ -654,25 +702,25 @@ export function createDigitalTwinAppClient({
         : { ...(checkpointBundle?.modelValues || {}) }
       current.options = {
         startTime: options.startTime ?? model.defaultStartTime ?? 0,
-        stopTime: options.stopTime ?? model.defaultStopTime ?? 1,
+        ...(options.stopTime !== undefined ? { stopTime: options.stopTime } : {}),
         stepSize: options.stepSize ?? model.defaultStepSize ?? 0.001,
       }
       const { startTime, stopTime, stepSize } = current.options
-      if (!isValidOptions(current.options) || stopTime <= startTime || stepSize <= 0) throw errorWithCode('Invalid simulation interval.', 'INVALID_RUN_REQUEST')
+      if (!isValidOptions(current.options) || (stopTime !== undefined && stopTime <= startTime) || stepSize <= 0) throw errorWithCode('Invalid simulation interval.', 'INVALID_RUN_REQUEST')
       const resumeTime = checkpointBundle?.simTime ?? startTime
       if (checkpointBundle && resumeTime < startTime) {
         throw errorWithCode('The saved FMU state is earlier than the configured simulation start time.', 'INVALID_RUN_REQUEST')
       }
-      if (resumeTime >= stopTime) {
+      if (stopTime !== undefined && resumeTime >= stopTime) {
         throw errorWithCode('Stop time must be later than the saved FMU state. Stop time is absolute.', 'INVALID_RUN_REQUEST')
       }
       current.resumeTime = resumeTime
       current.runOptions = { ...current.options, startTime: resumeTime }
-      if (current.inputControllerTimes.some((time) => time < resumeTime || time > stopTime)) {
+      if (current.inputControllerTimes.some((time) => time < resumeTime || (stopTime !== undefined && time > stopTime))) {
         throw errorWithCode('An input controller time is outside the simulation interval.', 'INVALID_INPUT')
       }
       current.nextControllerTime = inputControllerInterval === undefined ? Infinity : resumeTime + inputControllerInterval
-      if (batchPolicy === 'adaptive') {
+      if (current.batchPolicy === 'adaptive') {
         current.batchController = createAdaptiveBatchController({
           startTime: resumeTime, stopTime, stepSize, maxSamples: maxBatchSamples, ...adaptiveBatchOptions,
         })
@@ -687,7 +735,7 @@ export function createDigitalTwinAppClient({
       const schedule = checkpointBundle && Array.isArray(candidateSchedule)
         ? candidateSchedule.filter((event) => event.time >= checkpointBundle.simTime - 1e-12)
         : candidateSchedule
-      if (!isValidRunInputSchedule(schedule) || schedule.some((event) => event.time < startTime || event.time > stopTime)) throw errorWithCode('Invalid input schedule.', 'INVALID_INPUT_SCHEDULE')
+      if (!isValidRunInputSchedule(schedule) || schedule.some((event) => event.time < startTime || (stopTime !== undefined && event.time > stopTime))) throw errorWithCode('Invalid input schedule.', 'INVALID_INPUT_SCHEDULE')
       if (schedule.length && current.session.capabilities.advanceInputValues !== true) {
         throw errorWithCode('The provider FMU runtime cannot apply scheduled inputs during advance.', 'UNSUPPORTED_SCHEDULED_INPUTS')
       }
@@ -717,6 +765,9 @@ export function createDigitalTwinAppClient({
       }
       await updateController(current, initialSample, { initial: true })
       onRunAccepted?.({ runId: current.runId })
+      if (current.executionPace === 'realtime') {
+        current.paceClock = { simTime: resumeTime, wallTime: performance.now() }
+      }
       void pump(current).catch(report)
       return { runId: current.runId }
     } catch (error) {
