@@ -19,6 +19,7 @@ from typing import Any
 import fmpy
 
 from . import config
+from .fmi_ls_dae import read_fmi_ls_dae
 from .fmi_ls_struct import read_fmi_ls_struct
 from .fmu_metadata import describe_model_description
 
@@ -232,6 +233,52 @@ def _host_binary_directories() -> list[str]:
     return []
 
 
+def _select_native_execution_interface(
+    path: Path,
+    model_description: Any,
+    fmi_ls_dae: Any | None,
+) -> tuple[str | None, list[str], str | None]:
+    """Select the first declared execution interface with a native host binary."""
+    host_dirs = _host_binary_directories()
+    extensions = {
+        "windows": (".dll",),
+        "linux": (".so",),
+        "darwin": (".dylib", ".so"),
+    }.get(platform.system().lower(), ())
+    try:
+        with zipfile.ZipFile(path) as archive:
+            names = {entry.filename.replace("\\", "/") for entry in archive.infolist()}
+    except (OSError, zipfile.BadZipFile):
+        names = set()
+    lower_names = {name.lower(): name for name in names} if os.name == "nt" else {}
+
+    interfaces = []
+    if model_description.coSimulation is not None:
+        interfaces.append(("CoSimulation", model_description.coSimulation))
+    if model_description.modelExchange is not None:
+        interfaces.append(("ModelExchange", model_description.modelExchange))
+
+    for interface_name, interface in interfaces:
+        model_identifier = str(getattr(interface, "modelIdentifier", "") or "")
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", model_identifier):
+            continue
+        expected_names = {
+            f"binaries/{directory}/{model_identifier}{extension}"
+            for directory in host_dirs
+            for extension in extensions
+        }
+        matched = expected_names.intersection(names)
+        if os.name == "nt" and not matched:
+            matched = {
+                lower_names[name.lower()]
+                for name in expected_names
+                if name.lower() in lower_names
+            }
+        if matched:
+            return interface_name, sorted(matched), model_identifier
+    return None, [], None
+
+
 def _archive_report(path: Path) -> tuple[bool, list[str], str | None, int | None, int | None, int | None]:
     issues: list[str] = []
     digest = hashlib.sha256()
@@ -346,44 +393,38 @@ def inspect_fmu_path(path: Path | None, *, access_key: str, include_hash: bool =
         "modelExchange": description.modelExchange is not None,
         "scheduledExecution": getattr(description, "scheduledExecution", None) is not None,
     }
+    fmi_ls_dae = None
+    fmi_ls_dae_issue = None
+    try:
+        fmi_ls_dae = read_fmi_ls_dae(path, description)
+    except ValueError as exc:
+        fmi_ls_dae_issue = str(exc)
+    report["capabilities"]["fmiLsDae"] = fmi_ls_dae is not None
+    report["supportsFmiLsDae"] = fmi_ls_dae is not None
+    if fmi_ls_dae is not None:
+        report["fmiLsDae"] = fmi_ls_dae.describe()
+    elif fmi_ls_dae_issue:
+        report["fmiLsDaeIssue"] = fmi_ls_dae_issue[:512]
     if fmi_version.split(".", 1)[0] not in {"2", "3"}:
         report["issues"].append("Executor supports FMI 2.0 and FMI 3.0 only")
-    if description.coSimulation is None:
-        report["issues"].append("FMU does not provide Co-Simulation")
+    if description.coSimulation is None and description.modelExchange is None:
+        report["issues"].append("FMU does not provide Co-Simulation or Model Exchange")
     if not description.guid:
         report["issues"].append("FMU has no GUID")
 
-    model_identifier = str(getattr(description.coSimulation, "modelIdentifier", "") or "")
-    report["modelIdentifier"] = model_identifier
-    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", model_identifier):
-        report["issues"].append("FMU Co-Simulation modelIdentifier is missing or invalid")
-
-    extensions = {
-        "windows": (".dll",),
-        "linux": (".so",),
-        "darwin": (".dylib", ".so"),
-    }.get(platform.system().lower(), ())
-    expected_binary_names = {
-        f"binaries/{directory}/{model_identifier}{extension}"
-        for directory in host_dirs
-        for extension in extensions
-    } if model_identifier else set()
-    try:
-        with zipfile.ZipFile(path) as archive:
-            names = {entry.filename.replace("\\", "/") for entry in archive.infolist()}
-        matched = expected_binary_names.intersection(names)
-        if os.name == "nt" and not matched:
-            lower_names = {name.lower(): name for name in names}
-            matched = {lower_names[name.lower()] for name in expected_binary_names if name.lower() in lower_names}
-        found_binaries = sorted(matched)
-        present = bool(found_binaries)
-    except (OSError, zipfile.BadZipFile):
-        present = False
-        found_binaries = []
+    selected_interface, selected_binaries, model_identifier = _select_native_execution_interface(
+        path,
+        description,
+        fmi_ls_dae,
+    )
+    if model_identifier is not None:
+        report["modelIdentifier"] = model_identifier
+    present = bool(selected_binaries)
+    report["executionInterface"] = selected_interface
     report["nativeBinaryPresent"] = present
-    report["nativeBinaryEntries"] = found_binaries
-    if description.coSimulation is not None and host_dirs and not present:
-        report["issues"].append("FMU has no Co-Simulation binary for this Station platform")
+    report["nativeBinaryEntries"] = selected_binaries
+    if host_dirs and not present and (description.coSimulation is not None or description.modelExchange is not None):
+        report["issues"].append("FMU has no runnable Co-Simulation or Model Exchange binary for this Station platform")
     if not host_dirs:
         report["issues"].append("Station operating system or architecture is unsupported")
     report["stationCompatible"] = not report["issues"]
@@ -509,11 +550,25 @@ def describe_path(
 ) -> dict[str, Any]:
     """Describe a specific immutable FMU file."""
     md = fmpy.read_model_description(str(path))
+    fmi_ls_dae = None
+    fmi_ls_dae_issue = None
+    try:
+        fmi_ls_dae = read_fmi_ls_dae(path, md)
+    except ValueError as exc:
+        fmi_ls_dae_issue = str(exc)
+    execution_interface, _native_binaries, _model_identifier = _select_native_execution_interface(
+        path,
+        md,
+        fmi_ls_dae,
+    )
     description = describe_model_description(
         md,
         public_only=public_only,
         causality=causality,
         display_unit_inverses=_display_unit_inverse_map(path),
+        fmi_ls_dae=fmi_ls_dae,
+        fmi_ls_dae_issue=fmi_ls_dae_issue,
+        execution_interface=execution_interface,
     )
     fmi_ls_struct = read_fmi_ls_struct(
         path,

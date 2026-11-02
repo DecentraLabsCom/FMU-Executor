@@ -13,6 +13,9 @@ def describe_model_description(
     public_only: bool = False,
     causality: str | None = None,
     display_unit_inverses: dict[tuple[str, str], bool] | None = None,
+    fmi_ls_dae: Any | None = None,
+    fmi_ls_dae_issue: str | None = None,
+    execution_interface: str | None = None,
 ) -> dict[str, Any]:
     """Normalize a parsed FMI description without reopening the FMU archive."""
 
@@ -222,8 +225,16 @@ def describe_model_description(
         "fmiVersion": md.fmiVersion,
         "supportsCoSimulation": cs is not None,
         "supportsModelExchange": me is not None,
+        "supportsFmiLsDae": fmi_ls_dae is not None,
+        "supportsExecution": execution_interface in {"CoSimulation", "ModelExchange"},
         "modelVariables": variables,
     }
+    if execution_interface in {"CoSimulation", "ModelExchange"}:
+        result["executionInterface"] = execution_interface
+    if fmi_ls_dae is not None:
+        result["fmiLsDae"] = fmi_ls_dae.describe()
+    elif fmi_ls_dae_issue:
+        result["fmiLsDaeIssue"] = str(fmi_ls_dae_issue)[:512]
 
     for field, maximum_length in (
         ("description", 4096),
@@ -237,7 +248,14 @@ def describe_model_description(
             result[field] = value.strip()[:maximum_length]
 
     capabilities: dict[str, Any] = {}
-    interface = cs or me
+    if execution_interface == "ModelExchange":
+        interface = me
+    elif execution_interface == "CoSimulation":
+        interface = cs
+    else:
+        # Prefer native Co-Simulation when no host-specific selection is
+        # available. Model Exchange is the fallback execution interface.
+        interface = cs or me
     if interface is not None:
         for attribute in (
             "canGetAndSetFMUstate",
@@ -257,7 +275,15 @@ def describe_model_description(
     if capabilities:
         result["capabilities"] = capabilities
 
-    if cs is not None:
+    if execution_interface == "ModelExchange" and me is not None:
+        result["fmiType"] = "ModelExchange"
+        result["simulationKind"] = "modelExchange"
+        result["simulationType"] = "ModelExchange"
+    elif execution_interface == "CoSimulation" and cs is not None:
+        result["fmiType"] = "CoSimulation"
+        result["simulationKind"] = "coSimulation"
+        result["simulationType"] = "CoSimulation"
+    elif cs is not None:
         result["fmiType"] = "CoSimulation"
         result["simulationKind"] = "coSimulation"
         result["simulationType"] = "CoSimulation"

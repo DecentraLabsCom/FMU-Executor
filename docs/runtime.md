@@ -10,7 +10,8 @@ for public access and AAS policy behavior.
 
 ## FMI execution scope
 
-FMU Executor uses FMPy `0.3.32`. FMI 2 Co-Simulation uses FMPy's standard
+FMU Executor uses FMPy `0.3.32` and SUNDIALS IDAS through `sundials4py`.
+FMI 2 Co-Simulation uses FMPy's standard
 factory. FMI 3 Co-Simulation uses a small interface-aware factory because
 FMPy `0.3.32` otherwise requires Model Exchange and Scheduled Execution symbols
 even when an FMU declares only Co-Simulation. Functions belonging exclusively
@@ -20,18 +21,26 @@ to those other FMI 3 interfaces are not required for a Co-Simulation session.
 |---|---|---|
 | FMI 2 Co-Simulation | Supported | Realtime, one-shot and streaming execution. |
 | FMI 3 Co-Simulation | Supported | Realtime, one-shot and streaming execution, including event handling supported by the FMU/runtime. |
+| FMI 2 Model Exchange | Supported | ODE integration with FMPy's SUNDIALS CVode solver, including FMI event indicators, scheduled time events, and runtime input/tunable-parameter changes. |
+| FMI 3 Model Exchange | Supported | ODE integration with FMPy's SUNDIALS CVode solver, including FMI Event Mode iteration, event indicators, scheduled time events, and runtime input/tunable-parameter changes. |
+| FMI 3 Model Exchange + FMI-LS-DAE `1.0.0-alpha.1` | Experimental support | Semi-explicit index-1 equations in Continuous-Time Mode, integrated by SUNDIALS IDAS. Continuous algebraic variables and residuals may use FMI 3 Float32 or Float64 scalars and arrays; equation cardinality is checked after structural array dimensions are applied. The DAE path does not handle events or time events; those behaviors are outside alpha.1's scope. |
 | Scalar Real/Float32/Float64, integer, Boolean and String | Supported | Inputs and outputs exposed by the runtime. |
-| FMI 3 arrays | Supported | Fixed dimensions and arrays sized by fixed `UInt64` structural parameters set in Configuration Mode. |
+| FMI 3 arrays | Supported | Fixed dimensions and arrays sized by structural parameters set in Configuration Mode, including zero-length dimensions. |
 | FMI 3 Binary and Clock | Supported | Where the FMU runtime exposes the corresponding API; Binary uses base64 in JSON. |
 | FMI 3 `Int64` and `UInt64` | Supported | Serialized as strings in JSON to avoid JavaScript precision loss. |
-| FMI 2/FMI 3 Model Exchange | Not executable | The Station execution contract is limited to Co-Simulation. |
 | FMI 3 Scheduled Execution | Planned | Not exposed by the current Station contract. |
 | SSP / multi-FMU composition | Planned | Requires a future composition adapter. |
 
 The model description reports artifact capabilities such as
-`supportsModelExchange`; that flag describes what the FMU declares, not what
-this Executor can run. An executable FMU must provide Co-Simulation. Parsing
-and validation still inspect the full `modelDescription.xml`.
+`supportsModelExchange`; that flag describes what the FMU declares, not by
+itself whether its binary is runnable on this Station. An executable FMU must
+provide a compatible Co-Simulation or Model Exchange binary. If both
+interfaces are present, the Executor prefers Co-Simulation; for a
+Model-Exchange-only FMU it uses CVode for standard ODE models and selects the
+experimental IDAS path only when a valid supported FMI-LS-DAE declaration is
+present. FMI-LS-DAE is an additional equation profile, not a prerequisite for
+ordinary FMI 2/3 Model Exchange. Parsing and validation still inspect the full
+`modelDescription.xml`.
 
 ## Model description and variables
 
@@ -228,8 +237,9 @@ bounded `/tmp` tmpfs; see [configuration](configuration.md#container-image).
 Validation separates four outcomes: `archiveValid`, `modelDescriptionValid`,
 `stationCompatible` and `executionChecked`. It checks compressed and expanded
 archive bounds, path traversal and duplicate paths, FMI version and
-capabilities, GUID, the exact Co-Simulation binary for the current operating
-system and architecture, and whether native dependency loading was checked.
+capabilities, GUID, the selected Co-Simulation or Model Exchange
+binary for the current operating system and architecture, and whether native
+dependency loading was checked.
 
 Use `POST /internal/fmu/validate/{access_key}?probe=true` to load and initialize
 an FMU in an isolated worker. A passing probe checks the dependencies required

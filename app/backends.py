@@ -42,7 +42,12 @@ def backend_status() -> dict[str, Any]:
         "fmpy": {
             "id": "fmpy",
             "available": True,
-            "supports": ["FMI 2 CoSimulation", "FMI 3 CoSimulation"],
+            "supports": [
+                "FMI 2 CoSimulation",
+                "FMI 3 CoSimulation",
+                "FMI 2 ModelExchange",
+                "FMI 3 ModelExchange",
+            ],
             "state": "active",
         },
         "omsimulator": omsimulator_status(),

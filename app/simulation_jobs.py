@@ -139,8 +139,8 @@ def _validate_options(
         raise HTTPException(status_code=422, detail="UNSUPPORTED_SIMULATION_OPTIONS")
     try:
         metadata = model_metadata or fmu_storage.describe(access_key)
-        if not metadata.get("supportsCoSimulation"):
-            raise HTTPException(status_code=422, detail="FMU_COSIMULATION_REQUIRED")
+        if not metadata.get("supportsExecution"):
+            raise HTTPException(status_code=422, detail="FMU_EXECUTION_UNSUPPORTED")
         numeric_options = resolve_simulation_time_options(metadata, options)
         if any(type(value) not in (int, float) for value in numeric_options.values()):
             raise HTTPException(status_code=422, detail="INVALID_SIMULATION_OPTIONS")

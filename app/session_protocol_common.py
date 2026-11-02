@@ -43,7 +43,10 @@ def session_capabilities(
     )
     fmu_state_supported = bool(
         isinstance(model_metadata, dict)
-        and model_metadata.get("simulationType") == "CoSimulation"
+        and (
+            model_metadata.get("simulationType") in {"CoSimulation", "ModelExchange"}
+            or model_metadata.get("executionInterface") in {"CoSimulation", "ModelExchange"}
+        )
         and can_get_state
         and can_serialize_state
         and config.internal_token()

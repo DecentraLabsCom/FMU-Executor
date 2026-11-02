@@ -1,4 +1,4 @@
-"""FMU execution engine – wraps FMPy for Co-Simulation execution."""
+"""FMU execution engine for FMI Co-Simulation and Model Exchange models."""
 
 from __future__ import annotations
 
@@ -22,13 +22,18 @@ from typing import Any, Generator, Optional
 from fmpy import (
     extract as fmpy_extract,
     instantiate_fmu as fmpy_instantiate_fmu,
+    platform_tuple,
     read_model_description,
+    sharedLibraryExtension,
 )
 from fmpy.fmi1 import FMICallException
 from fmpy.fmi2 import fmi2Discard, fmi2LastSuccessfulTime, fmi2Pending, fmi2Terminated
 
 from . import config
 from .fmi3_cosimulation import instantiate_fmi3_cosimulation
+from .fmi3_model_exchange import instantiate_fmi3_model_exchange
+from .fmi_ls_dae import Fmi3DaeIntegrator, FmiLsDaeDefinition, read_fmi_ls_dae
+from .fmi_model_exchange import FmiModelExchangeIntegrator
 from .fmu_metadata import describe_model_description
 from .simulation_defaults import DEFAULT_STEP_SIZE, resolve_simulation_time_options
 
@@ -104,7 +109,7 @@ class OutputSubscription:
 
 
 class FmuSession:
-    """Manage one loaded FMI 2/FMI 3 Co-Simulation session."""
+    """Manage one FMI Co-Simulation or Model Exchange session."""
 
     def __init__(
         self,
@@ -125,6 +130,13 @@ class FmuSession:
         self._extract_dir: Path | None = None
         self._slave: Any | None = None
         self._md = None
+        self._fmi_ls_dae: FmiLsDaeDefinition | None = None
+        self._fmi_ls_dae_issue: str | None = None
+        self._execution_interface: str | None = None
+        self._dae_integrator: Fmi3DaeIntegrator | None = None
+        self._me_integrator: FmiModelExchangeIntegrator | None = None
+        self._use_me = False
+        self._use_dae = False
         self._time: float = 0.0
         self._step_size: float = 0.001
         self._start_time: float = 0.0
@@ -162,6 +174,18 @@ class FmuSession:
         ))
         fmpy_extract(str(self.fmu_path), unzipdir=str(self._extract_dir))
         self._md = read_model_description(str(self.fmu_path))
+        try:
+            self._fmi_ls_dae = read_fmi_ls_dae(self.fmu_path, self._md)
+        except ValueError as exc:
+            self._fmi_ls_dae_issue = str(exc)
+            logger.warning("FMI-LS-DAE manifest is unavailable for %s: %s", self.access_key, exc)
+        if self._md.coSimulation is not None and self._has_native_interface_binary(self._md.coSimulation):
+            self._execution_interface = "CoSimulation"
+        elif (
+            self._md.modelExchange is not None
+            and self._has_native_interface_binary(self._md.modelExchange)
+        ):
+            self._execution_interface = "ModelExchange"
         return self._describe()
 
     def initialize(
@@ -178,8 +202,17 @@ class FmuSession:
             raise RuntimeError("Session already initialised")
         if self._md is None:
             raise RuntimeError("FMU not loaded – call load() first")
-        if self._md.coSimulation is None:
-            raise RuntimeError("FMU does not support Co-Simulation")
+        cosimulation_available = self._execution_interface == "CoSimulation"
+        model_exchange_available = self._execution_interface == "ModelExchange"
+        if cosimulation_available:
+            self._use_me = False
+            self._use_dae = False
+        elif model_exchange_available:
+            self._use_me = True
+            self._use_dae = self._fmi_ls_dae is not None
+        else:
+            detail = self._fmi_ls_dae_issue or "FMU has no executable Co-Simulation or Model Exchange binary"
+            raise RuntimeError(detail)
 
         default_experiment = self._md.defaultExperiment
         default_step_size = getattr(default_experiment, "stepSize", None)
@@ -246,6 +279,8 @@ class FmuSession:
                 if structural_parameters:
                     self._apply_validated_values(structural_parameters)
                 self._apply_structural_array_shapes(dimension_values)
+                if self._use_dae and self._fmi_ls_dae is not None:
+                    slave.setBoolean([self._fmi_ls_dae.enable_dae_value_reference], [True])
                 slave.exitConfigurationMode()
             slave.enterInitializationMode(
                 startTime=self._start_time,
@@ -266,6 +301,26 @@ class FmuSession:
             self._apply_validated_values(remaining_parameters)
 
         slave.exitInitializationMode()
+        if self._use_dae:
+            self._enter_fmi3_continuous_time_mode(slave)
+            if self._fmi_ls_dae is None:
+                raise RuntimeError("FMI-LS-DAE declarations are unavailable")
+            default_tolerance = getattr(default_experiment, "tolerance", None)
+            self._dae_integrator = Fmi3DaeIntegrator(
+                slave,
+                self._fmi_ls_dae,
+                model_description=self._md,
+                start_time=self._start_time,
+                relative_tolerance=default_tolerance,
+            )
+        elif self._use_me:
+            self._me_integrator = FmiModelExchangeIntegrator(
+                slave,
+                self._md,
+                start_time=self._start_time,
+                max_step=self._step_size,
+                relative_tolerance=getattr(default_experiment, "tolerance", None),
+            )
         if self._fmi_major() == "3" and self._fmi3_event_mode_used:
             # FMI 3 Co-Simulation enters Event Mode when Event Mode is enabled.
             # Perform the initial discrete-state iteration before Step Mode.
@@ -702,7 +757,18 @@ class FmuSession:
         if self._state in {"stopped", "error"}:
             raise RuntimeError(f"Session cannot accept inputs from state {self._state}")
         validated = self._validate_values(values, phase="runtime")
-        self._apply_validated_values(validated)
+        if self._me_integrator is not None and validated:
+            terminated = self._me_integrator.apply_input_change(
+                self._time,
+                lambda: self._apply_validated_values(validated),
+            )
+            if terminated:
+                self._state = "stopped"
+                self._finished_reason = "fmu_termination_requested"
+        else:
+            self._apply_validated_values(validated)
+        if self._dae_integrator is not None and validated:
+            self._dae_integrator.restart_after_input_change(self._time, step_size=self._step_size)
 
     def capture_fmu_state(self) -> dict[str, Any]:
         """Capture a serialized checkpoint when the source FMU supports it."""
@@ -741,6 +807,11 @@ class FmuSession:
                 "playbackSpeed": self._playback_speed,
                 "earlyReturnAllowed": self._early_return_allowed,
                 "initialParameters": copy.deepcopy(self._initial_parameters),
+                **(
+                    {"modelExchange": self._me_integrator.snapshot_event_schedule()}
+                    if self._me_integrator is not None
+                    else {}
+                ),
             },
         }
 
@@ -766,6 +837,8 @@ class FmuSession:
         from .fmu_state import MAX_FMU_STATE_CHECKPOINT_JSON_BYTES
         if len(encoded_state) > MAX_FMU_STATE_CHECKPOINT_JSON_BYTES:
             raise ValueError("FMU state checkpoint exceeds the size limit")
+        raw_model_exchange_event_state: Any = None
+        model_exchange_event_state: dict[str, Any] = {}
         try:
             serialized = base64.b64decode(encoded_state, validate=True)
             raw_time = simulation["time"]
@@ -777,6 +850,7 @@ class FmuSession:
             time_value = float(raw_time)
             step_count = raw_step_count
             initial_parameters = simulation["initialParameters"]
+            raw_model_exchange_event_state = simulation.get("modelExchange")
         except (KeyError, TypeError, ValueError, OverflowError) as exc:
             raise ValueError("FMU state checkpoint is invalid or incompatible") from exc
         if not math.isfinite(time_value) or time_value < self._start_time or (
@@ -787,6 +861,14 @@ class FmuSession:
             raise ValueError("FMU state checkpoint exceeds the simulation step budget")
         if not isinstance(initial_parameters, dict):
             raise ValueError("FMU state checkpoint is invalid or incompatible")
+        if self._me_integrator is not None:
+            if not isinstance(raw_model_exchange_event_state, dict):
+                raise ValueError("FMU state checkpoint is missing Model Exchange event metadata")
+            for key, value in raw_model_exchange_event_state.items():
+                if not isinstance(key, str):
+                    raise ValueError("FMU state checkpoint has invalid Model Exchange event metadata")
+                model_exchange_event_state[key] = value
+            self._me_integrator.validate_event_schedule(model_exchange_event_state, time_value)
         state = None
         try:
             state = slave.deserializeFMUState(serialized)
@@ -801,6 +883,12 @@ class FmuSession:
                     logger.debug("Could not free restored FMU state for session %s", self.session_id, exc_info=True)
         self._time = time_value
         self._step_count = step_count
+        if self._dae_integrator is not None:
+            slave.setTime(self._time)
+            self._dae_integrator.restart_after_input_change(self._time, step_size=self._step_size)
+        if self._me_integrator is not None:
+            self._me_integrator.restore_event_schedule(model_exchange_event_state, self._time)
+            self._me_integrator.reset_after_restore(self._time)
         self._initial_parameters = copy.deepcopy(initial_parameters)
         self._finished_reason = None
         self._terminated = False
@@ -811,7 +899,7 @@ class FmuSession:
         return {"state": self._state, "simTime": self._time}
 
     def _supports_serialized_fmu_state(self) -> bool:
-        interface = getattr(self._md, "coSimulation", None)
+        interface = getattr(self._md, "modelExchange", None) if self._use_me else getattr(self._md, "coSimulation", None)
         if interface is None:
             return False
         return bool(
@@ -1032,10 +1120,35 @@ class FmuSession:
     def _fmi_major(self) -> str:
         return str(getattr(self._md, "fmiVersion", "2.0")).split(".", 1)[0]
 
+    def _has_native_interface_binary(self, interface: Any) -> bool:
+        if self._extract_dir is None or interface is None:
+            return False
+        model_identifier = str(getattr(interface, "modelIdentifier", "") or "")
+        if not model_identifier:
+            return False
+        binary = (
+            self._extract_dir
+            / "binaries"
+            / platform_tuple
+            / f"{model_identifier}{sharedLibraryExtension}"
+        )
+        return binary.is_file()
+
     def _instantiate(self) -> Any:
-        """Instantiate through FMPy's FMI 2/FMI 3 selector."""
+        """Instantiate through the selected FMI Co-Simulation or Model Exchange API."""
         if self._extract_dir is None or self._md is None:
             raise RuntimeError("FMU is not loaded")
+        if self._use_me:
+            model_exchange = getattr(self._md, "modelExchange", None)
+            if model_exchange is None:
+                raise RuntimeError("FMU does not declare Model Exchange")
+            if self._fmi_major() == "3":
+                return instantiate_fmi3_model_exchange(self._extract_dir, self._md)
+            return fmpy_instantiate_fmu(
+                str(self._extract_dir),
+                self._md,
+                fmi_type="ModelExchange",
+            )
         # Negotiate FMI 3 early return and event mode only when the FMU exposes
         # Event Mode. FMPy reports the actual reached time on every FMI 3 step.
         co_simulation = self._md.coSimulation
@@ -1060,6 +1173,32 @@ class FmuSession:
         requested_time = current_time + step_size
         if not math.isfinite(requested_time) or requested_time <= current_time:
             raise ValueError("FMI step does not produce a finite later time")
+        if self._use_dae:
+            if self._dae_integrator is None:
+                raise RuntimeError("FMI-LS-DAE integrator is not initialized")
+            reached_time = self._dae_integrator.advance(
+                current_time,
+                requested_time,
+                step_size=step_size,
+            )
+            return reached_time, {
+                "requestedTime": requested_time,
+                "earlyReturn": False,
+                "eventOccurred": False,
+                "eventHandlingNeeded": False,
+                "terminateSimulation": False,
+            }
+        if self._use_me:
+            if self._me_integrator is None:
+                raise RuntimeError("FMI Model Exchange integrator is not initialized")
+            result = self._me_integrator.advance(current_time, requested_time)
+            return float(result["time"]), {
+                "requestedTime": requested_time,
+                "earlyReturn": bool(result["earlyReturn"]),
+                "eventOccurred": bool(result["eventOccurred"]),
+                "eventHandlingNeeded": False,
+                "terminateSimulation": bool(result["terminateSimulation"]),
+            }
         event_handling_needed = False
         terminate_simulation = False
         early_return = False
@@ -1157,7 +1296,26 @@ class FmuSession:
         # The isolated worker may only access the staged FMU path, not the
         # catalog root used to resolve access keys. Reuse its parsed model
         # description and avoid opening a large modelDescription.xml twice.
-        return describe_model_description(self._md)
+        return describe_model_description(
+            self._md,
+            fmi_ls_dae=self._fmi_ls_dae,
+            fmi_ls_dae_issue=self._fmi_ls_dae_issue,
+            execution_interface=self._execution_interface,
+        )
+
+    @staticmethod
+    def _enter_fmi3_continuous_time_mode(slave: Any) -> None:
+        """Complete FMI 3 initialization event iteration before continuous-time use."""
+        for _ in range(1000):
+            needs_update, terminate, *_rest, next_event_time_defined, _next_event_time = slave.updateDiscreteStates()
+            if terminate:
+                raise RuntimeError("FMI Model Exchange requested termination during initialization")
+            if next_event_time_defined:
+                raise RuntimeError("FMI-LS-DAE runtime does not support time events")
+            if not needs_update:
+                slave.enterContinuousTimeMode()
+                return
+        raise RuntimeError("FMI_EVENT_ITERATION_LIMIT_EXCEEDED")
 
     def _merge_declared_start_values(self, values: dict[str, Any]) -> dict[str, Any]:
         """Seed writable FMI starts before applying explicit initialization values."""
@@ -1394,7 +1552,7 @@ class FmuSession:
                     normalised_extent = int(extent)
                 except (TypeError, ValueError, OverflowError) as exc:
                     raise ValueError(f"FMU array '{getattr(var, 'name', '')}' has an unresolved dimension") from exc
-                if normalised_extent <= 0 or normalised_extent != extent:
+                if normalised_extent < 0 or normalised_extent != extent:
                     raise ValueError(f"FMU array '{getattr(var, 'name', '')}' has an invalid dimension")
                 extents.append(normalised_extent)
             return int(reduce(mul, extents, 1))
@@ -1428,7 +1586,7 @@ class FmuSession:
                     raise ValueError(
                         f"FMU array '{getattr(var, 'name', '')}' has an unresolved dimension"
                     ) from exc
-                if normalised_extent <= 0:
+                if normalised_extent < 0:
                     raise ValueError(f"FMU array '{getattr(var, 'name', '')}' has an invalid dimension")
                 extents.append(normalised_extent)
             return int(reduce(mul, extents, 1))
@@ -1440,7 +1598,7 @@ class FmuSession:
                     normalised_extent = int(extent)
                 except (TypeError, ValueError, OverflowError) as exc:
                     raise ValueError(f"FMU array '{getattr(var, 'name', '')}' has an unresolved dimension") from exc
-                if normalised_extent <= 0 or normalised_extent != extent:
+                if normalised_extent < 0 or normalised_extent != extent:
                     raise ValueError(f"FMU array '{getattr(var, 'name', '')}' has an invalid dimension")
                 extents.append(normalised_extent)
             return int(reduce(mul, extents, 1))
@@ -1602,6 +1760,18 @@ class FmuSession:
         return value
 
     def _release_fmu(self) -> None:
+        if self._dae_integrator is not None:
+            try:
+                self._dae_integrator.close()
+            except Exception:
+                logger.debug("FMI-LS-DAE solver release failed for session %s", self.session_id, exc_info=True)
+            self._dae_integrator = None
+        if self._me_integrator is not None:
+            try:
+                self._me_integrator.close()
+            except Exception:
+                logger.debug("FMI Model Exchange solver release failed for session %s", self.session_id, exc_info=True)
+            self._me_integrator = None
         if self._slave is not None:
             try:
                 self._slave.terminate()

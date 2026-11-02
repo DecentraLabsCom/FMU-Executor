@@ -7,7 +7,9 @@ port to the public Internet.
 
 ## Install and run
 
-The supported runtime requires Python 3.11 or newer.
+The supported runtime requires Python 3.12 or newer. Model Exchange ODE
+integration uses FMPy's bundled SUNDIALS CVode solver. The separate
+experimental FMI-LS-DAE path uses the pinned SUNDIALS IDAS Python bindings.
 
 ```bash
 python -m pip install -r requirements.txt

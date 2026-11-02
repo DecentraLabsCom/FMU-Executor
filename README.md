@@ -1,16 +1,20 @@
 # FMU Executor
 
 FMU Executor is the private simulation service packaged with DecentraLabs Lab
-Station. It loads and runs FMI 2.0 and FMI 3.0 Co-Simulation FMUs on Windows or
-Linux. Lab Gateway authorizes reservation-bound work and forwards it to the
-Station; FMU Executor runs the model and returns results. It is not a public
-API and should only be reachable by trusted Gateway and Station components.
+Station. It loads FMI 2.0 and FMI 3.0 Co-Simulation and FMI 2/3 Model Exchange
+FMUs on Windows or Linux. Lab Gateway
+authorizes reservation-bound work and forwards it to the Station; FMU Executor
+runs the model and returns results. It is not a public API and should only be
+reachable by trusted Gateway and Station components.
 
 ```text
 Marketplace → Lab Gateway → Lab Station → FMU Executor → FMU
 ```
 
-The service is written in Python and requires Python 3.11 or newer.
+The service is written in Python and requires Python 3.12 or newer. It runs
+FMI 2/3 Co-Simulation and Model Exchange FMUs. Standard ODE Model Exchange is
+integrated by FMPy's CVode solver; FMI-LS-DAE uses its separate experimental
+IDAS path.
 
 ## Start locally
 

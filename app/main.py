@@ -1022,7 +1022,8 @@ def _validate_input_schedule(
         model_metadata.get("simulationType") or model_metadata.get("simulationKind") or ""
     ).lower().replace("_", "").replace("-", "")
     supports_runtime_tunable_parameters = (
-        fmi_major in {2, 3} and simulation_type.replace(" ", "") == "cosimulation"
+        fmi_major in {2, 3}
+        and simulation_type.replace(" ", "") in {"cosimulation", "modelexchange"}
     )
     schedulable_names = {
         item.get("name")
@@ -1360,7 +1361,10 @@ async def stream_simulation(body: SimulationBody):
     model_capabilities = model_metadata.get("capabilities", {})
     model_capabilities = model_capabilities if isinstance(model_capabilities, dict) else {}
     supports_serialized_state = bool(
-        model_metadata.get("simulationType") == "CoSimulation"
+        (
+            model_metadata.get("simulationType") in {"CoSimulation", "ModelExchange"}
+            or model_metadata.get("executionInterface") in {"CoSimulation", "ModelExchange"}
+        )
         and model_capabilities.get("canGetAndSetFMUstate", model_capabilities.get("canGetAndSetFMUState", False))
         and model_capabilities.get("canSerializeFMUstate", model_capabilities.get("canSerializeFMUState", False))
         and config.internal_token()

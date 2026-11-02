@@ -4,7 +4,7 @@ ARG VERSION
 ARG VCS_REF=unknown
 
 LABEL org.opencontainers.image.source="https://github.com/DecentraLabsCom/FMU-Executor" \
-      org.opencontainers.image.description="Shared DecentraLabs FMI 2/3 Co-Simulation executor" \
+      org.opencontainers.image.description="Shared DecentraLabs FMI 2/3 Co-Simulation and FMI-LS-DAE executor" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${VCS_REF}"
 
