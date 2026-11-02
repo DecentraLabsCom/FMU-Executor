@@ -11,6 +11,15 @@ import ctypes
 import logging
 import math
 
+from .fmi3_clock_scheduler import (
+    FMI3_INTERVAL_CHANGED,
+    FMI3_INTERVAL_NOT_YET_KNOWN,
+    Fmi3InputClockSchedule,
+    consume_fmi3_clock_ticks,
+    due_fmi3_clock_references,
+    read_fmi3_clock_interval_update,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -174,6 +183,7 @@ def _parse_model_structure(
     )
     previous_order = -1
     seen_by_kind: dict[str, set[int]] = {}
+    seen_clocked_previous_references: set[int] = set()
     for node in structure_node:
         kind = node.tag
         if kind not in order:
@@ -234,6 +244,64 @@ def _parse_model_structure(
             getattr(candidate, "causality", None) == "output" for candidate in candidates
         ):
             raise ValueError("FMI-LS-DAE Output must reference an output variable")
+        if kind == "ClockedState":
+            valid_clocked_state = False
+            for candidate in candidates:
+                previous = getattr(candidate, "previous", None)
+                previous_reference = getattr(previous, "valueReference", previous)
+                clocks = getattr(candidate, "clocks", None)
+                candidate_reference = getattr(candidate, "valueReference", None)
+                clock_references = [
+                    getattr(clock, "valueReference", clock)
+                    for clock in (clocks if isinstance(clocks, (list, tuple)) else [])
+                ]
+                if (
+                    getattr(candidate, "variability", None) != "discrete"
+                    or getattr(candidate, "clocks", None) is None
+                    or getattr(candidate, "type", None) not in {
+                        "Float32", "Float64", "Int8", "UInt8", "Int16", "UInt16",
+                        "Int32", "UInt32", "Int64", "UInt64", "Enumeration",
+                    }
+                    or isinstance(previous_reference, bool)
+                    or not isinstance(previous_reference, int)
+                    or previous_reference not in variables_by_reference
+                    or previous_reference == candidate_reference
+                    or previous_reference in seen_clocked_previous_references
+                    or not isinstance(clocks, (list, tuple))
+                    or not clocks
+                    or any(
+                        isinstance(clock_reference, bool)
+                        or not isinstance(clock_reference, int)
+                        or clock_reference not in variables_by_reference
+                        or not any(
+                            getattr(clock_variable, "type", None) == "Clock"
+                            for clock_variable in variables_by_reference[clock_reference]
+                        )
+                        for clock_reference in clock_references
+                    )
+                ):
+                    continue
+                previous_variables = variables_by_reference[previous_reference]
+                if not any(
+                    getattr(previous_variable, "type", None) == getattr(candidate, "type", None)
+                    and (
+                        getattr(previous_variable, "variability", None) == "discrete"
+                        or (
+                            getattr(previous_variable, "variability", None) is None
+                            and getattr(previous_variable, "type", None) not in {"Float32", "Float64"}
+                        )
+                    )
+                    and getattr(previous_variable, "causality", None) != "input"
+                    for previous_variable in previous_variables
+                ):
+                    continue
+                valid_clocked_state = True
+                seen_clocked_previous_references.add(previous_reference)
+                break
+            if not valid_clocked_state:
+                raise ValueError(
+                    "FMI-LS-DAE ClockedState must reference a discrete variable with a valid previous value and Clock"
+                )
         if kind == "InitialUnknown":
             valid_initial_unknown = any(
                 (
@@ -428,11 +496,10 @@ class Fmi3DaeIntegrator:
         start_time: float,
         relative_tolerance: float | None = None,
         internal_step_limit: int = 10_000,
+        input_clock_references: list[int] | None = None,
+        clock_schedules: list[Fmi3InputClockSchedule] | None = None,
+        initial_clocked_outputs: dict[str, Any] | None = None,
     ):
-        if definition.event_indicator_value_references:
-            raise ValueError("FMI-LS-DAE execution with event indicators is not supported by this integrator")
-        if definition.clocked_state_value_references:
-            raise ValueError("FMI-LS-DAE execution with ClockedState variables is not supported")
         try:
             from sundials4py import core, idas
         except ImportError as exc:
@@ -441,7 +508,14 @@ class Fmi3DaeIntegrator:
         self._core = core
         self._idas = idas
         self._fmu = fmu
+        self._model_description = model_description
         self._definition = definition
+        self._input_clock_references = list(input_clock_references or [])
+        self._clock_schedules = list(clock_schedules or [])
+        self._next_event_time_defined = False
+        self._next_event_time: float | None = None
+        self._event_states_changed = False
+        self._event_nominals_changed = False
         variables_by_name = {
             str(getattr(variable, "name", "")): variable
             for variable in (getattr(model_description, "modelVariables", []) or [])
@@ -473,6 +547,48 @@ class Fmi3DaeIntegrator:
             variables_by_name,
             variables_by_reference,
         )
+        self._event_indicator_variables = tuple(
+            variables_by_reference[reference]
+            for reference in definition.event_indicator_value_references
+            if reference in variables_by_reference
+        )
+        if len(self._event_indicator_variables) != len(definition.event_indicator_value_references):
+            raise ValueError("FMI-LS-DAE event indicator is missing from the model description")
+        get_event_indicator_count = getattr(fmu, "getNumberOfEventIndicators", None)
+        raw_event_indicator_count = (
+            get_event_indicator_count()
+            if callable(get_event_indicator_count)
+            else getattr(model_description, "numberOfEventIndicators", 0)
+        )
+        if (
+            isinstance(raw_event_indicator_count, bool)
+            or not isinstance(raw_event_indicator_count, int)
+            or raw_event_indicator_count < 0
+        ):
+            raise ValueError("FMU returned an invalid number of event indicators")
+        self._event_indicator_count = raw_event_indicator_count
+        declared_event_indicator_count = sum(
+            self._variable_size(variable, variables_by_reference)
+            for variable in self._event_indicator_variables
+        )
+        if declared_event_indicator_count != self._event_indicator_count:
+            raise ValueError(
+                "FMI-LS-DAE EventIndicator declarations do not match the FMI event indicator count"
+            )
+        self._clocked_output_variables = tuple(
+            variable
+            for variable in (getattr(model_description, "modelVariables", []) or [])
+            if getattr(variable, "causality", None) == "output"
+            and bool(getattr(variable, "clocks", None))
+        )
+        self._output_clock_variables = tuple(
+            variable
+            for variable in (getattr(model_description, "modelVariables", []) or [])
+            if getattr(variable, "type", None) == "Clock"
+            and getattr(variable, "causality", None) == "output"
+        )
+        self._pending_event_outputs: dict[str, Any] = {}
+        self._clocked_output_cache: dict[str, Any] = dict(initial_clocked_outputs or {})
         self._state_count = int(fmu.getNumberOfContinuousStates())
         derivative_count = sum(spec.size for spec in self._derivative_variables)
         if derivative_count != self._state_count:
@@ -511,6 +627,7 @@ class Fmi3DaeIntegrator:
         self._linear_solver = None
         self._matrix = None
         try:
+            self._initialize_event_mode(float(start_time))
             self._initialize_solver(float(start_time))
         except Exception:
             self.close()
@@ -565,13 +682,219 @@ class Fmi3DaeIntegrator:
             "configure SUNDIALS tolerances",
         )
         self._check_sundials(self._idas.IDASetId(self._ida_memory, self._id_vector), "set DAE variable types")
+        if self._event_indicator_count:
+            self._check_sundials(
+                self._idas.IDARootInit(
+                    self._ida_memory,
+                    self._event_indicator_count,
+                    self._event_indicators,
+                ),
+                "configure FMI event indicators",
+            )
+            self._check_sundials(
+                self._idas.IDASetRootDirection(self._ida_memory, [0] * self._event_indicator_count),
+                "configure FMI event indicator directions",
+            )
+            no_inactive_warning = getattr(self._idas, "IDASetNoInactiveRootWarn", None)
+            if no_inactive_warning is not None:
+                self._check_sundials(
+                    no_inactive_warning(self._ida_memory),
+                    "configure inactive event indicator handling",
+                )
         self._calculate_consistent_initial_conditions(start_time, 1e-6)
+
+    def _initialize_event_mode(self, start_time: float) -> None:
+        """Resolve FMI 3 initialization events and clocks due at simulation start."""
+        initial_clocks = set(due_fmi3_clock_references(self._clock_schedules, start_time))
+        terminated = self._resolve_event_mode(start_time, initial_clocks)
+        if terminated:
+            raise RuntimeError("FMI Model Exchange requested termination during DAE initialization")
+
+    def _update_discrete_states(
+        self,
+        current_time: float,
+        *,
+        activated_clocks: set[int] | None = None,
+        refresh_tunable_clocks: bool = False,
+    ) -> bool:
+        needs_update = True
+        terminate = False
+        states_changed = False
+        nominals_changed = False
+        next_event_time_defined = False
+        next_event_time: float | None = None
+        for _ in range(1000):
+            (
+                needs_update,
+                terminate,
+                iteration_nominals_changed,
+                iteration_states_changed,
+                next_event_time_defined,
+                next_event_time,
+            ) = self._fmu.updateDiscreteStates()
+            states_changed = states_changed or bool(iteration_states_changed)
+            nominals_changed = nominals_changed or bool(iteration_nominals_changed)
+            if terminate or not needs_update:
+                break
+        else:
+            raise RuntimeError("FMI_EVENT_ITERATION_LIMIT_EXCEEDED")
+        if next_event_time_defined:
+            if isinstance(next_event_time, bool) or not isinstance(next_event_time, (int, float)) or not math.isfinite(float(next_event_time)):
+                raise RuntimeError("FMU returned an invalid next event time")
+            if float(next_event_time) < current_time - max(1e-12, abs(current_time) * 1e-12):
+                raise RuntimeError("FMU returned a next event time before the current simulation time")
+        self._next_event_time_defined = bool(next_event_time_defined)
+        self._next_event_time = float(next_event_time) if next_event_time_defined else None
+        self._event_states_changed = states_changed
+        self._event_nominals_changed = nominals_changed
+        self._refresh_aperiodic_clocks(
+            current_time,
+            activated_clocks or set(),
+            refresh_tunable_clocks=refresh_tunable_clocks,
+        )
+        return bool(terminate)
+
+    def _set_input_clock_activations(self, active_references: set[int]) -> None:
+        active = [reference for reference in self._input_clock_references if reference in active_references]
+        if active:
+            self._fmu.setClock(
+                active,
+                [True] * len(active),
+            )
+
+    def _process_event(self, current_time: float, active_clock_references: list[int]) -> bool:
+        self._fmu.enterEventMode()
+        return self._resolve_event_mode(current_time, set(active_clock_references))
+
+    def _resolve_event_mode(
+        self,
+        current_time: float,
+        active_clock_references: set[int],
+        *,
+        refresh_tunable_clocks: bool = False,
+    ) -> bool:
+        """Iterate discrete events, including zero-delay aperiodic clock ticks."""
+        activated_clocks = set(active_clock_references)
+        for _ in range(1000):
+            self._set_input_clock_activations(activated_clocks)
+            if activated_clocks:
+                consume_fmi3_clock_ticks(self._clock_schedules, activated_clocks, current_time)
+            terminated = self._update_discrete_states(
+                current_time,
+                activated_clocks=activated_clocks,
+                refresh_tunable_clocks=refresh_tunable_clocks,
+            )
+            self._capture_event_outputs(activated_clocks)
+            if terminated:
+                return True
+            # FMI requires the FMU to deactivate any input Clock activated for
+            # updateDiscreteStates. Re-activate only when an aperiodic Clock
+            # reports another tick at this same simulation time. An FMU may
+            # also announce another super-dense time event at this instant.
+            activated_clocks = set(due_fmi3_clock_references(self._clock_schedules, current_time))
+            tolerance = max(1e-12, abs(current_time) * 1e-12)
+            time_event_due = (
+                self._next_event_time_defined
+                and self._next_event_time is not None
+                and self._next_event_time <= current_time + tolerance
+            )
+            if not activated_clocks and not time_event_due:
+                break
+        else:
+            raise RuntimeError("FMI_EVENT_ITERATION_LIMIT_EXCEEDED")
+        self._fmu.enterContinuousTimeMode()
+        return False
+
+    def _refresh_aperiodic_clocks(
+        self,
+        current_time: float,
+        activated_clocks: set[int],
+        *,
+        refresh_tunable_clocks: bool = False,
+    ) -> None:
+        for schedule in self._clock_schedules:
+            if schedule.variability == "changing" and schedule.value_reference not in activated_clocks:
+                continue
+            is_aperiodic = schedule.variability in {"changing", "countdown"}
+            is_tunable_periodic = (
+                refresh_tunable_clocks
+                and schedule.variability == "tunable"
+                and schedule.interval_from_fmu
+            )
+            if not is_aperiodic and not is_tunable_periodic:
+                continue
+            qualifier, interval = read_fmi3_clock_interval_update(
+                self._fmu,
+                schedule.value_reference,
+                supports_fraction=schedule.supports_fraction,
+            )
+            if qualifier == FMI3_INTERVAL_NOT_YET_KNOWN:
+                schedule.interval = None
+                schedule.next_time = None
+                continue
+            if qualifier != FMI3_INTERVAL_CHANGED:
+                continue
+            if interval is None:
+                raise RuntimeError("FMU marked a Clock interval as changed without returning a value")
+            if not math.isfinite(interval) or interval < (0 if is_aperiodic else 1e-15):
+                raise RuntimeError("FMU returned an invalid Clock interval")
+            schedule.interval = interval
+            if is_tunable_periodic:
+                if schedule.has_ticked:
+                    schedule.next_time = max(current_time, schedule.last_tick_time + interval)
+            else:
+                schedule.next_time = current_time + interval
+
+    def _next_time_event(self) -> float | None:
+        event_times = [
+            schedule.next_time for schedule in self._clock_schedules
+            if schedule.next_time is not None
+        ]
+        if self._next_event_time_defined and self._next_event_time is not None:
+            event_times.append(self._next_event_time)
+        return min(event_times) if event_times else None
+
+    def _restart_solver(self, current_time: float, step_size: float) -> None:
+        state_values = self._read_continuous_states()
+        algebraic_values = self._read_algebraic_values()
+        derivative_values = self._read_continuous_state_derivatives()
+        self._write_vector(self._state_vector, [*state_values, *algebraic_values])
+        self._write_vector(self._derivative_vector, [*derivative_values, *([0.0] * self._algebraic_count)])
+        self._check_sundials(
+            self._idas.IDAReInit(self._ida_memory, float(current_time), self._state_vector, self._derivative_vector),
+            "restart SUNDIALS after an FMI event",
+        )
+        self._calculate_consistent_initial_conditions(
+            current_time,
+            max(1e-8, min(abs(step_size) * 0.01, 1e-3)),
+        )
+
+    def _event_indicators(
+        self,
+        time: float,
+        state_vector: Any,
+        _derivative_vector: Any,
+        indicator_values: Any,
+        _user_data: Any,
+    ) -> int:
+        try:
+            values = self._core.N_VGetNumpyArray(state_vector)
+            self._set_fmu_for_solver_point(float(time), values)
+            fmu_indicators = (ctypes.c_double * self._event_indicator_count)()
+            self._fmu.getEventIndicators(fmu_indicators, self._event_indicator_count)
+            indicator_values[:] = [float(value) for value in fmu_indicators]
+            if not all(math.isfinite(float(value)) for value in indicator_values):
+                raise RuntimeError("FMU returned a non-finite event indicator")
+            return 0
+        except Exception as exc:
+            self._callback_error = exc
+            return -1
 
     @property
     def state_count(self) -> int:
         return self._state_count
 
-    def advance(self, current_time: float, target_time: float, *, step_size: float) -> float:
+    def advance(self, current_time: float, target_time: float, *, step_size: float) -> dict[str, Any]:
         if self._closed:
             raise RuntimeError("FMI-LS-DAE solver is closed")
         if not math.isfinite(current_time) or not math.isfinite(target_time) or target_time <= current_time:
@@ -585,43 +908,276 @@ class Fmi3DaeIntegrator:
             self._idas.IDASetMaxStep(self._ida_memory, max(step_size, 1e-12)),
             "set SUNDIALS maximum step",
         )
+        tolerance = max(1e-12, abs(current_time) * 1e-12)
+        due_clocks = due_fmi3_clock_references(self._clock_schedules, current_time)
+        next_event_time = self._next_time_event()
+        if next_event_time is not None and next_event_time <= current_time + tolerance:
+            terminated = self._process_event(current_time, due_clocks)
+            if not terminated:
+                self._restart_solver(current_time, step_size)
+            return {
+                "time": current_time,
+                "eventOccurred": True,
+                "terminateSimulation": terminated,
+                "earlyReturn": True,
+            }
+
+        integration_target = target_time
+        time_event_due = next_event_time is not None and next_event_time <= target_time + tolerance
+        if time_event_due and next_event_time is not None:
+            integration_target = min(target_time, next_event_time)
+        self._check_sundials(
+            self._idas.IDASetStopTime(self._ida_memory, integration_target),
+            "set SUNDIALS integration stop time",
+        )
         status, reached_time = self._idas.IDASolve(
             self._ida_memory,
-            float(target_time),
+            float(integration_target),
             self._output_state_vector,
             self._output_derivative_vector,
             self.IDA_NORMAL,
         )
         self._check_callback_and_sundials(status, "integrate FMI-LS-DAE model")
         reached_time = float(reached_time)
-        if not math.isfinite(reached_time) or reached_time < current_time - 1e-10 or reached_time > target_time + 1e-10:
+        if not math.isfinite(reached_time) or reached_time < current_time - 1e-10 or reached_time > integration_target + 1e-10:
             raise RuntimeError("SUNDIALS returned a time outside the requested DAE interval")
         self._copy_vector(self._output_state_vector, self._state_vector)
         self._copy_vector(self._output_derivative_vector, self._derivative_vector)
         self._sync_fmu(reached_time, self._state_vector)
-        enter_event_mode, terminate_simulation = self._fmu.completedIntegratorStep(
-            noSetFMUStatePriorToCurrentPoint=False,
+        enter_event_mode = False
+        terminate_simulation = False
+        needs_completed_step = bool(
+            getattr(getattr(self._model_description, "modelExchange", None), "needsCompletedIntegratorStep", False)
         )
-        if enter_event_mode:
-            raise RuntimeError("FMI-LS-DAE does not support event or discontinuity handling in this runtime")
+        if needs_completed_step:
+            enter_event_mode, terminate_simulation = self._fmu.completedIntegratorStep(
+                noSetFMUStatePriorToCurrentPoint=False,
+            )
         if terminate_simulation:
-            raise RuntimeError("FMI Model Exchange requested termination during DAE integration")
-        return reached_time
+            return {
+                "time": reached_time,
+                "eventOccurred": False,
+                "terminateSimulation": True,
+                "earlyReturn": reached_time < target_time - tolerance,
+            }
 
-    def restart_after_input_change(self, current_time: float, *, step_size: float) -> None:
-        """Discard IDAS history after a discontinuous input update and restore consistency."""
+        root_event = status == getattr(self._idas, "IDA_ROOT_RETURN", 2)
+        reached_scheduled_time = bool(
+            time_event_due
+            and next_event_time is not None
+            and abs(reached_time - next_event_time) <= max(tolerance, 1e-10)
+        )
+        event_occurred = bool(root_event or reached_scheduled_time or enter_event_mode)
+        if event_occurred:
+            scheduled_clocks = due_fmi3_clock_references(self._clock_schedules, reached_time)
+            terminate_simulation = self._process_event(reached_time, scheduled_clocks)
+            if not terminate_simulation:
+                self._restart_solver(reached_time, step_size)
+        return {
+            "time": reached_time,
+            "eventOccurred": event_occurred,
+            "terminateSimulation": bool(terminate_simulation),
+            "earlyReturn": reached_time < target_time - tolerance,
+        }
+
+    def apply_event_mode(
+        self,
+        current_time: float,
+        apply_values: Any,
+        *,
+        step_size: float,
+        active_clock_references: list[int] | None = None,
+        refresh_tunable_clocks: bool = False,
+    ) -> bool:
+        """Apply discrete inputs or tunable parameters at an FMI event instant."""
         if self._closed:
             raise RuntimeError("FMI-LS-DAE solver is closed")
-        state_values = self._read_continuous_states()
-        algebraic_values = self._read_algebraic_values()
-        derivative_values = self._read_continuous_state_derivatives()
-        self._write_vector(self._state_vector, [*state_values, *algebraic_values])
-        self._write_vector(self._derivative_vector, [*derivative_values, *([0.0] * self._algebraic_count)])
-        self._check_sundials(
-            self._idas.IDAReInit(self._ida_memory, float(current_time), self._state_vector, self._derivative_vector),
-            "restart SUNDIALS after an input change",
+        self._fmu.enterEventMode()
+        apply_values()
+        active_clocks = set(active_clock_references or [])
+        active_clocks.update(due_fmi3_clock_references(self._clock_schedules, current_time))
+        terminated = self._resolve_event_mode(
+            current_time,
+            active_clocks,
+            refresh_tunable_clocks=refresh_tunable_clocks,
         )
-        self._calculate_consistent_initial_conditions(current_time, max(1e-8, min(abs(step_size) * 0.01, 1e-3)))
+        if not terminated:
+            self._restart_solver(current_time, step_size)
+        return terminated
+
+    def take_event_outputs(self) -> dict[str, Any]:
+        outputs = self._pending_event_outputs
+        self._pending_event_outputs = {}
+        return outputs
+
+    def clocked_output_cache(self) -> dict[str, Any]:
+        return dict(self._clocked_output_cache)
+
+    def _capture_event_outputs(self, active_input_clocks: set[int]) -> None:
+        clock_variables = {
+            int(getattr(variable, "valueReference")): variable
+            for variable in (getattr(self._model_description, "modelVariables", []) or [])
+            if getattr(variable, "type", None) == "Clock"
+            and isinstance(getattr(variable, "valueReference", None), int)
+        }
+        required_clock_references = {
+            int(getattr(clock, "valueReference", clock))
+            for variable in self._clocked_output_variables
+            for clock in (getattr(variable, "clocks", []) or [])
+            if isinstance(getattr(clock, "valueReference", clock), int)
+            and not isinstance(getattr(clock, "valueReference", clock), bool)
+        }
+        required_clock_references.update(
+            int(variable.valueReference) for variable in self._output_clock_variables
+        )
+        query_references = [
+            reference for reference in required_clock_references
+            if reference in clock_variables
+            and getattr(clock_variables[reference], "causality", None) in {"output", "local"}
+        ]
+        active_clocks = set(active_input_clocks)
+        clock_values: dict[int, bool] = {}
+        if query_references:
+            for reference, value in zip(query_references, self._fmu.getClock(query_references), strict=True):
+                active = bool(value)
+                clock_values[reference] = active
+                variable = clock_variables[reference]
+                if getattr(variable, "causality", None) == "output":
+                    self._pending_event_outputs[str(variable.name)] = active
+
+        for variable in self._clocked_output_variables:
+            associated_references = {
+                int(getattr(clock, "valueReference", clock))
+                for clock in (getattr(variable, "clocks", []) or [])
+                if isinstance(getattr(clock, "valueReference", clock), int)
+                and not isinstance(getattr(clock, "valueReference", clock), bool)
+            }
+            if not associated_references.intersection(active_clocks | {
+                reference for reference, active in clock_values.items() if active
+            }):
+                continue
+            value_reference = int(variable.valueReference)
+            value_type = str(getattr(variable, "type", ""))
+            if value_type == "Enumeration":
+                value_type = "Int64"
+            getter = getattr(self._fmu, f"get{value_type}", None)
+            if getter is None:
+                raise RuntimeError(f"FMI clocked output '{variable.name}' has an unsupported type")
+            size = self._variable_size(variable)
+            values = getter([value_reference], nValues=size) if size > 1 else getter([value_reference])
+            normalized = [self._normalise_clocked_output(value_type, value) for value in values]
+            normalized_value = normalized if size > 1 else normalized[0]
+            self._clocked_output_cache[str(variable.name)] = normalized_value
+            self._pending_event_outputs[str(variable.name)] = normalized_value
+
+    @staticmethod
+    def _normalise_clocked_output(value_type: str, value: Any) -> Any:
+        if value_type in {"Float32", "Float64", "Real"}:
+            number = float(value)
+            if not math.isfinite(number):
+                raise RuntimeError("FMU returned a non-finite clocked output")
+            return number
+        if value_type in {"Int8", "UInt8", "Int16", "UInt16", "Int32", "UInt32", "Int64", "UInt64", "Enumeration"}:
+            return int(value)
+        if value_type in {"Boolean", "Clock"}:
+            return bool(value)
+        if value_type == "String":
+            return str(value)
+        if value_type == "Binary":
+            import base64
+            return base64.b64encode(bytes(value)).decode("ascii")
+        return value
+
+    def snapshot_event_schedule(self) -> dict[str, Any]:
+        return {
+            "nextEventTimeDefined": self._next_event_time_defined,
+            **({"nextEventTime": self._next_event_time} if self._next_event_time_defined else {}),
+            "clockSchedules": [
+                {
+                    "valueReference": schedule.value_reference,
+                    "intervalVariability": schedule.variability,
+                    "interval": schedule.interval,
+                    "shift": schedule.shift,
+                    "nextTime": schedule.next_time,
+                    "lastTickTime": schedule.last_tick_time,
+                    "hasTicked": schedule.has_ticked,
+                }
+                for schedule in self._clock_schedules
+            ],
+            "clockedOutputCache": dict(self._clocked_output_cache),
+        }
+
+    def restore_event_schedule(self, metadata: dict[str, Any], current_time: float) -> None:
+        if type(metadata.get("nextEventTimeDefined")) is not bool:
+            raise ValueError("FMI state checkpoint has invalid DAE event metadata")
+        next_defined = metadata["nextEventTimeDefined"]
+        next_time = metadata.get("nextEventTime")
+        if next_defined:
+            if isinstance(next_time, bool) or not isinstance(next_time, (int, float)) or not math.isfinite(float(next_time)):
+                raise ValueError("FMI state checkpoint has invalid DAE event time")
+            if float(next_time) < current_time - max(1e-12, abs(current_time) * 1e-12):
+                raise ValueError("FMI state checkpoint has a DAE event before its simulation time")
+        raw_schedules = metadata.get("clockSchedules")
+        if not isinstance(raw_schedules, list) or len(raw_schedules) != len(self._clock_schedules):
+            raise ValueError("FMI state checkpoint has invalid DAE clock metadata")
+        raw_clocked_outputs = metadata.get("clockedOutputCache")
+        if not isinstance(raw_clocked_outputs, dict):
+            raise ValueError("FMI state checkpoint has invalid DAE clocked output metadata")
+        clocked_variables = {str(variable.name): variable for variable in self._clocked_output_variables}
+        normalized_clocked_outputs: dict[str, Any] = {}
+        for name, value in raw_clocked_outputs.items():
+            variable = clocked_variables.get(name) if isinstance(name, str) else None
+            if variable is None:
+                raise ValueError("FMI state checkpoint has an unknown DAE clocked output")
+            value_type = str(getattr(variable, "type", ""))
+            if value_type == "Enumeration":
+                value_type = "Int64"
+            size = self._variable_size(variable)
+            raw_values = value if size > 1 and isinstance(value, list) else [value]
+            if len(raw_values) != size:
+                raise ValueError("FMI state checkpoint has an invalid DAE clocked output size")
+            try:
+                normalized = [self._normalise_clocked_output(value_type, item) for item in raw_values]
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("FMI state checkpoint has an invalid DAE clocked output value") from exc
+            normalized_clocked_outputs[name] = normalized if size > 1 else normalized[0]
+        by_reference = {schedule.value_reference: schedule for schedule in self._clock_schedules}
+        restored: set[int] = set()
+        for item in raw_schedules:
+            if not isinstance(item, dict):
+                raise ValueError("FMI state checkpoint has invalid DAE clock metadata")
+            reference = item.get("valueReference")
+            schedule = by_reference.get(reference) if isinstance(reference, int) and not isinstance(reference, bool) else None
+            if schedule is None or reference in restored:
+                raise ValueError("FMI state checkpoint has invalid DAE clock reference")
+            if item.get("intervalVariability") != schedule.variability:
+                raise ValueError("FMI state checkpoint DAE clock configuration does not match the FMU")
+            interval = _checkpoint_optional_finite_number(item.get("interval"), "clock interval")
+            next_clock_time = _checkpoint_optional_finite_number(item.get("nextTime"), "clock next time")
+            last_tick = _checkpoint_finite_number(item.get("lastTickTime"), "clock last tick")
+            shift = _checkpoint_finite_number(item.get("shift"), "clock shift")
+            has_ticked = item.get("hasTicked")
+            if type(has_ticked) is not bool:
+                raise ValueError("FMI state checkpoint has invalid DAE clock tick metadata")
+            if next_clock_time is not None and next_clock_time < current_time - max(1e-12, abs(current_time) * 1e-12):
+                raise ValueError("FMI state checkpoint has a DAE clock before its simulation time")
+            if last_tick > current_time + max(1e-12, abs(current_time) * 1e-12):
+                raise ValueError("FMI state checkpoint has a DAE clock tick after its simulation time")
+            schedule.interval = interval
+            schedule.next_time = next_clock_time
+            schedule.last_tick_time = last_tick
+            schedule.shift = shift
+            schedule.has_ticked = has_ticked
+            restored.add(reference)
+        self._next_event_time_defined = next_defined
+        self._next_event_time = float(next_time) if next_defined else None
+        self._clocked_output_cache = normalized_clocked_outputs
+
+    def restart_after_input_change(self, current_time: float, *, step_size: float) -> None:
+        """Discard IDAS history after an input update and restore DAE consistency."""
+        if self._closed:
+            raise RuntimeError("FMI-LS-DAE solver is closed")
+        self._restart_solver(current_time, step_size)
 
     def close(self) -> None:
         if self._closed:
@@ -837,3 +1393,13 @@ class Fmi3DaeIntegrator:
     def _check_sundials(status: int, operation: str) -> None:
         if isinstance(status, bool) or not isinstance(status, int) or status < 0:
             raise RuntimeError(f"SUNDIALS could not {operation} (status {status})")
+
+
+def _checkpoint_finite_number(value: Any, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+        raise ValueError(f"FMI state checkpoint has an invalid DAE {label}")
+    return float(value)
+
+
+def _checkpoint_optional_finite_number(value: Any, label: str) -> float | None:
+    return None if value is None else _checkpoint_finite_number(value, label)

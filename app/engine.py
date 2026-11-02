@@ -31,6 +31,7 @@ from fmpy.fmi2 import fmi2Discard, fmi2LastSuccessfulTime, fmi2Pending, fmi2Term
 
 from . import config
 from .fmi3_cosimulation import instantiate_fmi3_cosimulation
+from .fmi3_clock_scheduler import Fmi3InputClockSchedule, read_fmi3_input_clock_schedules
 from .fmi3_model_exchange import instantiate_fmi3_model_exchange
 from .fmi_ls_dae import Fmi3DaeIntegrator, FmiLsDaeDefinition, read_fmi_ls_dae
 from .fmi_model_exchange import FmiModelExchangeIntegrator
@@ -135,6 +136,8 @@ class FmuSession:
         self._execution_interface: str | None = None
         self._dae_integrator: Fmi3DaeIntegrator | None = None
         self._me_integrator: FmiModelExchangeIntegrator | None = None
+        self._fmi3_input_clock_references: list[int] = []
+        self._fmi3_clock_schedules: list[Fmi3InputClockSchedule] = []
         self._use_me = False
         self._use_dae = False
         self._time: float = 0.0
@@ -260,6 +263,14 @@ class FmuSession:
         validated_parameters = self._validate_values(initialization_values, phase="initialization")
         if self._use_me and dae_enable_variable is not None:
             self._use_dae = validated_parameters.get(str(dae_enable_variable.name)) is True
+        if (
+            self._use_me
+            and self._fmi_major() == "3"
+            and self._fmi_ls_dae is not None
+            and not self._use_dae
+            and self._fmi3_model_has_clocks()
+        ):
+            raise ValueError("FMI 3 clocked variables in an FMI-LS-DAE FMU require DAE execution mode")
         self._initial_parameters = copy.deepcopy(original_parameters)
         self._time_mode = time_mode
         self._playback_speed = float(playback_speed)
@@ -321,9 +332,26 @@ class FmuSession:
         if remaining_parameters:
             self._apply_validated_values(remaining_parameters)
 
+        initial_clocked_outputs: dict[str, Any] = {}
+        if self._fmi_major() == "3" and self._use_me and self._fmi_ls_dae is not None:
+            (
+                self._fmi3_input_clock_references,
+                self._fmi3_clock_schedules,
+            ) = read_fmi3_input_clock_schedules(slave, self._md, self._start_time)
+            if self._use_dae:
+                clocked_output_names = {
+                    str(variable.name)
+                    for variable in self._md.modelVariables
+                    if variable.causality == "output" and bool(getattr(variable, "clocks", None))
+                }
+                initial_outputs = self._read_outputs()["outputs"]
+                initial_clocked_outputs = {
+                    name: value for name, value in initial_outputs.items()
+                    if name in clocked_output_names
+                }
+
         slave.exitInitializationMode()
         if self._use_dae:
-            self._enter_fmi3_continuous_time_mode(slave)
             if self._fmi_ls_dae is None:
                 raise RuntimeError("FMI-LS-DAE declarations are unavailable")
             default_tolerance = getattr(default_experiment, "tolerance", None)
@@ -333,7 +361,11 @@ class FmuSession:
                 model_description=self._md,
                 start_time=self._start_time,
                 relative_tolerance=default_tolerance,
+                input_clock_references=self._fmi3_input_clock_references,
+                clock_schedules=self._fmi3_clock_schedules,
+                initial_clocked_outputs=initial_clocked_outputs,
             )
+            self._collect_dae_event_outputs()
         elif self._use_me:
             self._me_integrator = FmiModelExchangeIntegrator(
                 slave,
@@ -782,15 +814,17 @@ class FmuSession:
         validated = self._validate_values(values, phase="runtime")
         if self._dae_integrator is not None and validated:
             try:
-                if self._dae_change_requires_event_mode(validated):
+                requires_event_mode = self._dae_change_requires_event_mode(validated)
+                if requires_event_mode:
                     terminated = self._apply_dae_event_mode_values(validated)
                     if terminated:
                         self._state = "stopped"
                         self._finished_reason = "fmu_termination_requested"
                 else:
                     self._apply_validated_values(validated)
-                if self._state != "stopped":
+                if self._state != "stopped" and not requires_event_mode:
                     self._dae_integrator.restart_after_input_change(self._time, step_size=self._step_size)
+                self._collect_dae_event_outputs()
             except Exception:
                 self._state = "error"
                 raise
@@ -828,6 +862,8 @@ class FmuSession:
         target_dae_mode = validated[enable_name]
         if target_dae_mode == self._use_dae:
             return
+        if not target_dae_mode and self._fmi3_model_has_clocks():
+            raise ValueError("FMI 3 clocked variables in an FMI-LS-DAE FMU require DAE execution mode")
 
         slave = self._require_slave()
         try:
@@ -845,14 +881,16 @@ class FmuSession:
 
             default_tolerance = getattr(getattr(self._md, "defaultExperiment", None), "tolerance", None)
             if target_dae_mode:
-                self._enter_fmi3_continuous_time_mode(slave)
                 self._dae_integrator = Fmi3DaeIntegrator(
                     slave,
                     definition,
                     model_description=self._md,
                     start_time=self._time,
                     relative_tolerance=default_tolerance,
+                    input_clock_references=self._fmi3_input_clock_references,
+                    clock_schedules=self._fmi3_clock_schedules,
                 )
+                self._collect_dae_event_outputs()
             else:
                 self._me_integrator = FmiModelExchangeIntegrator(
                     slave,
@@ -867,7 +905,7 @@ class FmuSession:
             raise
 
     def _dae_change_requires_event_mode(self, values: dict[str, Any]) -> bool:
-        """Return whether FMI 3 Model Exchange requires an event for these writes."""
+        """Treat runtime input changes and tunable writes as FMI event instants."""
         if self._md is None:
             raise RuntimeError("FMU model description is not loaded")
         variables = {str(variable.name): variable for variable in self._md.modelVariables}
@@ -877,37 +915,49 @@ class FmuSession:
                 continue
             causality = str(getattr(variable, "causality", ""))
             variability = str(getattr(variable, "variability", ""))
-            if (causality == "parameter" and variability == "tunable") or (
-                causality == "input" and variability in {"discrete", "tunable"}
-            ):
+            if causality == "input" or (causality == "parameter" and variability == "tunable"):
                 return True
         return False
 
     def _apply_dae_event_mode_values(self, values: dict[str, Any]) -> bool:
         """Apply tunable/discrete DAE changes through FMI 3 Event Mode."""
-        slave = self._require_slave()
         if self._fmi_major() != "3":
             raise RuntimeError("FMI-LS-DAE event updates require FMI 3")
+        if self._dae_integrator is None:
+            raise RuntimeError("FMI-LS-DAE event handling is not initialized")
+        variables = {str(variable.name): variable for variable in self._md.modelVariables}
+        active_clock_references = [
+            int(variables[name].valueReference)
+            for name, value in values.items()
+            if value is True
+            and name in variables
+            and str(getattr(variables[name], "type", "")) == "Clock"
+        ]
+        tunable_parameter_changed = any(
+            name in variables
+            and str(getattr(variables[name], "causality", "")) == "parameter"
+            and str(getattr(variables[name], "variability", "")) == "tunable"
+            for name in values
+        )
+        non_clock_values = {
+            name: value
+            for name, value in values.items()
+            if name not in variables or str(getattr(variables[name], "type", "")) != "Clock"
+        }
+        return self._dae_integrator.apply_event_mode(
+            self._time,
+            lambda: self._apply_validated_values(non_clock_values),
+            step_size=self._step_size,
+            active_clock_references=active_clock_references,
+            refresh_tunable_clocks=tunable_parameter_changed,
+        )
 
-        slave.enterEventMode()
-        self._apply_validated_values(values)
-        for _ in range(1000):
-            (
-                needs_update,
-                terminate,
-                _nominals_changed,
-                _states_changed,
-                next_event_time_defined,
-                _next_event_time,
-            ) = slave.updateDiscreteStates()
-            if terminate:
-                return True
-            if next_event_time_defined:
-                raise RuntimeError("FMI-LS-DAE runtime does not support time events")
-            if not needs_update:
-                slave.enterContinuousTimeMode()
-                return False
-        raise RuntimeError("FMI_EVENT_ITERATION_LIMIT_EXCEEDED")
+    def _collect_dae_event_outputs(self) -> None:
+        if self._dae_integrator is None:
+            return
+        outputs = self._dae_integrator.take_event_outputs()
+        if outputs:
+            self._pending_event_outputs = {**(self._pending_event_outputs or {}), **outputs}
 
     def capture_fmu_state(self) -> dict[str, Any]:
         """Capture a serialized checkpoint when the source FMU supports it."""
@@ -947,6 +997,11 @@ class FmuSession:
                 "earlyReturnAllowed": self._early_return_allowed,
                 "initialParameters": copy.deepcopy(self._initial_parameters),
                 **(
+                    {"fmiLsDae": self._dae_integrator.snapshot_event_schedule()}
+                    if self._dae_integrator is not None
+                    else {}
+                ),
+                **(
                     {"modelExchange": self._me_integrator.snapshot_event_schedule()}
                     if self._me_integrator is not None
                     else {}
@@ -978,6 +1033,7 @@ class FmuSession:
             raise ValueError("FMU state checkpoint exceeds the size limit")
         raw_model_exchange_event_state: Any = None
         model_exchange_event_state: dict[str, Any] = {}
+        raw_dae_event_state: Any = None
         try:
             serialized = base64.b64decode(encoded_state, validate=True)
             raw_time = simulation["time"]
@@ -990,6 +1046,7 @@ class FmuSession:
             step_count = raw_step_count
             initial_parameters = simulation["initialParameters"]
             raw_model_exchange_event_state = simulation.get("modelExchange")
+            raw_dae_event_state = simulation.get("fmiLsDae")
         except (KeyError, TypeError, ValueError, OverflowError) as exc:
             raise ValueError("FMU state checkpoint is invalid or incompatible") from exc
         if not math.isfinite(time_value) or time_value < self._start_time or (
@@ -1008,6 +1065,8 @@ class FmuSession:
                     raise ValueError("FMU state checkpoint has invalid Model Exchange event metadata")
                 model_exchange_event_state[key] = value
             self._me_integrator.validate_event_schedule(model_exchange_event_state, time_value)
+        if self._dae_integrator is not None and not isinstance(raw_dae_event_state, dict):
+            raise ValueError("FMU state checkpoint is missing FMI-LS-DAE event metadata")
         state = None
         try:
             state = slave.deserializeFMUState(serialized)
@@ -1024,6 +1083,7 @@ class FmuSession:
         self._step_count = step_count
         if self._dae_integrator is not None:
             slave.setTime(self._time)
+            self._dae_integrator.restore_event_schedule(raw_dae_event_state, self._time)
             self._dae_integrator.restart_after_input_change(self._time, step_size=self._step_size)
         if self._me_integrator is not None:
             self._me_integrator.restore_event_schedule(model_exchange_event_state, self._time)
@@ -1296,6 +1356,14 @@ class FmuSession:
             None,
         )
 
+    def _fmi3_model_has_clocks(self) -> bool:
+        if self._md is None or self._fmi_major() != "3":
+            return False
+        return any(
+            self._variable_type(variable) == "Clock" or bool(getattr(variable, "clocks", None))
+            for variable in self._md.modelVariables
+        )
+
     def _instantiate(self) -> Any:
         """Instantiate through the selected FMI Co-Simulation or Model Exchange API."""
         if self._extract_dir is None or self._md is None:
@@ -1338,17 +1406,18 @@ class FmuSession:
         if self._use_dae:
             if self._dae_integrator is None:
                 raise RuntimeError("FMI-LS-DAE integrator is not initialized")
-            reached_time = self._dae_integrator.advance(
+            result = self._dae_integrator.advance(
                 current_time,
                 requested_time,
                 step_size=step_size,
             )
-            return reached_time, {
+            self._collect_dae_event_outputs()
+            return float(result["time"]), {
                 "requestedTime": requested_time,
-                "earlyReturn": False,
-                "eventOccurred": False,
+                "earlyReturn": bool(result["earlyReturn"]),
+                "eventOccurred": bool(result["eventOccurred"]),
                 "eventHandlingNeeded": False,
-                "terminateSimulation": False,
+                "terminateSimulation": bool(result["terminateSimulation"]),
             }
         if self._use_me:
             if self._me_integrator is None:
@@ -1464,20 +1533,6 @@ class FmuSession:
             fmi_ls_dae_issue=self._fmi_ls_dae_issue,
             execution_interface=self._execution_interface,
         )
-
-    @staticmethod
-    def _enter_fmi3_continuous_time_mode(slave: Any) -> None:
-        """Complete FMI 3 initialization event iteration before continuous-time use."""
-        for _ in range(1000):
-            needs_update, terminate, *_rest, next_event_time_defined, _next_event_time = slave.updateDiscreteStates()
-            if terminate:
-                raise RuntimeError("FMI Model Exchange requested termination during initialization")
-            if next_event_time_defined:
-                raise RuntimeError("FMI-LS-DAE runtime does not support time events")
-            if not needs_update:
-                slave.enterContinuousTimeMode()
-                return
-        raise RuntimeError("FMI_EVENT_ITERATION_LIMIT_EXCEEDED")
 
     def _merge_declared_start_values(self, values: dict[str, Any]) -> dict[str, Any]:
         """Seed writable FMI starts before applying explicit initialization values."""
@@ -1694,18 +1749,32 @@ class FmuSession:
         remaining_event_outputs = (
             dict(pending_event_outputs) if pending_event_outputs is not None else None
         )
+        clocked_output_cache = (
+            self._dae_integrator.clocked_output_cache()
+            if self._dae_integrator is not None
+            else {}
+        )
         for var in self._md.modelVariables:
             if var.causality != "output":
                 continue
             if refs is not None and var.valueReference not in refs:
                 continue
+            vtype = self._variable_type(var)
             if pending_event_outputs is not None and var.name in pending_event_outputs:
                 outputs[var.name] = pending_event_outputs[var.name]
                 if remaining_event_outputs is not None:
                     remaining_event_outputs.pop(var.name, None)
                 continue
+            if self._dae_integrator is not None and bool(getattr(var, "clocks", None)):
+                if var.name in clocked_output_cache:
+                    outputs[var.name] = clocked_output_cache[var.name]
+                # FMI 3 only permits reading clocked variables in Initialization
+                # Mode or while one of their associated Clocks is active.
+                continue
+            if self._dae_integrator is not None and vtype == "Clock":
+                outputs[var.name] = False
+                continue
             vr = [int(var.valueReference)]
-            vtype = self._variable_type(var)
             getter = getattr(self._slave, f"get{vtype}", None)
             if getter is None:
                 raise RuntimeError(f"FMU output '{var.name}' uses unsupported type {vtype}")

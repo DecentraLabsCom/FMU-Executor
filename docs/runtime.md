@@ -23,12 +23,12 @@ to those other FMI 3 interfaces are not required for a Co-Simulation session.
 | FMI 3 Co-Simulation | Supported | Realtime, one-shot and streaming execution, including event handling supported by the FMU/runtime. |
 | FMI 2 Model Exchange | Supported | ODE integration with FMPy's SUNDIALS CVode solver, including FMI event indicators, scheduled time events, and runtime input/tunable-parameter changes. |
 | FMI 3 Model Exchange | Supported | ODE integration with FMPy's SUNDIALS CVode solver, including FMI Event Mode iteration, event indicators, scheduled time events, and runtime input/tunable-parameter changes. |
-| FMI 3 Model Exchange + FMI-LS-DAE `1.0.0-alpha.1` | Experimental support | Semi-explicit index-1 equations in Continuous-Time Mode, integrated by SUNDIALS IDAS. Continuous algebraic variables and residuals may use FMI 3 Float32 or Float64 scalars and arrays; equation cardinality is checked after structural array dimensions are applied. The DAE path does not handle events or time events; those behaviors are outside alpha.1's scope. |
+| FMI 3 Model Exchange + FMI-LS-DAE `1.0.0-alpha.1` | Experimental support | Semi-explicit index-1 equations in Continuous-Time Mode, integrated by SUNDIALS IDAS. Continuous algebraic variables and residuals may use FMI 3 Float32 or Float64 scalars and arrays; equation cardinality is checked after structural array dimensions are applied. The Executor also applies FMI 3 Model Exchange event indicators, Event Mode iteration, time events, periodic and aperiodic input Clocks (including triggered input activations), clocked outputs/states, and solver reinitialization after state or input discontinuities. These hybrid behaviors use FMI 3 core semantics; alpha.1 itself leaves event handling and discontinuities outside its scope. When an FMI-LS-DAE FMU declares Clocks, execute it in DAE mode; the alternate ODE mode does not schedule Clocks. |
 | Scalar Real/Float32/Float64, integer, Boolean and String | Supported | Inputs and outputs exposed by the runtime. |
 | FMI 3 arrays | Supported | Fixed dimensions and arrays sized by structural parameters set in Configuration Mode, including zero-length dimensions. |
 | FMI 3 Binary and Clock | Supported | Where the FMU runtime exposes the corresponding API; Binary uses base64 in JSON. |
 | FMI 3 `Int64` and `UInt64` | Supported | Serialized as strings in JSON to avoid JavaScript precision loss. |
-| FMI 3 Scheduled Execution | Planned | Not exposed by the current Station contract. |
+| FMI 3 Scheduled Execution | Planned | A separate FMI interface from Model Exchange; `fmi3ActivateModelPartition` and Scheduled Execution scheduling are not part of the DAE Model Exchange support above. |
 | SSP / multi-FMU composition | Planned | Requires a future composition adapter. |
 
 The model description reports artifact capabilities such as
