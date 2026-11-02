@@ -333,6 +333,7 @@ class FmuSession:
             self._apply_validated_values(remaining_parameters)
 
         initial_clocked_outputs: dict[str, Any] = {}
+        initial_unknown_values: dict[int, Any] = {}
         if self._fmi_major() == "3" and self._use_me and self._fmi_ls_dae is not None:
             (
                 self._fmi3_input_clock_references,
@@ -341,7 +342,7 @@ class FmuSession:
             if self._use_dae:
                 clocked_output_names = {
                     str(variable.name)
-                    for variable in self._md.modelVariables
+                    for variable in self._effective_output_variables()
                     if variable.causality == "output" and bool(getattr(variable, "clocks", None))
                 }
                 initial_outputs = self._read_outputs()["outputs"]
@@ -349,6 +350,7 @@ class FmuSession:
                     name: value for name, value in initial_outputs.items()
                     if name in clocked_output_names
                 }
+                initial_unknown_values = self._read_fmi_ls_dae_initial_unknowns()
 
         slave.exitInitializationMode()
         if self._use_dae:
@@ -364,6 +366,7 @@ class FmuSession:
                 input_clock_references=self._fmi3_input_clock_references,
                 clock_schedules=self._fmi3_clock_schedules,
                 initial_clocked_outputs=initial_clocked_outputs,
+                initial_unknown_values=initial_unknown_values,
             )
             self._collect_dae_event_outputs()
         elif self._use_me:
@@ -906,9 +909,10 @@ class FmuSession:
 
     def _dae_change_requires_event_mode(self, values: dict[str, Any]) -> bool:
         """Treat runtime input changes and tunable writes as FMI event instants."""
-        if self._md is None:
+        model_description = self._md
+        if model_description is None:
             raise RuntimeError("FMU model description is not loaded")
-        variables = {str(variable.name): variable for variable in self._md.modelVariables}
+        variables = {str(variable.name): variable for variable in model_description.modelVariables}
         for name in values:
             variable = variables.get(name)
             if variable is None:
@@ -925,7 +929,10 @@ class FmuSession:
             raise RuntimeError("FMI-LS-DAE event updates require FMI 3")
         if self._dae_integrator is None:
             raise RuntimeError("FMI-LS-DAE event handling is not initialized")
-        variables = {str(variable.name): variable for variable in self._md.modelVariables}
+        model_description = self._md
+        if model_description is None:
+            raise RuntimeError("FMU model description is not loaded")
+        variables = {str(variable.name): variable for variable in model_description.modelVariables}
         active_clock_references = [
             int(variables[name].valueReference)
             for name, value in values.items()
@@ -1739,7 +1746,7 @@ class FmuSession:
         if not self._md or not self._slave:
             return {}
         outputs: dict[str, Any] = {}
-        output_variables = [v for v in self._md.modelVariables if v.causality == "output"]
+        output_variables = self._effective_output_variables()
         output_refs = {int(v.valueReference) for v in output_variables}
         if refs is not None:
             unknown_refs = set(int(ref) for ref in refs) - output_refs
@@ -1754,9 +1761,7 @@ class FmuSession:
             if self._dae_integrator is not None
             else {}
         )
-        for var in self._md.modelVariables:
-            if var.causality != "output":
-                continue
+        for var in output_variables:
             if refs is not None and var.valueReference not in refs:
                 continue
             vtype = self._variable_type(var)
@@ -1788,6 +1793,72 @@ class FmuSession:
             outputs[var.name] = normalised if self._is_array(var) else normalised[0]
         self._pending_event_outputs = remaining_event_outputs or None
         return outputs
+
+    def _effective_output_variables(self) -> list[Any]:
+        if self._md is None:
+            return []
+        model_outputs = [
+            variable for variable in self._md.modelVariables
+            if getattr(variable, "causality", None) == "output"
+        ]
+        if not self._use_dae or self._fmi_ls_dae is None:
+            return model_outputs
+        outputs_by_reference: dict[int, Any] = {}
+        for variable in model_outputs:
+            reference = getattr(variable, "valueReference", None)
+            if isinstance(reference, int) and not isinstance(reference, bool):
+                outputs_by_reference.setdefault(reference, variable)
+        ordered_outputs = []
+        for reference in self._fmi_ls_dae.output_value_references:
+            variable = outputs_by_reference.get(reference)
+            if variable is None:
+                raise RuntimeError(
+                    f"FMI-LS-DAE Output value reference {reference} is missing from the model description"
+                )
+            ordered_outputs.append(variable)
+        return ordered_outputs
+
+    def _read_fmi_ls_dae_initial_unknowns(self) -> dict[int, Any]:
+        """Snapshot ordered FMI-LS-DAE InitialUnknown variables in Initialization Mode."""
+        if self._md is None or self._slave is None or self._fmi_ls_dae is None:
+            return {}
+        variables_by_reference: dict[int, Any] = {}
+        for variable in self._md.modelVariables:
+            reference = getattr(variable, "valueReference", None)
+            if isinstance(reference, int) and not isinstance(reference, bool):
+                variables_by_reference.setdefault(reference, variable)
+        values: dict[int, Any] = {}
+        for reference in self._fmi_ls_dae.initial_unknown_value_references:
+            variable = variables_by_reference.get(reference)
+            if variable is None:
+                raise RuntimeError(
+                    f"FMI-LS-DAE InitialUnknown value reference {reference} is missing from the model description"
+                )
+            value_type = self._variable_type(variable)
+            getter = getattr(self._slave, f"get{value_type}", None)
+            if getter is None:
+                raise RuntimeError(
+                    f"FMI-LS-DAE InitialUnknown '{variable.name}' has an unsupported type {value_type}"
+                )
+            value_reference = [reference]
+            size = self._variable_size(variable)
+            try:
+                raw_values = (
+                    getter(value_reference, nValues=size)
+                    if self._is_array(variable)
+                    else getter(value_reference)
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Could not read FMI-LS-DAE InitialUnknown '{variable.name}' during initialization"
+                ) from exc
+            normalized = list(raw_values)
+            if len(normalized) != size:
+                raise RuntimeError(
+                    f"FMI-LS-DAE InitialUnknown '{variable.name}' returned an unexpected value count"
+                )
+            values[reference] = normalized if self._is_array(variable) else normalized[0]
+        return values
 
     @staticmethod
     def _normalise_type(var: Any) -> str:

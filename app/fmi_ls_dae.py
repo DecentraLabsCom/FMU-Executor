@@ -31,6 +31,10 @@ MAX_MANIFEST_BYTES = 1024 * 1024
 MAX_EQUATIONS = 100_000
 MAX_FMI3_VALUE_REFERENCE = (1 << 32) - 1
 DEPENDENCY_KINDS = frozenset({"dependent", "constant", "fixed", "tunable", "discrete"})
+NUMERIC_VARIABLE_TYPES = frozenset({
+    "Float32", "Float64", "Int8", "UInt8", "Int16", "UInt16",
+    "Int32", "UInt32", "Int64", "UInt64", "Enumeration",
+})
 
 
 @dataclass(frozen=True)
@@ -55,7 +59,15 @@ class FmiLsDaeDefinition:
     derivative_value_references: tuple[int, ...]
     derivative_names: tuple[str, ...]
     derivative_types: tuple[str, ...]
+    state_value_references: tuple[int, ...]
     model_structure: tuple[FmiLsDaeModelStructureEntry, ...]
+
+    @property
+    def output_value_references(self) -> tuple[int, ...]:
+        return tuple(
+            entry.value_reference for entry in self.model_structure
+            if entry.kind == "Output"
+        )
 
     @property
     def initial_unknown_value_references(self) -> tuple[int, ...]:
@@ -77,6 +89,10 @@ class FmiLsDaeDefinition:
             entry.value_reference for entry in self.model_structure
             if entry.kind == "ClockedState"
         )
+
+    @property
+    def residual_model_structure(self) -> tuple[FmiLsDaeModelStructureEntry, ...]:
+        return tuple(entry for entry in self.model_structure if entry.kind == "Residual")
 
     def describe(self) -> dict[str, Any]:
         return {
@@ -144,6 +160,43 @@ def _parse_dependency_references(
     return tuple(references)
 
 
+def _model_variable_size(variable: Any, variables_by_reference: dict[int, Any]) -> int:
+    """Resolve the declared scalar/array extent used by FMI ModelStructure lists."""
+    shape = getattr(variable, "shape", None)
+    if isinstance(shape, (list, tuple)) and shape:
+        extents = shape
+    else:
+        dimensions = getattr(variable, "dimensions", None)
+        if not isinstance(dimensions, (list, tuple)) or not dimensions:
+            return 1
+        extents = []
+        for dimension in dimensions:
+            extent = getattr(dimension, "start", None)
+            if extent is None:
+                referenced_variable = getattr(dimension, "variable", None)
+                extent = getattr(referenced_variable, "start", None)
+            if extent is None:
+                reference = getattr(dimension, "valueReference", None)
+                if isinstance(reference, int) and not isinstance(reference, bool):
+                    extent = getattr(variables_by_reference.get(reference), "start", None)
+            extents.append(extent)
+
+    size = 1
+    for extent in extents:
+        if isinstance(extent, bool):
+            raise ValueError("FMI-LS-DAE array has an invalid dimension")
+        try:
+            normalized_extent = int(extent)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("FMI-LS-DAE array has an unresolved dimension") from exc
+        if normalized_extent < 0 or normalized_extent != extent:
+            raise ValueError("FMI-LS-DAE array has an invalid dimension")
+        size *= normalized_extent
+        if size > MAX_EQUATIONS:
+            raise ValueError("FMI-LS-DAE array equation count exceeds the supported limit")
+    return size
+
+
 def _parse_model_structure(
     structure_node: ET.Element,
     variables: list[Any],
@@ -159,32 +212,70 @@ def _parse_model_structure(
         "Residual": 5,
     }
     entries: list[FmiLsDaeModelStructureEntry] = []
+    structure_children = list(structure_node)
     continuous_state_references: set[int] = set()
     continuous_derivative_references: set[int] = set()
-    for variable in variables:
-        derivative_of = getattr(variable, "derivative", None)
-        if derivative_of is None:
+    for node in structure_children:
+        if node.tag != "ContinuousStateDerivative":
             continue
-        variable_reference = getattr(variable, "valueReference", None)
-        if isinstance(variable_reference, int) and not isinstance(variable_reference, bool):
-            continuous_derivative_references.add(variable_reference)
-        state_reference = getattr(derivative_of, "valueReference", derivative_of)
-        if isinstance(state_reference, int) and not isinstance(state_reference, bool):
-            continuous_state_references.add(state_reference)
-    known_references = set(algebraic_references) | continuous_state_references
-    known_references.update(
-        int(getattr(variable, "valueReference"))
-        for variable in variables
-        if isinstance(getattr(variable, "valueReference", None), int)
-        and not isinstance(getattr(variable, "valueReference", None), bool)
-        and getattr(variable, "causality", None) in {
-            "input", "parameter", "structuralParameter", "independent",
-        }
+        derivative_reference = _value_reference(node, label="ModelStructure/ContinuousStateDerivative")
+        for variable in variables_by_reference.get(derivative_reference, []):
+            derivative_of = getattr(variable, "derivative", None)
+            if derivative_of is None:
+                continue
+            continuous_derivative_references.add(derivative_reference)
+            state_reference = getattr(derivative_of, "valueReference", derivative_of)
+            if isinstance(state_reference, int) and not isinstance(state_reference, bool):
+                continuous_state_references.add(state_reference)
+    declared_event_indicator_references = {
+        _value_reference(node, label="ModelStructure/EventIndicator")
+        for node in structure_children
+        if node.tag == "EventIndicator"
+    }
+    input_parameter_and_time_references = {
+        reference
+        for reference, candidates in variables_by_reference.items()
+        if any(
+            getattr(variable, "causality", None) in {"input", "parameter", "independent"}
+            for variable in candidates
+        )
+    }
+    discrete_state_references = {
+        reference
+        for reference, candidates in variables_by_reference.items()
+        if any(
+            getattr(variable, "variability", None) == "discrete"
+            and getattr(variable, "causality", None) != "input"
+            and getattr(variable, "type", None) != "Clock"
+            for variable in candidates
+        )
+    }
+    clock_references = {
+        reference
+        for reference, candidates in variables_by_reference.items()
+        if any(getattr(variable, "type", None) == "Clock" for variable in candidates)
+    }
+    # FMI 3 knowns for outputs/derivatives are inputs, continuous and
+    # discrete states, parameters and the independent variable. FMI-LS-DAE
+    # additionally permits algebraic variables for the DAE equations.
+    runtime_known_references = (
+        continuous_state_references
+        | discrete_state_references
+        | input_parameter_and_time_references
     )
+    initial_known_references = set(algebraic_references) | {
+        reference
+        for reference, candidates in variables_by_reference.items()
+        if any(
+            getattr(variable, "causality", None) in {"input", "independent"}
+            or getattr(variable, "initial", None) == "exact"
+            for variable in candidates
+        )
+    }
     previous_order = -1
     seen_by_kind: dict[str, set[int]] = {}
-    seen_clocked_previous_references: set[int] = set()
-    for node in structure_node:
+    clocked_state_variables_by_reference: dict[int, Any] = {}
+    for node in structure_children:
         kind = node.tag
         if kind not in order:
             raise ValueError(f"FMI-LS-DAE contains unsupported ModelStructure element {kind!r}")
@@ -246,27 +337,24 @@ def _parse_model_structure(
             raise ValueError("FMI-LS-DAE Output must reference an output variable")
         if kind == "ClockedState":
             valid_clocked_state = False
+            validated_clocked_state = None
             for candidate in candidates:
                 previous = getattr(candidate, "previous", None)
                 previous_reference = getattr(previous, "valueReference", previous)
                 clocks = getattr(candidate, "clocks", None)
                 candidate_reference = getattr(candidate, "valueReference", None)
-                clock_references = [
+                candidate_clock_references = [
                     getattr(clock, "valueReference", clock)
                     for clock in (clocks if isinstance(clocks, (list, tuple)) else [])
                 ]
                 if (
                     getattr(candidate, "variability", None) != "discrete"
                     or getattr(candidate, "clocks", None) is None
-                    or getattr(candidate, "type", None) not in {
-                        "Float32", "Float64", "Int8", "UInt8", "Int16", "UInt16",
-                        "Int32", "UInt32", "Int64", "UInt64", "Enumeration",
-                    }
+                    or getattr(candidate, "type", None) not in NUMERIC_VARIABLE_TYPES
                     or isinstance(previous_reference, bool)
                     or not isinstance(previous_reference, int)
                     or previous_reference not in variables_by_reference
                     or previous_reference == candidate_reference
-                    or previous_reference in seen_clocked_previous_references
                     or not isinstance(clocks, (list, tuple))
                     or not clocks
                     or any(
@@ -277,36 +365,37 @@ def _parse_model_structure(
                             getattr(clock_variable, "type", None) == "Clock"
                             for clock_variable in variables_by_reference[clock_reference]
                         )
-                        for clock_reference in clock_references
+                        for clock_reference in candidate_clock_references
                     )
                 ):
                     continue
                 previous_variables = variables_by_reference[previous_reference]
                 if not any(
                     getattr(previous_variable, "type", None) == getattr(candidate, "type", None)
-                    and (
-                        getattr(previous_variable, "variability", None) == "discrete"
-                        or (
-                            getattr(previous_variable, "variability", None) is None
-                            and getattr(previous_variable, "type", None) not in {"Float32", "Float64"}
-                        )
-                    )
+                    and getattr(previous_variable, "variability", None) == "discrete"
                     and getattr(previous_variable, "causality", None) != "input"
                     for previous_variable in previous_variables
                 ):
                     continue
                 valid_clocked_state = True
-                seen_clocked_previous_references.add(previous_reference)
+                validated_clocked_state = candidate
                 break
-            if not valid_clocked_state:
+            if not valid_clocked_state or validated_clocked_state is None:
                 raise ValueError(
                     "FMI-LS-DAE ClockedState must reference a discrete variable with a valid previous value and Clock"
                 )
+            clocked_state_variables_by_reference[reference] = validated_clocked_state
         if kind == "InitialUnknown":
+            if reference in declared_event_indicator_references:
+                raise ValueError("FMI-LS-DAE EventIndicator must not be listed as an InitialUnknown")
             valid_initial_unknown = any(
                 (
                     reference in algebraic_references
                     or getattr(candidate, "causality", None) == "calculatedParameter"
+                    or (
+                        getattr(candidate, "variability", None) in {"discrete", "tunable"}
+                        and bool(getattr(candidate, "clocks", None))
+                    )
                     or (
                         getattr(candidate, "initial", None) in {"approx", "calculated"}
                         and (
@@ -320,12 +409,91 @@ def _parse_model_structure(
             )
             if not valid_initial_unknown:
                 raise ValueError("FMI-LS-DAE InitialUnknown does not reference an initialization unknown")
-        if dependencies is not None and set(dependencies) - known_references:
-            raise ValueError(
-                f"FMI-LS-DAE {kind} dependencies must reference known inputs, states, parameters, "
-                "algebraic variables, or the independent variable"
+        allowed_dependencies = runtime_known_references | set(algebraic_references)
+        if kind == "InitialUnknown":
+            allowed_dependencies = initial_known_references
+        if kind == "ClockedState":
+            state_variable = clocked_state_variables_by_reference[reference]
+            previous = getattr(state_variable, "previous", None)
+            previous_reference = getattr(previous, "valueReference", previous)
+            state_clocks = getattr(state_variable, "clocks", None)
+            state_clock_references = {
+                getattr(clock, "valueReference", clock)
+                for clock in (state_clocks if isinstance(state_clocks, (list, tuple)) else [])
+                if isinstance(getattr(clock, "valueReference", clock), int)
+                and not isinstance(getattr(clock, "valueReference", clock), bool)
+            }
+            if isinstance(previous_reference, int) and not isinstance(previous_reference, bool):
+                state_clock_references.add(previous_reference)
+            allowed_dependencies = runtime_known_references | set(algebraic_references) | state_clock_references
+        if kind == "Output" and any(getattr(candidate, "type", None) == "Clock" for candidate in candidates):
+            allowed_dependencies = runtime_known_references | clock_references | set(algebraic_references)
+        if kind == "Residual":
+            allowed_dependencies = (
+                set(algebraic_references)
+                | continuous_state_references
+                | input_parameter_and_time_references
             )
+        if dependencies is not None and set(dependencies) - allowed_dependencies:
+            raise ValueError(
+                f"FMI-LS-DAE {kind} dependencies must reference known variables in that ModelStructure mode"
+            )
+        if kind == "ClockedState" and dependencies is not None:
+            state_variable = clocked_state_variables_by_reference[reference]
+            state_clocks = getattr(state_variable, "clocks", None)
+            required_clocks = {
+                getattr(clock, "valueReference", clock)
+                for clock in (state_clocks if isinstance(state_clocks, (list, tuple)) else [])
+            }
+            if not required_clocks.issubset(set(dependencies)):
+                raise ValueError("FMI-LS-DAE ClockedState dependencies must include its associated Clocks")
         entries.append(FmiLsDaeModelStructureEntry(kind, reference, dependencies, dependencies_kind))
+
+    declared_clocked_state_references = seen_by_kind.get("ClockedState", set())
+    previous_reference_by_state: dict[int, int] = {}
+    for state_reference, candidates in variables_by_reference.items():
+        for candidate in candidates:
+            previous = getattr(candidate, "previous", None)
+            if previous is None:
+                continue
+            previous_reference = getattr(previous, "valueReference", previous)
+            if isinstance(previous_reference, bool) or not isinstance(previous_reference, int):
+                raise ValueError("FMI clocked-state previous reference is invalid")
+            prior_state_reference = previous_reference_by_state.get(previous_reference)
+            if prior_state_reference is not None and prior_state_reference != state_reference:
+                raise ValueError("FMI clocked-state previous references must be unique")
+            previous_reference_by_state[previous_reference] = state_reference
+    model_clocked_state_references = set(previous_reference_by_state.values())
+    if declared_clocked_state_references != model_clocked_state_references:
+        raise ValueError("FMI-LS-DAE ModelStructure must declare every clocked state exactly once")
+
+    declared_initial_unknown_references = seen_by_kind.get("InitialUnknown", set())
+    required_initial_unknown_references: set[int] = set()
+    state_or_derivative_references = continuous_state_references | continuous_derivative_references
+    for reference, candidates in variables_by_reference.items():
+        if reference in declared_event_indicator_references:
+            continue
+        for variable in candidates:
+            causality = getattr(variable, "causality", None)
+            if causality == "calculatedParameter":
+                required_initial_unknown_references.add(reference)
+                continue
+            if (
+                causality == "output"
+                and not bool(getattr(variable, "clocks", None))
+                and getattr(variable, "initial", None) in {"approx", "calculated"}
+            ) or (
+                reference in state_or_derivative_references
+                and getattr(variable, "initial", None) in {"approx", "calculated"}
+            ):
+                required_initial_unknown_references.add(reference)
+    missing_initial_unknowns = required_initial_unknown_references - declared_initial_unknown_references
+    if missing_initial_unknowns:
+        missing_references = ", ".join(str(reference) for reference in sorted(missing_initial_unknowns))
+        raise ValueError(
+            "FMI-LS-DAE ModelStructure omits required InitialUnknown valueReferences: "
+            f"{missing_references}"
+        )
 
     return tuple(entries)
 
@@ -407,11 +575,26 @@ def parse_fmi_ls_dae_manifest(xml_bytes: bytes, model_description: Any) -> FmiLs
         variables_by_reference,
         set(algebraic_references),
     )
+    declared_output_references = {
+        entry.value_reference for entry in model_structure if entry.kind == "Output"
+    }
+    model_output_references = {
+        int(getattr(variable, "valueReference"))
+        for variable in variables
+        if getattr(variable, "causality", None) == "output"
+        and isinstance(getattr(variable, "valueReference", None), int)
+        and not isinstance(getattr(variable, "valueReference", None), bool)
+    }
+    if declared_output_references != model_output_references:
+        raise ValueError("FMI-LS-DAE ModelStructure must declare every model output exactly once")
     residual_references = tuple(
         entry.value_reference for entry in model_structure if entry.kind == "Residual"
     )
     derivative_references = tuple(
         entry.value_reference for entry in model_structure if entry.kind == "ContinuousStateDerivative"
+    )
+    event_indicator_references = tuple(
+        entry.value_reference for entry in model_structure if entry.kind == "EventIndicator"
     )
     if len(derivative_references) != len(set(derivative_references)):
         raise ValueError("FMI-LS-DAE continuous state derivative references must be unique")
@@ -443,8 +626,84 @@ def parse_fmi_ls_dae_manifest(xml_bytes: bytes, model_description: Any) -> FmiLs
     algebraic_names, algebraic_types = resolve_real_variables(algebraic_references, "algebraic variables")
     residual_names, residual_types = resolve_real_variables(residual_references, "residuals")
     derivative_names, derivative_types = resolve_real_variables(derivative_references, "continuous state derivatives")
+    state_references: list[int] = []
+    for derivative_reference in derivative_references:
+        derivative_variable = next(
+            (candidate for candidate in variables_by_reference[derivative_reference]
+             if getattr(candidate, "derivative", None) is not None),
+            None,
+        )
+        state = getattr(derivative_variable, "derivative", None)
+        state_reference = getattr(state, "valueReference", state)
+        if isinstance(state_reference, bool) or not isinstance(state_reference, int):
+            raise ValueError("FMI-LS-DAE derivative does not identify its continuous state")
+        if state_reference in state_references:
+            raise ValueError("FMI-LS-DAE derivatives must identify unique continuous states")
+        derivative_type = getattr(derivative_variable, "type", None)
+        if not any(
+            getattr(candidate, "type", None) == derivative_type
+            and getattr(candidate, "variability", None) == "continuous"
+            for candidate in variables_by_reference.get(state_reference, [])
+        ):
+            raise ValueError("FMI-LS-DAE derivative must identify a continuous state of the same type")
+        state_references.append(state_reference)
     if set(algebraic_references).intersection(residual_references):
         raise ValueError("FMI-LS-DAE algebraic and residual variables must be distinct")
+    residual_entries = tuple(entry for entry in model_structure if entry.kind == "Residual")
+    for algebraic_reference in algebraic_references:
+        if not any(
+            entry.dependencies is None or algebraic_reference in entry.dependencies
+            for entry in residual_entries
+        ):
+            raise ValueError(
+                "FMI-LS-DAE algebraic variables must affect at least one declared residual"
+            )
+
+    variables_by_reference_first = {
+        reference: candidates[0]
+        for reference, candidates in variables_by_reference.items()
+        if candidates
+    }
+    sizes_by_reference: dict[int, int] = {}
+    for reference, variable in variables_by_reference_first.items():
+        sizes_by_reference[reference] = _model_variable_size(variable, variables_by_reference_first)
+
+    derivative_variable_by_reference = {
+        reference: next(
+            candidate for candidate in variables_by_reference[reference]
+            if getattr(candidate, "type", None) in {"Float32", "Float64"}
+            and getattr(candidate, "variability", None) == "continuous"
+            and getattr(candidate, "derivative", None) is not None
+        )
+        for reference in derivative_references
+    }
+    derivative_count = sum(
+        _model_variable_size(variable, variables_by_reference_first)
+        for variable in derivative_variable_by_reference.values()
+    )
+    declared_state_count = getattr(model_description, "numberOfContinuousStates", None)
+    if (
+        isinstance(declared_state_count, int)
+        and not isinstance(declared_state_count, bool)
+        and derivative_count != declared_state_count
+    ):
+        raise ValueError(
+            "FMI-LS-DAE ModelStructure must declare every continuous-state derivative in FMI order"
+        )
+
+    algebraic_count = sum(sizes_by_reference[reference] for reference in algebraic_references)
+    residual_count = sum(sizes_by_reference[reference] for reference in residual_references)
+    if algebraic_count != residual_count:
+        raise ValueError("FMI-LS-DAE algebraic and residual arrays must contain the same number of values")
+
+    event_indicator_count = sum(sizes_by_reference[reference] for reference in event_indicator_references)
+    declared_event_indicator_count = getattr(model_description, "numberOfEventIndicators", None)
+    if (
+        isinstance(declared_event_indicator_count, int)
+        and not isinstance(declared_event_indicator_count, bool)
+        and event_indicator_count != declared_event_indicator_count
+    ):
+        raise ValueError("FMI-LS-DAE EventIndicator declarations do not match the FMI event indicator count")
 
     return FmiLsDaeDefinition(
         manifest_version=manifest_version,
@@ -459,6 +718,7 @@ def parse_fmi_ls_dae_manifest(xml_bytes: bytes, model_description: Any) -> FmiLs
         derivative_value_references=derivative_references,
         derivative_names=derivative_names,
         derivative_types=derivative_types,
+        state_value_references=tuple(state_references),
         model_structure=model_structure,
     )
 
@@ -499,6 +759,7 @@ class Fmi3DaeIntegrator:
         input_clock_references: list[int] | None = None,
         clock_schedules: list[Fmi3InputClockSchedule] | None = None,
         initial_clocked_outputs: dict[str, Any] | None = None,
+        initial_unknown_values: dict[int, Any] | None = None,
     ):
         try:
             from sundials4py import core, idas
@@ -510,6 +771,10 @@ class Fmi3DaeIntegrator:
         self._fmu = fmu
         self._model_description = model_description
         self._definition = definition
+        self._initial_unknown_values = dict(initial_unknown_values or {})
+        declared_initial_unknowns = set(definition.initial_unknown_value_references)
+        if set(self._initial_unknown_values) - declared_initial_unknowns:
+            raise ValueError("FMI-LS-DAE initialization data contains an undeclared InitialUnknown")
         self._input_clock_references = list(input_clock_references or [])
         self._clock_schedules = list(clock_schedules or [])
         self._next_event_time_defined = False
@@ -526,6 +791,7 @@ class Fmi3DaeIntegrator:
             if isinstance(getattr(variable, "valueReference", None), int)
             and not isinstance(getattr(variable, "valueReference", None), bool)
         }
+        self._variables_by_reference = variables_by_reference
         self._algebraic_variables = self._resolve_variable_specs(
             definition.algebraic_value_references,
             definition.algebraic_names,
@@ -547,6 +813,32 @@ class Fmi3DaeIntegrator:
             variables_by_name,
             variables_by_reference,
         )
+        state_variables = []
+        for reference in definition.state_value_references:
+            variable = variables_by_reference.get(reference)
+            if variable is None:
+                raise ValueError("FMI-LS-DAE continuous state is missing from the model description")
+            state_variables.append(variable)
+        self._state_variables = self._resolve_variable_specs(
+            definition.state_value_references,
+            tuple(str(variable.name) for variable in state_variables),
+            tuple(str(variable.type) for variable in state_variables),
+            variables_by_name,
+            variables_by_reference,
+        )
+        if len(self._state_variables) != len(self._derivative_variables) or any(
+            state.size != derivative.size
+            for state, derivative in zip(self._state_variables, self._derivative_variables, strict=True)
+        ):
+            raise ValueError("FMI-LS-DAE state and derivative dimensions do not match")
+        self._output_value_references = set(definition.output_value_references)
+        self._clocked_state_variables = tuple(
+            variables_by_reference[reference]
+            for reference in definition.clocked_state_value_references
+            if reference in variables_by_reference
+        )
+        if len(self._clocked_state_variables) != len(definition.clocked_state_value_references):
+            raise ValueError("FMI-LS-DAE clocked state is missing from the model description")
         self._event_indicator_variables = tuple(
             variables_by_reference[reference]
             for reference in definition.event_indicator_value_references
@@ -580,12 +872,14 @@ class Fmi3DaeIntegrator:
             for variable in (getattr(model_description, "modelVariables", []) or [])
             if getattr(variable, "causality", None) == "output"
             and bool(getattr(variable, "clocks", None))
+            and getattr(variable, "valueReference", None) in self._output_value_references
         )
         self._output_clock_variables = tuple(
             variable
             for variable in (getattr(model_description, "modelVariables", []) or [])
             if getattr(variable, "type", None) == "Clock"
             and getattr(variable, "causality", None) == "output"
+            and getattr(variable, "valueReference", None) in self._output_value_references
         )
         self._pending_event_outputs: dict[str, Any] = {}
         self._clocked_output_cache: dict[str, Any] = dict(initial_clocked_outputs or {})
@@ -656,6 +950,9 @@ class Fmi3DaeIntegrator:
         state_values = self._read_continuous_states()
         algebraic_values = self._read_algebraic_values()
         derivative_values = self._read_continuous_state_derivatives()
+        state_values = self._seed_initial_unknowns(self._state_variables, state_values)
+        algebraic_values = self._seed_initial_unknowns(self._algebraic_variables, algebraic_values)
+        derivative_values = self._seed_initial_unknowns(self._derivative_variables, derivative_values)
         self._write_vector(self._state_vector, [*state_values, *algebraic_values])
         self._write_vector(self._derivative_vector, [*derivative_values, *([0.0] * self._algebraic_count)])
 
@@ -739,12 +1036,20 @@ class Fmi3DaeIntegrator:
         else:
             raise RuntimeError("FMI_EVENT_ITERATION_LIMIT_EXCEEDED")
         if next_event_time_defined:
-            if isinstance(next_event_time, bool) or not isinstance(next_event_time, (int, float)) or not math.isfinite(float(next_event_time)):
+            if (
+                next_event_time is None
+                or isinstance(next_event_time, bool)
+                or not isinstance(next_event_time, (int, float))
+                or not math.isfinite(float(next_event_time))
+            ):
                 raise RuntimeError("FMU returned an invalid next event time")
-            if float(next_event_time) < current_time - max(1e-12, abs(current_time) * 1e-12):
+            validated_next_event_time = float(next_event_time)
+            if validated_next_event_time < current_time - max(1e-12, abs(current_time) * 1e-12):
                 raise RuntimeError("FMU returned a next event time before the current simulation time")
+        else:
+            validated_next_event_time = None
         self._next_event_time_defined = bool(next_event_time_defined)
-        self._next_event_time = float(next_event_time) if next_event_time_defined else None
+        self._next_event_time = validated_next_event_time
         self._event_states_changed = states_changed
         self._event_nominals_changed = nominals_changed
         self._refresh_aperiodic_clocks(
@@ -1028,6 +1333,13 @@ class Fmi3DaeIntegrator:
             and not isinstance(getattr(clock, "valueReference", clock), bool)
         }
         required_clock_references.update(
+            int(getattr(clock, "valueReference", clock))
+            for variable in self._clocked_state_variables
+            for clock in (getattr(variable, "clocks", []) or [])
+            if isinstance(getattr(clock, "valueReference", clock), int)
+            and not isinstance(getattr(clock, "valueReference", clock), bool)
+        )
+        required_clock_references.update(
             int(variable.valueReference) for variable in self._output_clock_variables
         )
         query_references = [
@@ -1063,7 +1375,7 @@ class Fmi3DaeIntegrator:
             getter = getattr(self._fmu, f"get{value_type}", None)
             if getter is None:
                 raise RuntimeError(f"FMI clocked output '{variable.name}' has an unsupported type")
-            size = self._variable_size(variable)
+            size = self._variable_size(variable, self._variables_by_reference)
             values = getter([value_reference], nValues=size) if size > 1 else getter([value_reference])
             normalized = [self._normalise_clocked_output(value_type, value) for value in values]
             normalized_value = normalized if size > 1 else normalized[0]
@@ -1113,10 +1425,18 @@ class Fmi3DaeIntegrator:
         next_defined = metadata["nextEventTimeDefined"]
         next_time = metadata.get("nextEventTime")
         if next_defined:
-            if isinstance(next_time, bool) or not isinstance(next_time, (int, float)) or not math.isfinite(float(next_time)):
+            if (
+                next_time is None
+                or isinstance(next_time, bool)
+                or not isinstance(next_time, (int, float))
+                or not math.isfinite(float(next_time))
+            ):
                 raise ValueError("FMI state checkpoint has invalid DAE event time")
-            if float(next_time) < current_time - max(1e-12, abs(current_time) * 1e-12):
+            validated_next_time = float(next_time)
+            if validated_next_time < current_time - max(1e-12, abs(current_time) * 1e-12):
                 raise ValueError("FMI state checkpoint has a DAE event before its simulation time")
+        else:
+            validated_next_time = None
         raw_schedules = metadata.get("clockSchedules")
         if not isinstance(raw_schedules, list) or len(raw_schedules) != len(self._clock_schedules):
             raise ValueError("FMI state checkpoint has invalid DAE clock metadata")
@@ -1132,7 +1452,7 @@ class Fmi3DaeIntegrator:
             value_type = str(getattr(variable, "type", ""))
             if value_type == "Enumeration":
                 value_type = "Int64"
-            size = self._variable_size(variable)
+            size = self._variable_size(variable, self._variables_by_reference)
             raw_values = value if size > 1 and isinstance(value, list) else [value]
             if len(raw_values) != size:
                 raise ValueError("FMI state checkpoint has an invalid DAE clocked output size")
@@ -1147,8 +1467,15 @@ class Fmi3DaeIntegrator:
             if not isinstance(item, dict):
                 raise ValueError("FMI state checkpoint has invalid DAE clock metadata")
             reference = item.get("valueReference")
-            schedule = by_reference.get(reference) if isinstance(reference, int) and not isinstance(reference, bool) else None
-            if schedule is None or reference in restored:
+            normalized_reference = (
+                reference
+                if isinstance(reference, int) and not isinstance(reference, bool)
+                else None
+            )
+            if normalized_reference is None:
+                raise ValueError("FMI state checkpoint has invalid DAE clock reference")
+            schedule = by_reference.get(normalized_reference)
+            if schedule is None or normalized_reference in restored:
                 raise ValueError("FMI state checkpoint has invalid DAE clock reference")
             if item.get("intervalVariability") != schedule.variability:
                 raise ValueError("FMI state checkpoint DAE clock configuration does not match the FMU")
@@ -1168,9 +1495,9 @@ class Fmi3DaeIntegrator:
             schedule.last_tick_time = last_tick
             schedule.shift = shift
             schedule.has_ticked = has_ticked
-            restored.add(reference)
+            restored.add(normalized_reference)
         self._next_event_time_defined = next_defined
-        self._next_event_time = float(next_time) if next_defined else None
+        self._next_event_time = validated_next_time
         self._clocked_output_cache = normalized_clocked_outputs
 
     def restart_after_input_change(self, current_time: float, *, step_size: float) -> None:
@@ -1273,6 +1600,35 @@ class Fmi3DaeIntegrator:
             return []
         return self._read_real_values(self._algebraic_variables)
 
+    def _seed_initial_unknowns(
+        self,
+        variables: tuple[_RealVariableSpec, ...],
+        values: list[float],
+    ) -> list[float]:
+        """Use the manifest's ordered InitialUnknown values as solver guesses."""
+        seeded = list(values)
+        for variable in variables:
+            if variable.value_reference not in self._initial_unknown_values:
+                continue
+            raw = self._initial_unknown_values[variable.value_reference]
+            raw_values = list(raw) if isinstance(raw, (list, tuple)) else [raw]
+            if len(raw_values) != variable.size:
+                raise ValueError(
+                    f"FMI-LS-DAE InitialUnknown {variable.value_reference} has an unexpected value count"
+                )
+            try:
+                normalized = [float(value) for value in raw_values]
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(
+                    f"FMI-LS-DAE InitialUnknown {variable.value_reference} is not numeric"
+                ) from exc
+            if not all(math.isfinite(value) for value in normalized):
+                raise ValueError(
+                    f"FMI-LS-DAE InitialUnknown {variable.value_reference} is not finite"
+                )
+            seeded[variable.offset:variable.offset + variable.size] = normalized
+        return seeded
+
     @staticmethod
     def _resolve_variable_specs(
         references: tuple[int, ...],
@@ -1300,40 +1656,7 @@ class Fmi3DaeIntegrator:
 
     @staticmethod
     def _variable_size(variable: Any, variables_by_reference: dict[int, Any]) -> int:
-        shape = getattr(variable, "shape", None)
-        if isinstance(shape, (list, tuple)) and shape:
-            extents = shape
-        else:
-            dimensions = getattr(variable, "dimensions", None)
-            if not isinstance(dimensions, (list, tuple)) or not dimensions:
-                return 1
-            extents = []
-            for dimension in dimensions:
-                extent = getattr(dimension, "start", None)
-                if extent is None:
-                    referenced_variable = getattr(dimension, "variable", None)
-                    extent = getattr(referenced_variable, "start", None)
-                if extent is None:
-                    reference = getattr(dimension, "valueReference", None)
-                    if isinstance(reference, int) and not isinstance(reference, bool):
-                        referenced_variable = variables_by_reference.get(reference)
-                        extent = getattr(referenced_variable, "start", None)
-                extents.append(extent)
-
-        size = 1
-        for extent in extents:
-            if isinstance(extent, bool):
-                raise ValueError("FMI-LS-DAE array has an invalid dimension")
-            try:
-                normalized_extent = int(extent)
-            except (TypeError, ValueError, OverflowError) as exc:
-                raise ValueError("FMI-LS-DAE array has an unresolved dimension") from exc
-            if normalized_extent < 0 or normalized_extent != extent:
-                raise ValueError("FMI-LS-DAE array has an invalid dimension")
-            size *= normalized_extent
-            if size > MAX_EQUATIONS:
-                raise ValueError("FMI-LS-DAE array equation count exceeds the supported limit")
-        return size
+        return _model_variable_size(variable, variables_by_reference)
 
     def _read_real_values(self, specs: tuple[_RealVariableSpec, ...]) -> list[float]:
         result = [0.0] * sum(spec.size for spec in specs)
