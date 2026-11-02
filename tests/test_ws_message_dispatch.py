@@ -28,6 +28,7 @@ class Session:
     _step_size = 0.1
     _time_mode = "simtime"
     _playback_speed = 1.0
+    _execution_interface = None
     _terminated = False
     _initialised = True
     _md = SimpleNamespace(modelVariables=[SimpleNamespace(name="x", valueReference=4, causality="output", type="Real")])
@@ -40,13 +41,16 @@ class Session:
         return values
     def validate_inputs(self, values):
         return values
-    def initialize(self, *, start_time, stop_time, step_size=None, parameters=None, time_mode="simtime", playback_speed=1.0, early_return_allowed=False):
+    def validate_reconfiguration_values(self, values):
+        return values
+    def initialize(self, *, start_time, stop_time, step_size=None, parameters=None, time_mode="simtime", playback_speed=1.0, early_return_allowed=False, execution_interface=None):
         self.state = "initialized"
         self._time = start_time
         self._stop_time = stop_time
         self._step_size = step_size or 0.1
         self._time_mode = time_mode
         self._playback_speed = playback_speed
+        self._execution_interface = execution_interface or "CoSimulation"
         self.initialized_with = (start_time, stop_time, step_size, parameters)
     def resume(self): self.state = "running"
     def pause(self): self.state = "paused"
@@ -54,6 +58,7 @@ class Session:
     def step(self, delta=None): self._time += delta or self._step_size
     def run_until(self, target, step_size=None): self._time = target
     def set_inputs(self, values): self.inputs = values
+    def reconfigure_structural_parameters(self, values): self.reconfigured = values
     def get_outputs(self, refs=None): self.output_refs = refs; return {"outputs": {"x": 9}}
     def terminate(self): self._terminated = True; self.state = "terminated"
 
@@ -104,6 +109,18 @@ def test_live_session_commands_cover_state_model_and_data_operations(dispatch, m
     assert advanced["simTime"] == 3
     assert call({"type": "sim.setInputs", "values": {"x": 5}})["type"] == "sim.inputs.updated"
     assert session.inputs == {"x": 5}
+
+    selected = call({
+        "type": "sim.initialize",
+        "options": {"executionInterface": "ModelExchange"},
+    }, stop_runner=lambda: asyncio.sleep(0))
+    assert selected["executionInterface"] == "ModelExchange"
+    monkeypatch.setattr(main, "model_execution_policy", lambda _context: {
+        "maxInputUpdatesPerWindow": 32,
+    })
+    reconfigured = call({"type": "sim.reconfigure", "values": {"dae": True}})
+    assert reconfigured["type"] == "sim.reconfigured"
+    assert session.reconfigured == {"dae": True}
     selected = call({"type": "sim.getOutputs", "variables": ["x"]})
     assert selected["values"] == {"x": 9} and session.output_refs == [4]
     subscribed = call({"type": "sim.subscribeOutputs", "variables": ["x"], "periodMs": 1, "maxBatchSize": 1, "maxHz": 5})

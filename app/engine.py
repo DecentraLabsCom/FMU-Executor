@@ -179,12 +179,12 @@ class FmuSession:
         except ValueError as exc:
             self._fmi_ls_dae_issue = str(exc)
             logger.warning("FMI-LS-DAE manifest is unavailable for %s: %s", self.access_key, exc)
-        if self._md.coSimulation is not None and self._has_native_interface_binary(self._md.coSimulation):
+        available_interfaces = self._available_execution_interfaces()
+        if self._fmi_ls_dae is not None and "ModelExchange" in available_interfaces:
+            self._execution_interface = "ModelExchange"
+        elif "CoSimulation" in available_interfaces:
             self._execution_interface = "CoSimulation"
-        elif (
-            self._md.modelExchange is not None
-            and self._has_native_interface_binary(self._md.modelExchange)
-        ):
+        elif "ModelExchange" in available_interfaces:
             self._execution_interface = "ModelExchange"
         return self._describe()
 
@@ -197,22 +197,24 @@ class FmuSession:
         time_mode: str = "simtime",
         playback_speed: float = 1.0,
         early_return_allowed: bool = False,
+        execution_interface: str | None = None,
     ) -> dict[str, Any]:
         if self._initialised:
             raise RuntimeError("Session already initialised")
         if self._md is None:
             raise RuntimeError("FMU not loaded – call load() first")
-        cosimulation_available = self._execution_interface == "CoSimulation"
-        model_exchange_available = self._execution_interface == "ModelExchange"
-        if cosimulation_available:
-            self._use_me = False
-            self._use_dae = False
-        elif model_exchange_available:
-            self._use_me = True
-            self._use_dae = self._fmi_ls_dae is not None
-        else:
+        available_interfaces = self._available_execution_interfaces()
+        if execution_interface is not None:
+            if not isinstance(execution_interface, str) or execution_interface not in {"CoSimulation", "ModelExchange"}:
+                raise ValueError("executionInterface must be CoSimulation or ModelExchange")
+            if execution_interface not in available_interfaces:
+                raise ValueError(f"FMU does not provide an executable {execution_interface} interface")
+            self._execution_interface = execution_interface
+        elif self._execution_interface not in {"CoSimulation", "ModelExchange"}:
             detail = self._fmi_ls_dae_issue or "FMU has no executable Co-Simulation or Model Exchange binary"
             raise RuntimeError(detail)
+        self._use_me = self._execution_interface == "ModelExchange"
+        self._use_dae = False
 
         default_experiment = self._md.defaultExperiment
         default_step_size = getattr(default_experiment, "stepSize", None)
@@ -245,7 +247,19 @@ class FmuSession:
             raise ValueError("Initialization values must be an object")
         original_parameters = parameters if parameters is not None else {}
         initialization_values = self._merge_declared_start_values(original_parameters)
+        dae_enable_variable = self._dae_enable_variable()
+        if dae_enable_variable is not None:
+            dae_enable_name = str(dae_enable_variable.name)
+            requested_dae_value = original_parameters.get(dae_enable_name)
+            if not self._use_me and requested_dae_value is True:
+                raise ValueError("FMI-LS-DAE can only be enabled with the ModelExchange execution interface")
+            if self._use_me and dae_enable_name not in original_parameters:
+                # The Executor can run the declared DAE formulation by default;
+                # callers can explicitly pass false to retain the FMI ODE mode.
+                initialization_values[dae_enable_name] = True
         validated_parameters = self._validate_values(initialization_values, phase="initialization")
+        if self._use_me and dae_enable_variable is not None:
+            self._use_dae = validated_parameters.get(str(dae_enable_variable.name)) is True
         self._initial_parameters = copy.deepcopy(original_parameters)
         self._time_mode = time_mode
         self._playback_speed = float(playback_speed)
@@ -288,8 +302,6 @@ class FmuSession:
                 if structural_parameters:
                     self._apply_validated_values(structural_parameters)
                 self._apply_structural_array_shapes(dimension_values)
-                if self._use_dae and self._fmi_ls_dae is not None:
-                    slave.setBoolean([self._fmi_ls_dae.enable_dae_value_reference], [True])
                 slave.exitConfigurationMode()
             slave.enterInitializationMode(
                 startTime=self._start_time,
@@ -344,6 +356,7 @@ class FmuSession:
                     "state": self._state,
                     "timeMode": self._time_mode,
                     "playbackSpeed": self._playback_speed,
+                    "executionInterface": self._execution_interface,
                 }
         self._initialised = True
         self._terminated = False
@@ -355,6 +368,7 @@ class FmuSession:
             "state": "initialized",
             "timeMode": self._time_mode,
             "playbackSpeed": self._playback_speed,
+            "executionInterface": self._execution_interface,
         }
 
     def step(self, step_size: float | None = None) -> dict[str, Any]:
@@ -793,6 +807,65 @@ class FmuSession:
         else:
             self._apply_validated_values(validated)
 
+    def validate_reconfiguration_values(self, values: dict[str, Any]) -> dict[str, Any]:
+        """Validate writes that arrive through FMI 3 Reconfiguration Mode."""
+        self._ensure_live()
+        return self._validate_values(values, phase="reconfiguration")
+
+    def reconfigure_structural_parameters(self, values: dict[str, Any]) -> None:
+        """Toggle the FMI-LS-DAE mode through FMI 3 Reconfiguration Mode."""
+        self._ensure_live()
+        validated = self._validate_values(values, phase="reconfiguration")
+        definition = self._fmi_ls_dae
+        enable_variable = self._dae_enable_variable()
+        if definition is None or enable_variable is None or not self._use_me or self._fmi_major() != "3":
+            raise ValueError("Runtime structural reconfiguration is only supported for the FMI-LS-DAE selector")
+        enable_name = str(enable_variable.name)
+        if set(validated) != {enable_name} or type(validated[enable_name]) is not bool:
+            raise ValueError("Only the FMI-LS-DAE Boolean selector can be reconfigured at runtime")
+        if not self._initialised or self._state in {"stopped", "error"}:
+            raise RuntimeError("FMI-LS-DAE reconfiguration requires an active Model Exchange simulation")
+        target_dae_mode = validated[enable_name]
+        if target_dae_mode == self._use_dae:
+            return
+
+        slave = self._require_slave()
+        try:
+            slave.enterEventMode()
+            slave.enterConfigurationMode()
+            self._apply_validated_values({enable_name: target_dae_mode})
+            slave.exitConfigurationMode()
+
+            if self._dae_integrator is not None:
+                self._dae_integrator.close()
+                self._dae_integrator = None
+            if self._me_integrator is not None:
+                self._me_integrator.close()
+                self._me_integrator = None
+
+            default_tolerance = getattr(getattr(self._md, "defaultExperiment", None), "tolerance", None)
+            if target_dae_mode:
+                self._enter_fmi3_continuous_time_mode(slave)
+                self._dae_integrator = Fmi3DaeIntegrator(
+                    slave,
+                    definition,
+                    model_description=self._md,
+                    start_time=self._time,
+                    relative_tolerance=default_tolerance,
+                )
+            else:
+                self._me_integrator = FmiModelExchangeIntegrator(
+                    slave,
+                    self._md,
+                    start_time=self._time,
+                    max_step=self._step_size,
+                    relative_tolerance=default_tolerance,
+                )
+            self._use_dae = target_dae_mode
+        except Exception:
+            self._state = "error"
+            raise
+
     def _dae_change_requires_event_mode(self, values: dict[str, Any]) -> bool:
         """Return whether FMI 3 Model Exchange requires an event for these writes."""
         if self._md is None:
@@ -1200,6 +1273,29 @@ class FmuSession:
         )
         return binary.is_file()
 
+    def _available_execution_interfaces(self) -> list[str]:
+        if self._md is None:
+            return []
+        interfaces = []
+        if self._md.coSimulation is not None and self._has_native_interface_binary(self._md.coSimulation):
+            interfaces.append("CoSimulation")
+        if self._md.modelExchange is not None and self._has_native_interface_binary(self._md.modelExchange):
+            interfaces.append("ModelExchange")
+        return interfaces
+
+    def _dae_enable_variable(self) -> Any | None:
+        if self._md is None or self._fmi_ls_dae is None:
+            return None
+        return next(
+            (
+                variable
+                for variable in self._md.modelVariables
+                if getattr(variable, "valueReference", None)
+                == self._fmi_ls_dae.enable_dae_value_reference
+            ),
+            None,
+        )
+
     def _instantiate(self) -> Any:
         """Instantiate through the selected FMI Co-Simulation or Model Exchange API."""
         if self._extract_dir is None or self._md is None:
@@ -1549,6 +1645,18 @@ class FmuSession:
             allowed = causality == "input" or (
                 causality == "parameter" and variability == "tunable"
             )
+        elif phase == "reconfiguration":
+            dae_enable_variable = self._dae_enable_variable()
+            allowed = (
+                self._fmi_major() == "3"
+                and self._fmi_ls_dae is not None
+                and dae_enable_variable is not None
+                and getattr(var, "valueReference", None)
+                == self._fmi_ls_dae.enable_dae_value_reference
+                and causality == "structuralParameter"
+                and variability == "tunable"
+                and str(getattr(var, "type", "")) == "Boolean"
+            )
         else:
             raise ValueError(f"Unknown variable write phase '{phase}'")
         if not allowed:
@@ -1582,7 +1690,7 @@ class FmuSession:
             unknown_refs = set(int(ref) for ref in refs) - output_refs
             if unknown_refs:
                 raise ValueError("Requested value reference is unknown or is not an output")
-        pending_event_outputs = self._pending_event_outputs
+        pending_event_outputs = getattr(self, "_pending_event_outputs", None)
         remaining_event_outputs = (
             dict(pending_event_outputs) if pending_event_outputs is not None else None
         )
@@ -1840,29 +1948,33 @@ class FmuSession:
         return value
 
     def _release_fmu(self) -> None:
-        if self._dae_integrator is not None:
+        dae_integrator = getattr(self, "_dae_integrator", None)
+        me_integrator = getattr(self, "_me_integrator", None)
+        if dae_integrator is not None:
             try:
-                self._dae_integrator.close()
+                dae_integrator.close()
             except Exception:
-                logger.debug("FMI-LS-DAE solver release failed for session %s", self.session_id, exc_info=True)
+                logger.debug("FMI-LS-DAE solver release failed for session %s", getattr(self, "session_id", "unknown"), exc_info=True)
             self._dae_integrator = None
-        if self._me_integrator is not None:
+        if me_integrator is not None:
             try:
-                self._me_integrator.close()
+                me_integrator.close()
             except Exception:
-                logger.debug("FMI Model Exchange solver release failed for session %s", self.session_id, exc_info=True)
+                logger.debug("FMI Model Exchange solver release failed for session %s", getattr(self, "session_id", "unknown"), exc_info=True)
             self._me_integrator = None
-        if self._slave is not None:
+        slave = getattr(self, "_slave", None)
+        if slave is not None:
             try:
-                self._slave.terminate()
+                slave.terminate()
             except Exception:
-                logger.debug("FMU terminate failed for session %s", self.session_id, exc_info=True)
+                logger.debug("FMU terminate failed for session %s", getattr(self, "session_id", "unknown"), exc_info=True)
             try:
-                self._slave.freeInstance()
+                slave.freeInstance()
             except Exception:
-                logger.debug("FMU freeInstance failed for session %s", self.session_id, exc_info=True)
+                logger.debug("FMU freeInstance failed for session %s", getattr(self, "session_id", "unknown"), exc_info=True)
         self._slave = None
-        self._initialised = False
+        if hasattr(self, "_initialised"):
+            self._initialised = False
 
     def _cleanup_temp(self) -> None:
         extract_dir = getattr(self, "_extract_dir", None)

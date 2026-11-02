@@ -68,8 +68,10 @@ _REALTIME_METHODS = {
     "run_until",
     "advance",
     "validate_inputs",
+    "validate_reconfiguration_values",
     "validate_input_schedule",
     "set_inputs",
+    "reconfigure_structural_parameters",
     "get_outputs",
     "pause",
     "resume",
@@ -674,6 +676,9 @@ class RealtimeSession:
     def set_inputs(self, values: dict[str, Any]) -> None:
         self._rpc("set_inputs", values)
 
+    def reconfigure_structural_parameters(self, values: dict[str, Any]) -> None:
+        self._rpc("reconfigure_structural_parameters", values)
+
     def capture_fmu_state(self) -> dict[str, Any]:
         """Capture a serialized FMU checkpoint through the isolated worker."""
         result = self._rpc("capture_fmu_state")
@@ -690,6 +695,10 @@ class RealtimeSession:
 
     def validate_inputs(self, values: dict[str, Any]) -> dict[str, Any]:
         result = self._rpc("validate_inputs", values)
+        return result if isinstance(result, dict) else {}
+
+    def validate_reconfiguration_values(self, values: dict[str, Any]) -> dict[str, Any]:
+        result = self._rpc("validate_reconfiguration_values", values)
         return result if isinstance(result, dict) else {}
 
     def validate_input_schedule(self, input_schedule: list[dict[str, Any]]) -> list[dict[str, Any]]:

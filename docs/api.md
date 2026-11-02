@@ -95,7 +95,7 @@ Gateway requests use this shape for `run` and `stream`:
     }
   },
   "parameters": {"ambient": 293.15},
-  "options": {"startTime": 0, "stopTime": 10, "stepSize": 0.01}
+  "options": {"startTime": 0, "stepSize": 0.01}
 }
 ```
 
@@ -109,8 +109,9 @@ the SHA-256 of the preceding NDJSON data lines.
 The streaming `stream` endpoint accepts `captureFmuState: true` to include an
 opaque `checkpoint` in `sim.done`. A request may also include `checkpoint` to
 resume from that state; the new `options.startTime` may be earlier than the
-checkpoint time but cannot be later, and `stopTime` must be later. The runtime
-resumes at the stored time. Checkpoint support requires a Co-Simulation
+checkpoint time but cannot be later. If `stopTime` is supplied, it must be later
+than the checkpoint time; omitting it leaves the simulation horizon open. The
+runtime resumes at the stored time. Checkpoint support requires a Co-Simulation
 FMU that declares both `canGetAndSetFMUstate` and `canSerializeFMUstate`, plus
 Executor signing configuration. Checkpoints are bound to the active reservation,
 FMU file hash, and execution platform, expire after 24 hours, and are stored
@@ -170,8 +171,8 @@ including `exp` when provided by Gateway).
 | `session.create` | `session.created` | Loads a session; returns `sessionId`, expiry and capabilities. |
 | `session.attach` | `session.attached` | Reattaches a disconnected session during the configured grace window after validating its original context. |
 | `model.describe` | `model.description` | Returns normalized FMU metadata. `includeVariables: false` omits the variable list. |
-| `sim.initialize` | `sim.state` | Accepts `options.startTime`, `stopTime`, `stepSize` and initial `parameters`. An optional `checkpoint` restores a prior serialized FMU state after initialization; omit initial `parameters` when restoring. |
-| `sim.start` | `sim.state` | Starts automatic stepping through `stopTime`. |
+| `sim.initialize` | `sim.state` | Accepts `options.startTime`, optional `stopTime`, `stepSize`, optional `executionInterface` (`CoSimulation` or `ModelExchange`) and initial `parameters`. Omit `stopTime` for an unbounded horizon. If both execution interfaces are present, the default prefers the declared FMI-LS-DAE Model Exchange path when its binary is available; otherwise Co-Simulation is preferred. An optional `checkpoint` restores a prior serialized FMU state after initialization; omit initial `parameters` when restoring. |
+| `sim.start` | `sim.state` | Starts automatic stepping through `stopTime`, or without a fixed horizon when `stopTime` is omitted. |
 | `sim.pause` | `sim.state` | Pauses automatic stepping while retaining FMU state. |
 | `sim.resume` | `sim.state` | Resumes from `paused` or `initialized`. |
 | `sim.reset` | `sim.state` | Recreates the FMU instance with the original initialization options. |
@@ -179,6 +180,7 @@ including `exp` when provided by Gateway).
 | `sim.runUntil` | `sim.outputs` | Advances to `time`; legacy `targetTime` is accepted. Optional `stepSize`. |
 | `sim.advance` | `sim.samples` | Advances toward `targetTime` and returns bounded intermediate samples; optional `stepSize`, `maxSamples` (1–256), `maxComputeMs` (1–1000, soft), `outputSampleEverySteps`, `outputVariables`, `inputValues` and `inputSchedule`. Supports `external` mode when `currentCommunicationPoint` matches the current simulation time and the target does not exceed `stopTime`. |
 | `sim.setInputs` | `sim.inputs.updated` | `values` map keyed by model variable name. |
+| `sim.reconfigure` | `sim.reconfigured` | Changes the declared FMI-LS-DAE Boolean mode selector in an active FMI 3 Model Exchange session through Event and Reconfiguration Modes. Other structural parameters are not supported for runtime reconfiguration yet. |
 | `sim.getOutputs` | `sim.outputs` | Optional `variables` array; legacy `valueReferences` accepted. |
 | `sim.captureFMUState` | `sim.fmuState` | Captures the current serialized state and returns an opaque, reservation-bound `checkpoint` and its `simTime`. |
 | `sim.restoreFMUState` | `sim.state` | Restores an initialized session from `checkpoint`. Optional `variables` requests up to 512 readable values so a proxy can refresh its local output cache. |

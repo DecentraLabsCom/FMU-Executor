@@ -20,23 +20,60 @@ MANIFEST_NAMESPACE = "http://fmi-standard.org/fmi-ls-manifest"
 SUPPORTED_MANIFEST_VERSIONS = {"1.0.0-alpha.1"}
 MAX_MANIFEST_BYTES = 1024 * 1024
 MAX_EQUATIONS = 100_000
+MAX_FMI3_VALUE_REFERENCE = (1 << 32) - 1
+DEPENDENCY_KINDS = frozenset({"dependent", "constant", "fixed", "tunable", "discrete"})
+
+
+@dataclass(frozen=True)
+class FmiLsDaeModelStructureEntry:
+    kind: str
+    value_reference: int
+    dependencies: tuple[int, ...] | None
+    dependencies_kind: tuple[str, ...] | None
 
 
 @dataclass(frozen=True)
 class FmiLsDaeDefinition:
     manifest_version: str
     enable_dae_value_reference: int
+    enable_dae_variable_name: str
     algebraic_value_references: tuple[int, ...]
     residual_value_references: tuple[int, ...]
     algebraic_names: tuple[str, ...]
     residual_names: tuple[str, ...]
     algebraic_types: tuple[str, ...]
     residual_types: tuple[str, ...]
+    derivative_value_references: tuple[int, ...]
+    derivative_names: tuple[str, ...]
+    derivative_types: tuple[str, ...]
+    model_structure: tuple[FmiLsDaeModelStructureEntry, ...]
+
+    @property
+    def initial_unknown_value_references(self) -> tuple[int, ...]:
+        return tuple(
+            entry.value_reference for entry in self.model_structure
+            if entry.kind == "InitialUnknown"
+        )
+
+    @property
+    def event_indicator_value_references(self) -> tuple[int, ...]:
+        return tuple(
+            entry.value_reference for entry in self.model_structure
+            if entry.kind == "EventIndicator"
+        )
+
+    @property
+    def clocked_state_value_references(self) -> tuple[int, ...]:
+        return tuple(
+            entry.value_reference for entry in self.model_structure
+            if entry.kind == "ClockedState"
+        )
 
     def describe(self) -> dict[str, Any]:
         return {
             "manifestName": MANIFEST_NAME,
             "manifestVersion": self.manifest_version,
+            "enableDAEParameter": self.enable_dae_variable_name,
             "algebraicVariables": list(self.algebraic_names),
             "residualVariableCount": len(self.residual_value_references),
         }
@@ -60,9 +97,169 @@ def _value_reference(element: ET.Element, *, label: str) -> int:
         value = int(raw) if raw is not None else -1
     except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError(f"FMI-LS-DAE {label} has an invalid valueReference") from exc
-    if value < 0:
+    if value < 0 or value > MAX_FMI3_VALUE_REFERENCE:
         raise ValueError(f"FMI-LS-DAE {label} has an invalid valueReference")
     return value
+
+
+def _validate_annotations_only(element: ET.Element, *, label: str, allowed_attributes: set[str]) -> None:
+    if set(element.attrib) - allowed_attributes:
+        raise ValueError(f"FMI-LS-DAE {label} contains unsupported attributes")
+    annotations = [child for child in element if _local_name(child.tag) == "Annotations"]
+    if len(annotations) > 1 or len(annotations) != len(list(element)):
+        raise ValueError(f"FMI-LS-DAE {label} contains unsupported child elements")
+
+
+def _parse_dependency_references(
+    raw: str | None,
+    *,
+    label: str,
+    variables_by_reference: dict[int, list[Any]],
+) -> tuple[int, ...] | None:
+    if raw is None:
+        return None
+    tokens = raw.split()
+    references: list[int] = []
+    for token in tokens:
+        try:
+            reference = int(token)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"FMI-LS-DAE {label} has an invalid dependency valueReference") from exc
+        if reference < 0 or reference > MAX_FMI3_VALUE_REFERENCE:
+            raise ValueError(f"FMI-LS-DAE {label} has an invalid dependency valueReference")
+        if reference not in variables_by_reference:
+            raise ValueError(f"FMI-LS-DAE {label} references unknown dependency valueReference {reference}")
+        references.append(reference)
+    if len(references) != len(set(references)):
+        raise ValueError(f"FMI-LS-DAE {label} dependency references must be unique")
+    return tuple(references)
+
+
+def _parse_model_structure(
+    structure_node: ET.Element,
+    variables: list[Any],
+    variables_by_reference: dict[int, list[Any]],
+    algebraic_references: set[int],
+) -> tuple[FmiLsDaeModelStructureEntry, ...]:
+    order = {
+        "Output": 0,
+        "ContinuousStateDerivative": 1,
+        "ClockedState": 2,
+        "InitialUnknown": 3,
+        "EventIndicator": 4,
+        "Residual": 5,
+    }
+    entries: list[FmiLsDaeModelStructureEntry] = []
+    continuous_state_references: set[int] = set()
+    continuous_derivative_references: set[int] = set()
+    for variable in variables:
+        derivative_of = getattr(variable, "derivative", None)
+        if derivative_of is None:
+            continue
+        variable_reference = getattr(variable, "valueReference", None)
+        if isinstance(variable_reference, int) and not isinstance(variable_reference, bool):
+            continuous_derivative_references.add(variable_reference)
+        state_reference = getattr(derivative_of, "valueReference", derivative_of)
+        if isinstance(state_reference, int) and not isinstance(state_reference, bool):
+            continuous_state_references.add(state_reference)
+    known_references = set(algebraic_references) | continuous_state_references
+    known_references.update(
+        int(getattr(variable, "valueReference"))
+        for variable in variables
+        if isinstance(getattr(variable, "valueReference", None), int)
+        and not isinstance(getattr(variable, "valueReference", None), bool)
+        and getattr(variable, "causality", None) in {
+            "input", "parameter", "structuralParameter", "independent",
+        }
+    )
+    previous_order = -1
+    seen_by_kind: dict[str, set[int]] = {}
+    for node in structure_node:
+        kind = node.tag
+        if kind not in order:
+            raise ValueError(f"FMI-LS-DAE contains unsupported ModelStructure element {kind!r}")
+        current_order = order[kind]
+        if current_order < previous_order:
+            raise ValueError("FMI-LS-DAE has invalid ModelStructure order")
+        previous_order = current_order
+        _validate_annotations_only(
+            node,
+            label=f"ModelStructure/{kind}",
+            allowed_attributes={"valueReference", "dependencies", "dependenciesKind"},
+        )
+        reference = _value_reference(node, label=f"ModelStructure/{kind}")
+        candidates = variables_by_reference.get(reference)
+        if not candidates:
+            raise ValueError(f"FMI-LS-DAE {kind} references an unknown model variable")
+        seen = seen_by_kind.setdefault(kind, set())
+        if reference in seen:
+            raise ValueError(f"FMI-LS-DAE {kind} references must be unique")
+        seen.add(reference)
+
+        dependencies = _parse_dependency_references(
+            node.get("dependencies"),
+            label=kind,
+            variables_by_reference=variables_by_reference,
+        )
+        raw_kinds = node.get("dependenciesKind")
+        dependencies_kind: tuple[str, ...] | None = None
+        if raw_kinds is not None:
+            if dependencies is None:
+                raise ValueError(f"FMI-LS-DAE {kind} dependenciesKind requires dependencies")
+            parsed_kinds = tuple(raw_kinds.split())
+            if len(parsed_kinds) != len(dependencies):
+                raise ValueError(f"FMI-LS-DAE {kind} dependenciesKind count does not match dependencies")
+            allowed_kinds = {"dependent", "constant"} if kind == "InitialUnknown" else DEPENDENCY_KINDS
+            if any(value not in allowed_kinds for value in parsed_kinds):
+                raise ValueError(f"FMI-LS-DAE {kind} has an unsupported dependenciesKind")
+            if any(value != "dependent" for value in parsed_kinds) and not all(
+                getattr(candidate, "type", None) in {"Float32", "Float64"}
+                for candidate in candidates
+            ):
+                raise ValueError(f"FMI-LS-DAE {kind} dependenciesKind requires a floating-point unknown")
+            dependencies_kind = parsed_kinds
+
+        numeric_continuous = any(
+            getattr(candidate, "type", None) in {"Float32", "Float64"}
+            and getattr(candidate, "variability", None) == "continuous"
+            for candidate in candidates
+        )
+        if kind in {"ContinuousStateDerivative", "EventIndicator", "Residual"} and not numeric_continuous:
+            raise ValueError(f"FMI-LS-DAE {kind} must reference a continuous Float32 or Float64 variable")
+        if kind == "ContinuousStateDerivative" and not any(
+            getattr(candidate, "derivative", None) is not None for candidate in candidates
+        ):
+            raise ValueError("FMI-LS-DAE ContinuousStateDerivative must reference a derivative variable")
+        if kind == "Output" and not any(
+            getattr(candidate, "causality", None) == "output" for candidate in candidates
+        ):
+            raise ValueError("FMI-LS-DAE Output must reference an output variable")
+        if kind == "InitialUnknown":
+            valid_initial_unknown = any(
+                (
+                    reference in algebraic_references
+                    or getattr(candidate, "causality", None) == "calculatedParameter"
+                    or (
+                        getattr(candidate, "initial", None) in {"approx", "calculated"}
+                        and (
+                            getattr(candidate, "causality", None) == "output"
+                            or reference in continuous_state_references
+                            or reference in continuous_derivative_references
+                        )
+                    )
+                )
+                for candidate in candidates
+            )
+            if not valid_initial_unknown:
+                raise ValueError("FMI-LS-DAE InitialUnknown does not reference an initialization unknown")
+        if dependencies is not None and set(dependencies) - known_references:
+            raise ValueError(
+                f"FMI-LS-DAE {kind} dependencies must reference known inputs, states, parameters, "
+                "algebraic variables, or the independent variable"
+            )
+        entries.append(FmiLsDaeModelStructureEntry(kind, reference, dependencies, dependencies_kind))
+
+    return tuple(entries)
 
 
 def parse_fmi_ls_dae_manifest(xml_bytes: bytes, model_description: Any) -> FmiLsDaeDefinition:
@@ -76,14 +273,17 @@ def parse_fmi_ls_dae_manifest(xml_bytes: bytes, model_description: Any) -> FmiLs
     except ET.ParseError as exc:
         raise ValueError("FMI-LS-DAE manifest XML is invalid") from exc
 
-    if _local_name(root.tag) != "fmiDAEManifest":
+    if root.tag != "fmiDAEManifest":
         raise ValueError("FMI-LS-DAE manifest has an unexpected root element")
     manifest_name = root.get(f"{{{MANIFEST_NAMESPACE}}}fmi-ls-name")
     manifest_version = root.get(f"{{{MANIFEST_NAMESPACE}}}fmi-ls-version")
+    manifest_description = root.get(f"{{{MANIFEST_NAMESPACE}}}fmi-ls-description")
     if manifest_name != MANIFEST_NAME:
         raise ValueError("FMI-LS-DAE manifest name is missing or unsupported")
     if manifest_version not in SUPPORTED_MANIFEST_VERSIONS:
         raise ValueError("FMI-LS-DAE manifest version is unsupported")
+    if manifest_description != "Layered standard for DAE support in FMI.":
+        raise ValueError("FMI-LS-DAE manifest description is missing or unsupported")
     if str(getattr(model_description, "fmiVersion", "")).split(".", 1)[0] != "3":
         raise ValueError("FMI-LS-DAE requires FMI 3.0 Model Exchange")
     if getattr(model_description, "modelExchange", None) is None:
@@ -96,17 +296,19 @@ def parse_fmi_ls_dae_manifest(xml_bytes: bytes, model_description: Any) -> FmiLs
         if isinstance(reference, int) and not isinstance(reference, bool):
             variables_by_reference.setdefault(reference, []).append(variable)
 
-    children: dict[str, list[ET.Element]] = {}
-    for child in root:
-        children.setdefault(_local_name(child.tag), []).append(child)
-    enable_nodes = children.get("EnableDAEParameter", [])
-    algebraic_nodes_containers = children.get("AlgebraicVariables", [])
-    structure_nodes = children.get("ModelStructure", [])
-    if len(enable_nodes) != 1 or len(algebraic_nodes_containers) != 1 or len(structure_nodes) != 1:
+    root_children = list(root)
+    child_names = [child.tag for child in root_children]
+    if child_names not in (
+        ["EnableDAEParameter", "AlgebraicVariables", "ModelStructure"],
+        ["EnableDAEParameter", "AlgebraicVariables", "ModelStructure", "Annotations"],
+    ):
         raise ValueError("FMI-LS-DAE manifest is missing required declarations")
-    enable_node = enable_nodes[0]
-    algebraic_node = algebraic_nodes_containers[0]
-    structure_node = structure_nodes[0]
+    enable_node, algebraic_node, structure_node = root_children[:3]
+    _validate_annotations_only(enable_node, label="EnableDAEParameter", allowed_attributes={"valueReference"})
+    if set(algebraic_node.attrib):
+        raise ValueError("FMI-LS-DAE AlgebraicVariables contains unsupported attributes")
+    if any(node.tag != "AlgebraicVariable" for node in algebraic_node):
+        raise ValueError("FMI-LS-DAE AlgebraicVariables contains unsupported child elements")
 
     enable_reference = _value_reference(enable_node, label="EnableDAEParameter")
     enable_variable = next(
@@ -120,14 +322,31 @@ def parse_fmi_ls_dae_manifest(xml_bytes: bytes, model_description: Any) -> FmiLs
     if getattr(enable_variable, "variability", None) not in {"fixed", "tunable"}:
         raise ValueError("FMI-LS-DAE enable parameter must be a fixed or tunable structural parameter")
 
-    algebraic_nodes = [node for node in algebraic_node if _local_name(node.tag) == "AlgebraicVariable"]
-    residual_nodes = [node for node in structure_node if _local_name(node.tag) == "Residual"]
-    if len(algebraic_nodes) > MAX_EQUATIONS or len(residual_nodes) > MAX_EQUATIONS:
+    algebraic_nodes = list(algebraic_node)
+    if len(algebraic_nodes) > MAX_EQUATIONS or len(list(structure_node)) > MAX_EQUATIONS:
         raise ValueError("FMI-LS-DAE equation count exceeds the limit")
     algebraic_references = tuple(_value_reference(node, label="AlgebraicVariable") for node in algebraic_nodes)
-    residual_references = tuple(_value_reference(node, label="Residual") for node in residual_nodes)
     if len(set(algebraic_references)) != len(algebraic_references):
         raise ValueError("FMI-LS-DAE algebraic variable references must be unique")
+    for node in algebraic_nodes:
+        _validate_annotations_only(node, label="AlgebraicVariable", allowed_attributes={"valueReference"})
+        if not variables_by_reference.get(_value_reference(node, label="AlgebraicVariable")):
+            raise ValueError("FMI-LS-DAE AlgebraicVariable references an unknown model variable")
+
+    model_structure = _parse_model_structure(
+        structure_node,
+        variables,
+        variables_by_reference,
+        set(algebraic_references),
+    )
+    residual_references = tuple(
+        entry.value_reference for entry in model_structure if entry.kind == "Residual"
+    )
+    derivative_references = tuple(
+        entry.value_reference for entry in model_structure if entry.kind == "ContinuousStateDerivative"
+    )
+    if len(derivative_references) != len(set(derivative_references)):
+        raise ValueError("FMI-LS-DAE continuous state derivative references must be unique")
     if len(set(residual_references)) != len(residual_references):
         raise ValueError("FMI-LS-DAE residual references must be unique")
 
@@ -155,18 +374,24 @@ def parse_fmi_ls_dae_manifest(xml_bytes: bytes, model_description: Any) -> FmiLs
 
     algebraic_names, algebraic_types = resolve_real_variables(algebraic_references, "algebraic variables")
     residual_names, residual_types = resolve_real_variables(residual_references, "residuals")
+    derivative_names, derivative_types = resolve_real_variables(derivative_references, "continuous state derivatives")
     if set(algebraic_references).intersection(residual_references):
         raise ValueError("FMI-LS-DAE algebraic and residual variables must be distinct")
 
     return FmiLsDaeDefinition(
         manifest_version=manifest_version,
         enable_dae_value_reference=enable_reference,
+        enable_dae_variable_name=str(enable_variable.name),
         algebraic_value_references=algebraic_references,
         residual_value_references=residual_references,
         algebraic_names=algebraic_names,
         residual_names=residual_names,
         algebraic_types=algebraic_types,
         residual_types=residual_types,
+        derivative_value_references=derivative_references,
+        derivative_names=derivative_names,
+        derivative_types=derivative_types,
+        model_structure=model_structure,
     )
 
 
@@ -204,6 +429,10 @@ class Fmi3DaeIntegrator:
         relative_tolerance: float | None = None,
         internal_step_limit: int = 10_000,
     ):
+        if definition.event_indicator_value_references:
+            raise ValueError("FMI-LS-DAE execution with event indicators is not supported by this integrator")
+        if definition.clocked_state_value_references:
+            raise ValueError("FMI-LS-DAE execution with ClockedState variables is not supported")
         try:
             from sundials4py import core, idas
         except ImportError as exc:
@@ -237,7 +466,19 @@ class Fmi3DaeIntegrator:
             variables_by_name,
             variables_by_reference,
         )
+        self._derivative_variables = self._resolve_variable_specs(
+            definition.derivative_value_references,
+            definition.derivative_names,
+            definition.derivative_types,
+            variables_by_name,
+            variables_by_reference,
+        )
         self._state_count = int(fmu.getNumberOfContinuousStates())
+        derivative_count = sum(spec.size for spec in self._derivative_variables)
+        if derivative_count != self._state_count:
+            raise ValueError(
+                "FMI-LS-DAE ModelStructure derivative count does not match the FMU continuous-state count"
+            )
         self._algebraic_count = sum(spec.size for spec in self._algebraic_variables)
         residual_count = sum(spec.size for spec in self._residual_variables)
         if self._algebraic_count != residual_count:

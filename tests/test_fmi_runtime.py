@@ -29,6 +29,7 @@ def _fmi3_model_description():
     model.guid = "{fmi3-guid}"
     model.coSimulation = MagicMock(modelIdentifier="Fmi3Model")
     model.coSimulation.hasEventMode = False
+    model.modelExchange = None
     model.defaultExperiment = None
     model.modelVariables = [
         _variable("vectorInput", 1, "Float32", "input", shape=(2,)),
@@ -51,7 +52,9 @@ def test_fmi3_cosimulation_uses_generic_instantiation_and_arrays(tmp_path: Path)
     session = engine.FmuSession("fmi3-test", tmp_path / "model.fmu")
     session._extract_dir = tmp_path
     session._md = model
-    with patch("app.engine.fmpy_instantiate_fmu", return_value=fmu) as instantiate:
+    session._execution_interface = "CoSimulation"
+    with patch.object(session, "_available_execution_interfaces", return_value=["CoSimulation"]), \
+            patch("app.engine.instantiate_fmi3_cosimulation", return_value=fmu) as instantiate:
         result = session.initialize(
             start_time=0.0,
             stop_time=2.0,
@@ -59,10 +62,7 @@ def test_fmi3_cosimulation_uses_generic_instantiation_and_arrays(tmp_path: Path)
             parameters={"vectorInput": [1, 2]},
         )
 
-    instantiate.assert_called_once_with(
-        str(tmp_path), model, fmi_type="CoSimulation",
-        early_return_allowed=False, event_mode_used=False,
-    )
+    instantiate.assert_called_once_with(tmp_path, model, early_return_allowed=False, event_mode_used=False)
     fmu.enterInitializationMode.assert_called_once_with(startTime=0.0, stopTime=2.0)
     fmu.setFloat32.assert_called_once_with([1], [1.0, 2.0])
     assert result["state"] == "initialized"
@@ -87,13 +87,12 @@ def test_fmi3_event_mode_enters_step_mode_after_initialization(tmp_path: Path):
     session = engine.FmuSession("fmi3-event-mode-test", tmp_path / "model.fmu")
     session._extract_dir = tmp_path
     session._md = model
-    with patch("app.engine.fmpy_instantiate_fmu", return_value=fmu) as instantiate:
+    session._execution_interface = "CoSimulation"
+    with patch.object(session, "_available_execution_interfaces", return_value=["CoSimulation"]), \
+            patch("app.engine.instantiate_fmi3_cosimulation", return_value=fmu) as instantiate:
         session.initialize(start_time=0.0, stop_time=1.0, step_size=0.1)
 
-    instantiate.assert_called_once_with(
-        str(tmp_path), model, fmi_type="CoSimulation",
-        early_return_allowed=False, event_mode_used=True,
-    )
+    instantiate.assert_called_once_with(tmp_path, model, early_return_allowed=False, event_mode_used=True)
     fmu.exitInitializationMode.assert_called_once_with()
     fmu.updateDiscreteStates.assert_called_once_with()
     fmu.enterStepMode.assert_called_once_with()
@@ -111,12 +110,15 @@ def test_fmi_session_lifecycle_supports_pause_resume_and_reset(tmp_path: Path):
     model.coSimulation = MagicMock(modelIdentifier="Fmi2Model")
     model.defaultExperiment = None
     model.modelVariables = []
+    model.modelExchange = None
     fmu = MagicMock()
 
     session = engine.FmuSession("lifecycle-test", tmp_path / "model.fmu")
     session._extract_dir = tmp_path
     session._md = model
-    with patch("app.engine.fmpy_instantiate_fmu", return_value=fmu) as instantiate:
+    session._execution_interface = "CoSimulation"
+    with patch.object(session, "_available_execution_interfaces", return_value=["CoSimulation"]), \
+            patch("app.engine.fmpy_instantiate_fmu", return_value=fmu) as instantiate:
         session.initialize(stop_time=1.0, step_size=0.1)
         session.step()
         assert session.pause()["state"] == "paused"

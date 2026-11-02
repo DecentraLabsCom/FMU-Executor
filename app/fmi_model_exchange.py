@@ -44,6 +44,8 @@ class FmiModelExchangeIntegrator:
         if relative_tolerance is None or not math.isfinite(relative_tolerance) or relative_tolerance <= 0:
             relative_tolerance = 1e-5
 
+        self._event_states_changed = False
+        self._event_nominals_changed = False
         next_event_time_defined, next_event_time = self._initialize_event_mode()
         self._next_event_time_defined = next_event_time_defined
         self._next_event_time = next_event_time
@@ -129,6 +131,9 @@ class FmiModelExchangeIntegrator:
         if event_occurred and not terminate_simulation:
             terminate_simulation = self._process_event()
             if not terminate_simulation:
+                # CVodeSolver.reset rereads continuous states and nominals from the
+                # FMU. Do this for every event so both FMI event flags are applied,
+                # including changes raised by an earlier super-dense iteration.
                 self._solver.reset(reached_time)
 
         return {
@@ -147,6 +152,7 @@ class FmiModelExchangeIntegrator:
         terminated = self._update_discrete_states()
         if not terminated:
             self._fmu.enterContinuousTimeMode()
+            # reset() refreshes both state values and nominal-based tolerances.
             self._solver.reset(current_time)
         return terminated
 
@@ -198,22 +204,30 @@ class FmiModelExchangeIntegrator:
 
     def _initialize_event_mode(self) -> tuple[bool, float | None]:
         if self._fmi_major == "2":
-            needs_update, terminate, _nominals_changed, _states_changed, next_defined, next_time = self._fmu.newDiscreteStates()
+            needs_update, terminate, nominals_changed, states_changed, next_defined, next_time = self._fmu.newDiscreteStates()
         else:
-            needs_update, terminate, _nominals_changed, _states_changed, next_defined, next_time = self._fmu.updateDiscreteStates()
+            needs_update, terminate, nominals_changed, states_changed, next_defined, next_time = self._fmu.updateDiscreteStates()
+        any_nominals_changed = bool(nominals_changed)
+        any_states_changed = bool(states_changed)
         if terminate:
             raise RuntimeError("FMU requested termination during Model Exchange initialization")
         for _ in range(self.MAX_EVENT_ITERATIONS - 1):
             if not needs_update:
                 break
             if self._fmi_major == "2":
-                needs_update, terminate, _nominals_changed, _states_changed, next_defined, next_time = self._fmu.newDiscreteStates()
+                needs_update, terminate, nominals_changed, states_changed, next_defined, next_time = self._fmu.newDiscreteStates()
             else:
-                needs_update, terminate, _nominals_changed, _states_changed, next_defined, next_time = self._fmu.updateDiscreteStates()
+                needs_update, terminate, nominals_changed, states_changed, next_defined, next_time = self._fmu.updateDiscreteStates()
+            any_nominals_changed = any_nominals_changed or bool(nominals_changed)
+            any_states_changed = any_states_changed or bool(states_changed)
             if terminate:
                 raise RuntimeError("FMU requested termination during Model Exchange initialization")
         else:
             raise RuntimeError("FMI_EVENT_ITERATION_LIMIT_EXCEEDED")
+        self._event_states_changed = any_states_changed
+        self._event_nominals_changed = any_nominals_changed
+        # The CVodeSolver is constructed after this initial event iteration; its
+        # constructor reads the current states and nominal values from the FMU.
         next_defined, next_time = self._validated_next_event(next_defined, next_time)
         self._fmu.enterContinuousTimeMode()
         return next_defined, next_time
@@ -228,18 +242,24 @@ class FmiModelExchangeIntegrator:
     def _update_discrete_states(self) -> bool:
         needs_update = True
         terminate = False
+        nominals_changed = False
+        states_changed = False
         next_defined = False
         next_time: float | None = None
         for _ in range(self.MAX_EVENT_ITERATIONS):
             if self._fmi_major == "2":
-                needs_update, terminate, _nominals_changed, _states_changed, next_defined, next_time = self._fmu.newDiscreteStates()
+                needs_update, terminate, iteration_nominals_changed, iteration_states_changed, next_defined, next_time = self._fmu.newDiscreteStates()
             else:
-                needs_update, terminate, _nominals_changed, _states_changed, next_defined, next_time = self._fmu.updateDiscreteStates()
+                needs_update, terminate, iteration_nominals_changed, iteration_states_changed, next_defined, next_time = self._fmu.updateDiscreteStates()
+            nominals_changed = nominals_changed or bool(iteration_nominals_changed)
+            states_changed = states_changed or bool(iteration_states_changed)
             if terminate or not needs_update:
                 break
         else:
             raise RuntimeError("FMI_EVENT_ITERATION_LIMIT_EXCEEDED")
         self._next_event_time_defined, self._next_event_time = self._validated_next_event(next_defined, next_time)
+        self._event_states_changed = states_changed
+        self._event_nominals_changed = nominals_changed
         return bool(terminate)
 
     @staticmethod

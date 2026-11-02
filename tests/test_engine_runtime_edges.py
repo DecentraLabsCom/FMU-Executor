@@ -14,6 +14,7 @@ def make_live_session(tmp_path: Path, *, version="2.0", state="initialized", tim
     model = SimpleNamespace(
         fmiVersion=version,
         coSimulation=SimpleNamespace(modelIdentifier="Model", hasEventMode=False),
+        modelExchange=None,
         defaultExperiment=None,
         modelVariables=[],
     )
@@ -52,9 +53,10 @@ def _step_result(*, early=False, event=False, event_needed=False, terminate=Fals
 def test_load_extracts_once_and_returns_describe(monkeypatch, tmp_path):
     monkeypatch.setattr(engine.config, "TEMP_DIR", tmp_path)
     extracted = Mock()
-    model = SimpleNamespace(fmiVersion="2.0")
+    model = SimpleNamespace(fmiVersion="2.0", coSimulation=None, modelExchange=None)
     monkeypatch.setattr(engine, "fmpy_extract", extracted)
     monkeypatch.setattr(engine, "read_model_description", Mock(return_value=model))
+    monkeypatch.setattr(engine, "read_fmi_ls_dae", Mock(return_value=None))
     session = engine.FmuSession("load-test", tmp_path / "source.fmu")
     monkeypatch.setattr(session, "_describe", lambda: {"modelName": "Model"})
 
@@ -68,15 +70,17 @@ def test_initialization_validates_model_and_finite_time_contract(tmp_path, monke
     session = engine.FmuSession("init-test", tmp_path / "model.fmu")
     with pytest.raises(RuntimeError, match="call load"):
         session.initialize()
-    session._md = cast(Any, SimpleNamespace(coSimulation=None))
-    with pytest.raises(RuntimeError, match="Co-Simulation"):
+    session._md = cast(Any, SimpleNamespace(coSimulation=None, modelExchange=None))
+    with pytest.raises(RuntimeError, match="no executable Co-Simulation or Model Exchange binary"):
         session.initialize()
 
     session._md = cast(Any, SimpleNamespace(
         fmiVersion="2.0", coSimulation=SimpleNamespace(modelIdentifier="Model"),
-        defaultExperiment=SimpleNamespace(stepSize=0.2), modelVariables=[],
+        modelExchange=None, defaultExperiment=SimpleNamespace(stepSize=0.2), modelVariables=[],
     ))
     session._extract_dir = tmp_path
+    monkeypatch.setattr(session, "_available_execution_interfaces", lambda: ["CoSimulation"])
+    session._execution_interface = "CoSimulation"
     for kwargs, message in (
         ({"start_time": float("nan")}, "must be finite"),
         ({"stop_time": 0}, "greater than startTime"),
@@ -264,6 +268,50 @@ def test_fmi3_tunable_boolean_structural_parameter_is_valid_at_initialization(tm
     assert session._merge_declared_start_values({}) == {"enableDAE": False}
     with pytest.raises(ValueError, match="cannot be modified during runtime"):
         session.validate_runtime_input_values({"enableDAE": True})
+
+
+def test_fmi3_dae_selector_explicit_false_keeps_ode_mode(tmp_path, monkeypatch):
+    session = engine.FmuSession("dae-false-test", tmp_path / "model.fmu")
+    session._extract_dir = tmp_path
+    selector = SimpleNamespace(
+        name="enableDAE", type="Boolean", causality="structuralParameter", variability="tunable",
+        valueReference=7, min=None, max=None, start=False, declaredType=None, shape=None, dimensions=[],
+    )
+    model = SimpleNamespace(
+        fmiVersion="3.0", guid="dae-false-guid", coSimulation=None,
+        modelExchange=SimpleNamespace(modelIdentifier="ModelExchange", needsCompletedIntegratorStep=False),
+        defaultExperiment=None, modelVariables=[selector],
+    )
+    session._md = cast(Any, model)
+    session._fmi_ls_dae = cast(Any, SimpleNamespace(enable_dae_value_reference=7))
+    monkeypatch.setattr(session, "_available_execution_interfaces", lambda: ["ModelExchange"])
+    monkeypatch.setattr(session, "_execution_interface", "ModelExchange")
+    fmu = Mock()
+    monkeypatch.setattr(engine, "instantiate_fmi3_model_exchange", lambda *_args: fmu)
+    integrator = Mock()
+    monkeypatch.setattr(engine, "FmiModelExchangeIntegrator", lambda *_args, **_kwargs: integrator)
+    dae_integrator = Mock()
+    monkeypatch.setattr(engine, "Fmi3DaeIntegrator", lambda *_args, **_kwargs: dae_integrator)
+
+    session.initialize(parameters={"enableDAE": False}, execution_interface="ModelExchange")
+
+    fmu.setBoolean.assert_called_once_with([7], [False])
+    assert session._use_dae is False
+    assert session._me_integrator is integrator
+    assert session._dae_integrator is None
+    dae_integrator.assert_not_called()
+
+
+def test_initialize_rejects_an_execution_interface_without_a_binary(tmp_path, monkeypatch):
+    session = engine.FmuSession("missing-interface-test", tmp_path / "model.fmu")
+    session._md = cast(Any, SimpleNamespace(
+        fmiVersion="3.0", coSimulation=SimpleNamespace(modelIdentifier="CS"),
+        modelExchange=SimpleNamespace(modelIdentifier="ME"), defaultExperiment=None, modelVariables=[],
+    ))
+    monkeypatch.setattr(session, "_available_execution_interfaces", lambda: ["CoSimulation"])
+
+    with pytest.raises(ValueError, match="does not provide an executable ModelExchange"):
+        session.initialize(execution_interface="ModelExchange")
 
 
 def test_value_validation_and_output_reads_cover_fmi_types(tmp_path):

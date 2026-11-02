@@ -156,6 +156,12 @@ async def _handle_sim_initialize(
     early_return_allowed = options.get("earlyReturnAllowed", False)
     if type(early_return_allowed) is not bool:
         raise HTTPException(status_code=400, detail="INVALID_SIMULATION_OPTIONS")
+    execution_interface = options.get("executionInterface")
+    if execution_interface is not None and (
+        not isinstance(execution_interface, str)
+        or execution_interface not in {"CoSimulation", "ModelExchange"}
+    ):
+        raise HTTPException(status_code=400, detail="INVALID_EXECUTION_INTERFACE")
     try:
         await asyncio.to_thread(session.validate_initial_values, params)
     except ValueError as exc:
@@ -171,15 +177,20 @@ async def _handle_sim_initialize(
     if stop_runner is not None:
         await stop_runner()
     try:
+        initialization_options = {
+            "start_time": start_time,
+            "stop_time": stop_time,
+            "step_size": step_value,
+            "parameters": params or None,
+            "time_mode": time_mode,
+            "playback_speed": playback_speed,
+            "early_return_allowed": early_return_allowed,
+        }
+        if execution_interface is not None:
+            initialization_options["execution_interface"] = execution_interface
         await asyncio.to_thread(
             session.initialize,
-            start_time=start_time,
-            stop_time=stop_time,
-            step_size=step_value,
-            parameters=params or None,
-            time_mode=time_mode,
-            playback_speed=playback_speed,
-            early_return_allowed=early_return_allowed,
+            **initialization_options,
         )
         if checkpoint_snapshot is not None:
             await asyncio.to_thread(session.restore_fmu_state, checkpoint_snapshot)
@@ -192,6 +203,7 @@ async def _handle_sim_initialize(
         "simTime": session._time,
         "timeMode": session._time_mode,
         "playbackSpeed": session._playback_speed,
+        "executionInterface": getattr(session, "_execution_interface", None),
     }
 
 
