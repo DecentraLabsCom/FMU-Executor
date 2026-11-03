@@ -37,6 +37,18 @@ def make_live_session(tmp_path: Path, *, version="2.0", state="initialized", tim
     return session
 
 
+def _model_description(session: engine.FmuSession) -> Any:
+    model = session._md
+    assert model is not None
+    return model
+
+
+def _fmu_slave(session: engine.FmuSession) -> Any:
+    slave = session._slave
+    assert slave is not None
+    return slave
+
+
 def _set_model_variables(session: engine.FmuSession, variables: list[SimpleNamespace]) -> None:
     model = session._md
     assert model is not None
@@ -73,19 +85,21 @@ def _state_checkpoint(mode: str, event_metadata: dict[str, Any]) -> dict[str, An
 def test_fmi3_cosimulation_checkpoint_preserves_next_event_without_clocks(tmp_path):
     session = make_live_session(tmp_path, version="3.0")
     session.fmu_sha256 = "checkpoint-model-hash"
-    session._md.coSimulation.canGetAndSetFMUstate = True
-    session._md.coSimulation.canSerializeFMUstate = True
+    model = _model_description(session)
+    model.coSimulation.canGetAndSetFMUstate = True
+    model.coSimulation.canSerializeFMUstate = True
     session._fmi3_cs_next_event_time_defined = True
     session._fmi3_cs_next_event_time = 0.75
     session._time = 0.5
-    session._slave.getFMUState.return_value = object()
-    session._slave.serializeFMUState.return_value = b"serialized-fmu-state"
+    slave = _fmu_slave(session)
+    slave.getFMUState.return_value = object()
+    slave.serializeFMUState.return_value = b"serialized-fmu-state"
 
     checkpoint = session.capture_fmu_state()
     metadata = checkpoint["simulation"]["fmi3CoSimulation"]
     assert metadata == {"nextEventTimeDefined": True, "nextEventTime": 0.75}
 
-    session._slave.deserializeFMUState.return_value = object()
+    slave.deserializeFMUState.return_value = object()
     restored = session.restore_fmu_state(checkpoint)
     assert restored["nextEventTimeDefined"] is True
     assert restored["nextEventTime"] == 0.75
@@ -94,19 +108,21 @@ def test_fmi3_cosimulation_checkpoint_preserves_next_event_without_clocks(tmp_pa
 def test_fmi3_dae_checkpoint_restores_by_rebuilding_ode_initialized_session(monkeypatch, tmp_path):
     session = make_live_session(tmp_path, version="3.0")
     session.fmu_sha256 = "checkpoint-model-hash"
-    session._md.coSimulation = None
-    session._md.modelExchange = SimpleNamespace(
+    model = _model_description(session)
+    model.coSimulation = None
+    model.modelExchange = SimpleNamespace(
         modelIdentifier="ModelExchange",
         canGetAndSetFMUstate=True,
         canSerializeFMUstate=True,
     )
-    session._md.defaultExperiment = SimpleNamespace(tolerance=1e-6)
+    model.defaultExperiment = SimpleNamespace(tolerance=1e-6)
     session._execution_interface = "ModelExchange"
     session._use_me = True
     session._fmi_ls_dae = cast(Any, SimpleNamespace())
     old_integrator = Mock()
     session._me_integrator = old_integrator
-    session._slave.deserializeFMUState.return_value = object()
+    slave = _fmu_slave(session)
+    slave.deserializeFMUState.return_value = object()
 
     created: dict[str, Any] = {}
 
@@ -129,28 +145,31 @@ def test_fmi3_dae_checkpoint_restores_by_rebuilding_ode_initialized_session(monk
 
     assert restored["simTime"] == 0.5
     assert session._use_dae is True
-    assert session._dae_integrator.restored_schedule == (event_state, 0.5)
+    restored_integrator = cast(Any, session._dae_integrator)
+    assert restored_integrator.restored_schedule == (event_state, 0.5)
     assert created["kwargs"]["restoring_state"] is True
     old_integrator.close.assert_called_once_with()
-    session._slave.setTime.assert_called_once_with(0.5)
+    slave.setTime.assert_called_once_with(0.5)
 
 
 def test_fmi3_model_exchange_checkpoint_restores_by_rebuilding_dae_initialized_session(monkeypatch, tmp_path):
     session = make_live_session(tmp_path, version="3.0")
     session.fmu_sha256 = "checkpoint-model-hash"
-    session._md.coSimulation = None
-    session._md.modelExchange = SimpleNamespace(
+    model = _model_description(session)
+    model.coSimulation = None
+    model.modelExchange = SimpleNamespace(
         modelIdentifier="ModelExchange",
         canGetAndSetFMUstate=True,
         canSerializeFMUstate=True,
     )
-    session._md.defaultExperiment = SimpleNamespace(tolerance=1e-6)
+    model.defaultExperiment = SimpleNamespace(tolerance=1e-6)
     session._execution_interface = "ModelExchange"
     session._use_me = True
     session._use_dae = True
     old_integrator = Mock()
     session._dae_integrator = old_integrator
-    session._slave.deserializeFMUState.return_value = object()
+    slave = _fmu_slave(session)
+    slave.deserializeFMUState.return_value = object()
 
     created: dict[str, Any] = {}
 
@@ -173,10 +192,11 @@ def test_fmi3_model_exchange_checkpoint_restores_by_rebuilding_dae_initialized_s
 
     assert restored["simTime"] == 0.5
     assert session._use_dae is False
-    assert session._me_integrator.restored_schedule == (event_state, 0.5)
+    restored_integrator = cast(Any, session._me_integrator)
+    assert restored_integrator.restored_schedule == (event_state, 0.5)
     assert created["kwargs"]["restoring_state"] is True
     old_integrator.close.assert_called_once_with()
-    session._slave.setTime.assert_called_once_with(0.5)
+    slave.setTime.assert_called_once_with(0.5)
 
 
 def test_load_extracts_once_and_returns_describe(monkeypatch, tmp_path):
