@@ -84,16 +84,14 @@ public caller may read or write.
 
 At initialization, values are validated against declared variable names,
 causality, types, ranges and array lengths. Initial values can be supplied for
-FMU inputs and non-constant parameters. FMI 3 fixed `UInt64` structural
+FMU inputs and non-constant parameters. FMI 3 fixed and tunable structural
 parameters are applied in Configuration Mode before Initialization Mode and
-determine dependent array lengths. FMI-LS-DAE's scalar tunable Boolean
-structural selector is also applied in Configuration Mode before
-Initialization. In a realtime session
+determine dependent array lengths. In a realtime session
 the preferred location is `sim.initialize.options.inputs`; the top-level
 `parameters` field carries parameters and structural parameters.
 
-For writable inputs, non-constant parameters, FMI 3 fixed `UInt64` structural
-parameters and tunable Boolean structural selectors, the Executor seeds
+For writable inputs, non-constant parameters and FMI 3 fixed or tunable
+structural parameters, the Executor seeds
 declared FMI `start` values before applying explicit initialization values.
 Explicit values override those defaults. This also ensures an FMU receives a
 declared start when a client omits a value that matches the start in
@@ -113,7 +111,12 @@ Eligible inputs and tunable parameters are applied at communication points.
 Asynchronous jobs and batches do not accept input schedules. Event count,
 payload size, and the other request limits are configurable in the
 [configuration reference](configuration.md). Scheduled changes do not turn
-fixed parameters into tunable ones.
+fixed parameters into tunable ones. FMI 3 tunable structural parameters use
+`sim.reconfigure` instead of ordinary runtime writes; Co-Simulation
+reconfigures from Step Mode, while Model Exchange reconfigures from Event Mode.
+A reconfiguration re-resolves dependent array shapes and invalidates the old
+array values. Initial array dimensions must be positive; a reconfigured
+dimension may be zero when the FMU permits it.
 
 The FMI proxy uses `sim.reset` with `deferInitialization: true` when it needs
 to create a fresh FMU instance and then initialize it with new experiment

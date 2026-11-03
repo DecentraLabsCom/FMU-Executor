@@ -259,6 +259,7 @@ async def _handle_fmu_state_message(
         )
         restored = await asyncio.to_thread(session.restore_fmu_state, snapshot)
         outputs: dict[str, Any] = {}
+        output_event_metadata: dict[str, Any] = {}
         if variables:
             model_description = session._md
             if model_description is None:
@@ -273,17 +274,28 @@ async def _handle_fmu_state_message(
             refs = [int(outputs_by_name[name].valueReference) for name in variables]
             outputs_snapshot = await asyncio.to_thread(session.get_outputs, refs)
             outputs = outputs_snapshot.get("outputs", {})
+            output_event_metadata = {
+                key: outputs_snapshot[key]
+                for key in ("nextEventTimeDefined", "nextEventTime", "terminateSimulation", "finished")
+                if key in outputs_snapshot
+            }
     except ValueError as exc:
         raise HTTPException(400, "INVALID_FMU_STATE_CHECKPOINT") from exc
     except RuntimeError as exc:
         raise HTTPException(409, str(exc)) from exc
-    return {
+    response = {
         "type": "sim.state",
         "sessionId": session.session_id,
         "state": restored.get("state", session.state),
         "simTime": restored.get("simTime", session._time),
         "outputs": outputs,
     }
+    for key in ("nextEventTimeDefined", "nextEventTime"):
+        if key in output_event_metadata:
+            response[key] = output_event_metadata[key]
+        elif key in restored:
+            response[key] = restored[key]
+    return response
 
 async def handle_session_bootstrap(
     msg_type: str,

@@ -60,6 +60,10 @@ async def handle_io_command(
             "type": "sim.inputs.updated",
             "sessionId": session.session_id,
             "simTime": session._time,
+            "terminateSimulation": bool(
+                session._state == "stopped"
+                and session._finished_reason == "fmu_termination_requested"
+            ),
         }
 
     if msg_type == "sim.reconfigure":
@@ -124,7 +128,12 @@ async def handle_io_command(
                 result = await asyncio.to_thread(session.get_outputs, refs)
         except process_runner.OutputReadRateLimitError as exc:
             raise _output_read_rate_limit_exception(exc) from exc
-        return _sim_outputs_payload(session, result["outputs"])
+        metadata = {
+            key: result[key]
+            for key in ("nextEventTimeDefined", "nextEventTime", "terminateSimulation", "finished")
+            if key in result
+        }
+        return _sim_outputs_payload(session, result["outputs"], metadata)
 
     if msg_type == "sim.subscribeOutputs":
         variables = msg.get("variables")

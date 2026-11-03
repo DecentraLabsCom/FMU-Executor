@@ -180,7 +180,7 @@ including `exp` when provided by Gateway).
 | `sim.runUntil` | `sim.outputs` | Advances to `time`; legacy `targetTime` is accepted. Optional `stepSize`. |
 | `sim.advance` | `sim.samples` | Advances toward `targetTime` and returns bounded intermediate samples; optional `stepSize`, `maxSamples` (1–256), `maxComputeMs` (1–1000, soft), `outputSampleEverySteps`, `outputVariables`, `inputValues` and `inputSchedule`. Supports `external` mode when `currentCommunicationPoint` matches the current simulation time and the target does not exceed `stopTime`. |
 | `sim.setInputs` | `sim.inputs.updated` | `values` map keyed by model variable name. |
-| `sim.reconfigure` | `sim.reconfigured` | Changes the declared FMI-LS-DAE Boolean mode selector in an active FMI 3 Model Exchange session through Event and Reconfiguration Modes. Other structural parameters are not supported for runtime reconfiguration yet. |
+| `sim.reconfigure` | `sim.reconfigured` | Changes declared tunable FMI 3 structural parameters in an active session. Co-Simulation enters Reconfiguration Mode from Step Mode; Model Exchange enters it from Event Mode. Dependent array shapes are re-resolved and previous array values become invalid. |
 | `sim.getOutputs` | `sim.outputs` | Optional `variables` array; legacy `valueReferences` accepted. |
 | `sim.captureFMUState` | `sim.fmuState` | Captures the current serialized state and returns an opaque, reservation-bound `checkpoint` and its `simTime`. |
 | `sim.restoreFMUState` | `sim.state` | Restores an initialized session from `checkpoint`. Optional `variables` requests up to 512 readable values so a proxy can refresh its local output cache. |

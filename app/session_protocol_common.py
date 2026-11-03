@@ -107,7 +107,7 @@ def sim_outputs_payload(
     if metadata:
         for key in (
             "requestedTime", "timeAdvanced", "sequence", "earlyReturn", "eventOccurred", "eventHandlingNeeded",
-            "terminateSimulation", "finished", "finishReason", "steps",
+            "terminateSimulation", "finished", "finishReason", "steps", "nextEventTimeDefined", "nextEventTime",
         ):
             if key in metadata:
                 payload[key] = metadata[key]

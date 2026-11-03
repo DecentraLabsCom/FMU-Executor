@@ -107,6 +107,13 @@ def describe_model_description(
         }
         if var.type:
             entry["type"] = var.type
+        clock_references = []
+        for clock in getattr(var, "clocks", None) or []:
+            reference = getattr(clock, "valueReference", clock)
+            if isinstance(reference, int) and not isinstance(reference, bool) and reference >= 0:
+                clock_references.append(reference)
+        if clock_references:
+            entry["clocks"] = clock_references
         dimensions = getattr(var, "dimensions", None)
         if isinstance(dimensions, (list, tuple)) and dimensions:
             dimension_entries = []

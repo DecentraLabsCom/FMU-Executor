@@ -350,14 +350,14 @@ class FmuSession:
                     for variable in self._effective_output_variables()
                     if variable.causality == "output" and bool(getattr(variable, "clocks", None))
                 }
-                initial_outputs = self._read_outputs()["outputs"]
+                initial_outputs = self._read_outputs()
                 initial_clocked_outputs = {
                     name: value for name, value in initial_outputs.items()
                     if name in clocked_output_names
                 }
                 initial_unknown_values = self._read_fmi_ls_dae_initial_unknowns()
             elif self._fmi3_model_has_clocks():
-                initial_outputs = self._read_outputs()["outputs"]
+                initial_outputs = self._read_outputs()
                 self._fmi3_clock_runtime = Fmi3ClockRuntime(
                     slave,
                     self._md,
@@ -550,6 +550,7 @@ class FmuSession:
             "terminateSimulation": terminate_simulation,
             "finished": self._state == "stopped",
             "finishReason": self._finished_reason,
+            **self._fmi3_event_time_metadata(),
         }
 
     def run_until_streaming(
@@ -791,6 +792,11 @@ class FmuSession:
                         "earlyReturn": bool(snapshot.get("earlyReturn", False)),
                         "terminateSimulation": bool(snapshot.get("terminateSimulation", False)),
                         "finished": bool(snapshot.get("finished", False)),
+                        **{
+                            key: snapshot[key]
+                            for key in ("nextEventTimeDefined", "nextEventTime")
+                            if key in snapshot
+                        },
                     })
 
                 if max_compute_ms is not None:
@@ -840,6 +846,7 @@ class FmuSession:
             "sampleBytes": sample_bytes,
             "computeMs": execution_ms,
             "computeBudgetOverrunMs": compute_budget_overrun_ms,
+            **self._fmi3_event_time_metadata(),
         }
         if max_compute_ms is not None:
             result["maxComputeMs"] = float(max_compute_ms)
@@ -896,72 +903,119 @@ class FmuSession:
         return self._validate_values(values, phase="reconfiguration")
 
     def reconfigure_structural_parameters(self, values: dict[str, Any]) -> None:
-        """Toggle the FMI-LS-DAE mode through FMI 3 Reconfiguration Mode."""
+        """Apply tunable FMI 3 structural parameters at a legal reconfiguration point."""
         self._ensure_live()
         validated = self._validate_values(values, phase="reconfiguration")
-        definition = self._fmi_ls_dae
-        enable_variable = self._dae_enable_variable()
-        if definition is None or enable_variable is None or not self._use_me or self._fmi_major() != "3":
-            raise ValueError("Runtime structural reconfiguration is only supported for the FMI-LS-DAE selector")
-        enable_name = str(enable_variable.name)
-        if set(validated) != {enable_name} or type(validated[enable_name]) is not bool:
-            raise ValueError("Only the FMI-LS-DAE Boolean selector can be reconfigured at runtime")
+        if self._fmi_major() != "3":
+            raise ValueError("Structural reconfiguration requires FMI 3")
         if not self._initialised or self._state in {"stopped", "error"}:
-            raise RuntimeError("FMI-LS-DAE reconfiguration requires an active Model Exchange simulation")
-        target_dae_mode = validated[enable_name]
-        if target_dae_mode == self._use_dae:
+            raise RuntimeError("Structural reconfiguration requires an active simulation")
+        if not validated:
             return
 
         slave = self._require_slave()
+        model_description = self._md
+        if model_description is None:
+            raise RuntimeError("FMU model description is unavailable")
+        dimension_value_references = {
+            int(dimension.valueReference)
+            for variable in model_description.modelVariables
+            for dimension in (getattr(variable, "dimensions", None) or [])
+            if getattr(dimension, "valueReference", None) is not None
+        }
+        dimension_values: dict[int, int] = {}
+        for name, value in validated.items():
+            variable = next((item for item in model_description.modelVariables if item.name == name), None)
+            if variable is None:
+                raise ValueError(f"Unknown structural parameter '{name}'")
+            reference = int(variable.valueReference)
+            if reference in dimension_value_references:
+                if str(getattr(variable, "type", "")) != "UInt64" or isinstance(value, bool):
+                    raise ValueError(f"Structural dimension '{name}' must be UInt64")
+                extent = int(value)
+                if extent < 0:
+                    raise ValueError(f"Reconfigured structural dimension '{name}' must be non-negative")
+                dimension_values[reference] = extent
+        for variable in model_description.modelVariables:
+            reference = int(getattr(variable, "valueReference", -1))
+            if reference not in dimension_value_references or reference in dimension_values:
+                continue
+            getter = getattr(slave, f"get{self._variable_type(variable)}", None)
+            current_values = getter([reference]) if getter is not None else []
+            current_value: Any = current_values[0] if current_values else self._initial_parameters.get(
+                str(variable.name), getattr(variable, "start", None)
+            )
+            if current_value is None:
+                raise ValueError(f"Structural dimension '{variable.name}' has no current value")
+            try:
+                dimension_extent = int(current_value)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(f"Structural dimension '{variable.name}' must be a non-negative UInt64") from exc
+            if isinstance(current_value, bool) or dimension_extent != current_value or dimension_extent < 0:
+                raise ValueError(f"Structural dimension '{variable.name}' must be a non-negative UInt64")
+            dimension_values[reference] = dimension_extent
+
+        definition = self._fmi_ls_dae
+        enable_variable = self._dae_enable_variable()
+        enable_name = str(enable_variable.name) if enable_variable is not None else None
+        target_dae_mode = (
+            validated[enable_name]
+            if enable_name is not None and enable_name in validated
+            else self._use_dae
+        )
         try:
-            slave.enterEventMode()
+            if self._use_me:
+                slave.enterEventMode()
             slave.enterConfigurationMode()
-            self._apply_validated_values({enable_name: target_dae_mode})
+            self._apply_validated_values(validated)
+            self._apply_structural_array_shapes(dimension_values)
             slave.exitConfigurationMode()
 
-            initial_clocked_outputs = (
-                self._dae_integrator.clocked_output_cache()
-                if self._dae_integrator is not None
-                else (
-                    self._fmi3_clock_runtime.clocked_output_cache()
-                    if self._fmi3_clock_runtime is not None
-                    else {}
+            if self._use_me:
+                initial_clocked_outputs = (
+                    self._dae_integrator.clocked_output_cache()
+                    if self._dae_integrator is not None
+                    else (
+                        self._fmi3_clock_runtime.clocked_output_cache()
+                        if self._fmi3_clock_runtime is not None
+                        else {}
+                    )
                 )
-            )
+                if self._dae_integrator is not None:
+                    self._dae_integrator.close()
+                    self._dae_integrator = None
+                if self._me_integrator is not None:
+                    self._me_integrator.close()
+                    self._me_integrator = None
+                self._fmi3_clock_runtime = None
 
-            if self._dae_integrator is not None:
-                self._dae_integrator.close()
-                self._dae_integrator = None
-            if self._me_integrator is not None:
-                self._me_integrator.close()
-                self._me_integrator = None
-            self._fmi3_clock_runtime = None
-
-            default_tolerance = getattr(getattr(self._md, "defaultExperiment", None), "tolerance", None)
-            if target_dae_mode:
-                self._dae_integrator = Fmi3DaeIntegrator(
-                    slave,
-                    definition,
-                    model_description=self._md,
-                    start_time=self._time,
-                    relative_tolerance=default_tolerance,
-                    input_clock_references=self._fmi3_input_clock_references,
-                    clock_schedules=self._fmi3_clock_schedules,
-                    initial_clocked_outputs=initial_clocked_outputs,
-                )
-                self._collect_dae_event_outputs()
-            else:
-                self._fmi3_clock_runtime = self._create_fmi3_clock_runtime(initial_clocked_outputs)
-                self._me_integrator = FmiModelExchangeIntegrator(
-                    slave,
-                    self._md,
-                    start_time=self._time,
-                    max_step=self._step_size,
-                    relative_tolerance=default_tolerance,
-                    clock_runtime=self._fmi3_clock_runtime,
-                )
-                self._collect_me_event_outputs()
-            self._use_dae = target_dae_mode
+                default_tolerance = getattr(getattr(self._md, "defaultExperiment", None), "tolerance", None)
+                if target_dae_mode:
+                    if definition is None:
+                        raise ValueError("DAE mode is enabled but the FMI-LS-DAE manifest is unavailable")
+                    self._dae_integrator = Fmi3DaeIntegrator(
+                        slave,
+                        definition,
+                        model_description=self._md,
+                        start_time=self._time,
+                        relative_tolerance=default_tolerance,
+                        input_clock_references=self._fmi3_input_clock_references,
+                        clock_schedules=self._fmi3_clock_schedules,
+                        initial_clocked_outputs=initial_clocked_outputs,
+                    )
+                    self._collect_dae_event_outputs()
+                else:
+                    self._fmi3_clock_runtime = self._create_fmi3_clock_runtime(initial_clocked_outputs)
+                    self._me_integrator = FmiModelExchangeIntegrator(
+                        slave,
+                        self._md,
+                        start_time=self._time,
+                        max_step=self._step_size,
+                        relative_tolerance=default_tolerance,
+                        clock_runtime=self._fmi3_clock_runtime,
+                    )
+                    self._collect_me_event_outputs()
+                self._use_dae = target_dae_mode
         except Exception:
             self._state = "error"
             raise
@@ -1202,7 +1256,9 @@ class FmuSession:
         # explicit sim.advance. Keep that newly initialized session runnable;
         # restoring into an existing paused session should remain paused.
         self._state = "initialized" if initialized_for_run else "paused"
-        return {"state": self._state, "simTime": self._time}
+        result = {"state": self._state, "simTime": self._time}
+        result.update(self._fmi3_event_time_metadata())
+        return result
 
     def _supports_serialized_fmu_state(self) -> bool:
         interface = getattr(self._md, "modelExchange", None) if self._use_me else getattr(self._md, "coSimulation", None)
@@ -1248,7 +1304,31 @@ class FmuSession:
 
     def get_outputs(self, refs: list[int] | None = None) -> dict[str, Any]:
         self._ensure_live()
-        return {"time": self._time, "outputs": self._read_outputs(refs)}
+        result = {"time": self._time, "outputs": self._read_outputs(refs)}
+        result.update(self._fmi3_event_time_metadata())
+        if self._fmi_major() == "3" and not self._use_me:
+            result["terminateSimulation"] = self._finished_reason == "fmu_termination_requested"
+            result["finished"] = self._state == "stopped"
+        return result
+
+    def _fmi3_event_time_metadata(self) -> dict[str, Any]:
+        if self._fmi_major() != "3":
+            return {}
+        if self._use_me:
+            integrator = self._dae_integrator if self._use_dae else self._me_integrator
+            snapshot = getattr(integrator, "snapshot_event_schedule", None)
+            event_schedule = snapshot() if callable(snapshot) else {}
+            if isinstance(event_schedule, dict):
+                return {
+                    key: event_schedule[key]
+                    for key in ("nextEventTimeDefined", "nextEventTime")
+                    if key in event_schedule
+                }
+            return {"nextEventTimeDefined": False}
+        result: dict[str, Any] = {"nextEventTimeDefined": self._fmi3_cs_next_event_time_defined}
+        if self._fmi3_cs_next_event_time_defined and self._fmi3_cs_next_event_time is not None:
+            result["nextEventTime"] = self._fmi3_cs_next_event_time
+        return result
 
     def pause(self) -> dict[str, Any]:
         """Pause automatic execution without destroying FMU state."""
@@ -1432,13 +1512,29 @@ class FmuSession:
         model_identifier = str(getattr(interface, "modelIdentifier", "") or "")
         if not model_identifier:
             return False
-        binary = (
-            self._extract_dir
-            / "binaries"
-            / platform_tuple
-            / f"{model_identifier}{sharedLibraryExtension}"
+        directories = [platform_tuple]
+        if self._fmi_major() == "2":
+            legacy_platform = {
+                ("windows", "amd64"): "win64",
+                ("windows", "x86_64"): "win64",
+                ("windows", "x64"): "win64",
+                ("windows", "x86"): "win32",
+                ("windows", "i386"): "win32",
+                ("windows", "i686"): "win32",
+                ("linux", "x86_64"): "linux64",
+                ("linux", "amd64"): "linux64",
+                ("linux", "x86"): "linux32",
+                ("linux", "i386"): "linux32",
+                ("linux", "i686"): "linux32",
+                ("darwin", "x86_64"): "darwin64",
+                ("darwin", "amd64"): "darwin64",
+            }.get((platform.system().lower(), platform.machine().lower()))
+            if legacy_platform:
+                directories.insert(0, legacy_platform)
+        return any(
+            (self._extract_dir / "binaries" / directory / f"{model_identifier}{sharedLibraryExtension}").is_file()
+            for directory in directories
         )
-        return binary.is_file()
 
     def _available_execution_interfaces(self) -> list[str]:
         if self._md is None:
@@ -1894,6 +1990,7 @@ class FmuSession:
             "terminateSimulation": terminateSimulation,
             "finished": finished or self._state == "stopped",
             "finishReason": self._finished_reason,
+            **self._fmi3_event_time_metadata(),
         }
 
     def _describe(self) -> dict[str, Any]:
@@ -2023,7 +2120,7 @@ class FmuSession:
         var_map = {v.name: v for v in self._md.modelVariables}
         normalized: dict[str, Any] = {}
         dimension_values: dict[int, int] = {}
-        if phase == "initialization" and self._fmi_major() == "3":
+        if phase in {"initialization", "reconfiguration"} and self._fmi_major() == "3":
             dimension_value_references = {
                 int(dimension.valueReference)
                 for variable in self._md.modelVariables
@@ -2041,7 +2138,10 @@ class FmuSession:
                 if value_reference in dimension_value_references:
                     if str(getattr(var, "type", "")) != "UInt64" or isinstance(values[0], bool):
                         raise ValueError(f"Structural dimension '{name}' must be UInt64")
-                    dimension_values[value_reference] = int(values[0])
+                    extent = int(values[0])
+                    if phase == "initialization" and extent <= 0:
+                        raise ValueError(f"Initial structural dimension '{name}' must be positive")
+                    dimension_values[value_reference] = extent
         for name, value in params.items():
             if name in normalized:
                 continue
@@ -2063,10 +2163,7 @@ class FmuSession:
                 or (
                     self._fmi_major() == "3"
                     and causality == "structuralParameter"
-                    and (
-                        (variability == "fixed" and str(getattr(var, "type", "")) == "UInt64")
-                        or (variability == "tunable" and str(getattr(var, "type", "")) == "Boolean")
-                    )
+                    and variability in {"fixed", "tunable"}
                 )
             )
         elif phase == "runtime":
@@ -2074,16 +2171,10 @@ class FmuSession:
                 causality == "parameter" and variability == "tunable"
             )
         elif phase == "reconfiguration":
-            dae_enable_variable = self._dae_enable_variable()
             allowed = (
                 self._fmi_major() == "3"
-                and self._fmi_ls_dae is not None
-                and dae_enable_variable is not None
-                and getattr(var, "valueReference", None)
-                == self._fmi_ls_dae.enable_dae_value_reference
                 and causality == "structuralParameter"
                 and variability == "tunable"
-                and str(getattr(var, "type", "")) == "Boolean"
             )
         else:
             raise ValueError(f"Unknown variable write phase '{phase}'")
@@ -2340,6 +2431,21 @@ class FmuSession:
                     extent = int(getattr(referenced_variable, "start"))
                 resolved_shape.append(extent)
             variable.shape = tuple(resolved_shape)
+        for attribute, count_attribute in (
+            ("derivatives", "numberOfContinuousStates"),
+            ("eventIndicators", "numberOfEventIndicators"),
+        ):
+            variables = getattr(self._md, attribute, None)
+            if isinstance(variables, (list, tuple)):
+                setattr(
+                    self._md,
+                    count_attribute,
+                    sum(
+                        self._variable_size(getattr(unknown, "variable", None))
+                        for unknown in variables
+                        if getattr(unknown, "variable", None) is not None
+                    ),
+                )
 
     @staticmethod
     def _is_array(var: Any) -> bool:
