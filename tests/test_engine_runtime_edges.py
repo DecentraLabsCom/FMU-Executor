@@ -105,6 +105,32 @@ def test_fmi3_cosimulation_checkpoint_preserves_next_event_without_clocks(tmp_pa
     assert restored["nextEventTime"] == 0.75
 
 
+def test_checkpoint_can_be_restored_before_and_after_source_terminate(tmp_path):
+    session = make_live_session(tmp_path, version="2.0")
+    session.fmu_sha256 = "checkpoint-model-hash"
+    model = _model_description(session)
+    model.coSimulation.canGetAndSetFMUstate = True
+    model.coSimulation.canSerializeFMUstate = True
+    slave = _fmu_slave(session)
+    slave.getFMUState.return_value = object()
+    slave.serializeFMUState.return_value = b"serialized-fmu-state"
+    slave.deserializeFMUState.return_value = object()
+
+    before_terminate = session.capture_fmu_state()
+    session.terminate_fmu()
+    assert session._source_fmu_terminated is True
+
+    after_terminate = session.capture_fmu_state()
+    assert after_terminate["simulation"]["sourceFmuTerminated"] is True
+    assert slave.terminate.call_count == 1
+
+    session.restore_fmu_state(before_terminate)
+    assert session._source_fmu_terminated is False
+    session.restore_fmu_state(after_terminate)
+    assert session._source_fmu_terminated is True
+    assert slave.terminate.call_count == 1
+
+
 def test_fmi3_dae_checkpoint_restores_by_rebuilding_ode_initialized_session(monkeypatch, tmp_path):
     session = make_live_session(tmp_path, version="3.0")
     session.fmu_sha256 = "checkpoint-model-hash"
@@ -794,3 +820,43 @@ def test_external_model_exchange_accepts_declared_initial_state_values(tmp_path,
     model.derivatives = [SimpleNamespace(variable=derivative)]
 
     assert session._validate_values({"x": 0.8}, phase="initialization") == {"x": 0.8}
+
+
+def test_initial_value_preflight_uses_requested_external_model_exchange_context(tmp_path):
+    session = make_live_session(tmp_path, version="3.0")
+    state = SimpleNamespace(
+        name="x1",
+        valueReference=1,
+        type="Float64",
+        causality="local",
+        variability="continuous",
+        initial="exact",
+        start=0.25,
+        dimensions=[],
+    )
+    derivative = SimpleNamespace(
+        name="der_x1",
+        valueReference=2,
+        type="Float64",
+        causality="local",
+        variability="continuous",
+        derivative=state,
+        dimensions=[],
+    )
+    model = _model_description(session)
+    model.modelExchange = SimpleNamespace(modelIdentifier="Model")
+    model.coSimulation = None
+    model.modelVariables = [state, derivative]
+    model.derivatives = [SimpleNamespace(variable=derivative)]
+    session._external_solver = False
+    session._use_me = False
+    session._initialised = False
+
+    with pytest.raises(ValueError, match="cannot be modified during initialization"):
+        session.validate_initial_values({"x1": 0.8})
+
+    assert session.validate_initial_values(
+        {"x1": 0.8},
+        execution_interface="ModelExchange",
+        external_solver=True,
+    ) == {"x1": 0.8}

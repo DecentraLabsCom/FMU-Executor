@@ -41,7 +41,8 @@ class Session:
     seq = 0
 
     def load(self): self.loaded = True; return {"modelName": "demo"}
-    def validate_initial_values(self, values):
+    def validate_initial_values(self, values, *, execution_interface=None, external_solver=None):
+        self.validation_context = (execution_interface, external_solver)
         return values
     def validate_inputs(self, values):
         return values
@@ -77,6 +78,9 @@ class Session:
         self._defer_initialization_exit = False
         self.exited_initialization_mode = True
         return {"state": "initialized", "simTime": self._time}
+    def terminate_fmu(self):
+        self.source_fmu_terminated = True
+        return {"state": self.state, "simTime": self._time, "fmuTerminated": True}
     def resume(self): self.state = "running"; self._state = "running"
     def pause(self): self.state = "paused"; self._state = "paused"
     def reset(self, defer_initialization=False): self.state = "initialized"; self._state = "initialized"; self._time = 0.0
@@ -193,6 +197,30 @@ def test_deferred_cosimulation_initialization_exits_through_lifecycle_command(di
     exited = call({"type": "sim.exitInitializationMode"}, stop_runner=lambda: asyncio.sleep(0))
     assert exited["state"] == "initialized"
     assert session.exited_initialization_mode is True
+
+
+def test_initialization_preflight_receives_requested_model_exchange_context(dispatch):
+    session, call = dispatch
+    call({
+        "type": "sim.initialize",
+        "parameters": {"x1": 0.8},
+        "options": {
+            "executionInterface": "ModelExchange",
+            "externalSolver": True,
+        },
+    }, stop_runner=lambda: asyncio.sleep(0))
+
+    assert session.validation_context == ("ModelExchange", True)
+
+
+def test_proxy_can_terminate_the_source_fmu_without_closing_remote_state_session(dispatch):
+    session, call = dispatch
+
+    response = call({"type": "sim.terminateFMU"}, stop_runner=lambda: asyncio.sleep(0))
+
+    assert response["type"] == "sim.state"
+    assert response["_sourceFmuTerminated"] is True
+    assert session.source_fmu_terminated is True
 
 
 def test_advance_reserves_scheduled_input_quota_and_settles_only_applied_events(dispatch, monkeypatch):

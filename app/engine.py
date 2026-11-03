@@ -166,6 +166,7 @@ class FmuSession:
         self._state: str = "new"
         self._initialised: bool = False
         self._terminated: bool = False
+        self._source_fmu_terminated = False
         self._attached: bool = False
         self._attach_deadline: float | None = None
         self._attachment_owner: object | None = None
@@ -226,6 +227,7 @@ class FmuSession:
         self._fmi3_event_mode_used = False
         self._fmi3_cs_next_event_time_defined = False
         self._fmi3_cs_next_event_time = None
+        self._source_fmu_terminated = False
         self._pending_event_outputs = None
         available_interfaces = self._available_execution_interfaces()
         if execution_interface is not None:
@@ -1192,6 +1194,7 @@ class FmuSession:
             "earlyReturnAllowed": self._early_return_allowed,
             "initialParameters": copy.deepcopy(self._initial_parameters),
             "initializationMode": self._defer_initialization_exit,
+            "sourceFmuTerminated": self._source_fmu_terminated,
         }
         if self._dae_integrator is not None:
             simulation["fmiLsDae"] = self._dae_integrator.snapshot_event_schedule()
@@ -1253,6 +1256,7 @@ class FmuSession:
         fmi3_cs_next_event_time_defined = False
         fmi3_cs_next_event_time: float | None = None
         initialization_mode = False
+        source_fmu_terminated = False
         try:
             serialized = base64.b64decode(encoded_state, validate=True)
             raw_time = simulation["time"]
@@ -1273,10 +1277,14 @@ class FmuSession:
             if type(raw_initialization_mode) is not bool:
                 raise ValueError("invalid initialization mode")
             initialization_mode = raw_initialization_mode
+            raw_source_fmu_terminated = simulation.get("sourceFmuTerminated", False)
+            if type(raw_source_fmu_terminated) is not bool:
+                raise ValueError("invalid source FMU termination state")
+            source_fmu_terminated = raw_source_fmu_terminated
         except (KeyError, TypeError, ValueError, OverflowError) as exc:
             raise ValueError("FMU state checkpoint is invalid or incompatible") from exc
         if not math.isfinite(time_value) or time_value < self._start_time or (
-            self._stop_time is not None and time_value >= self._stop_time
+            self._stop_time is not None and time_value > self._stop_time
         ):
             raise ValueError("FMU state checkpoint time must fall within the new simulation interval")
         if step_count < 0 or (self._max_simulation_steps is not None and step_count > self._max_simulation_steps):
@@ -1385,6 +1393,7 @@ class FmuSession:
                 except Exception:
                     logger.debug("Could not free restored FMU state for session %s", self.session_id, exc_info=True)
         self._time = time_value
+        self._source_fmu_terminated = source_fmu_terminated
         self._step_count = step_count
         self._defer_initialization_exit = initialization_mode
         if checkpoint_uses_me:
@@ -1499,6 +1508,23 @@ class FmuSession:
         result.update(self._fmi3_event_time_metadata())
         return result
 
+    def terminate_fmu(self) -> dict[str, Any]:
+        """Terminate the source FMU while keeping its session restorable.
+
+        The proxy FMU remains responsible for freeing the remote session. FMI
+        allows FMU state capture/restoration in Terminated, so the source
+        instance must remain allocated until the proxy closes its session.
+        """
+        slave = self._require_slave()
+        if self._source_fmu_terminated:
+            return {"state": self._state, "simTime": self._time, "fmuTerminated": True}
+        try:
+            slave.terminate()
+        except Exception as exc:
+            raise RuntimeError("The source FMU could not be terminated") from exc
+        self._source_fmu_terminated = True
+        return {"state": self._state, "simTime": self._time, "fmuTerminated": True}
+
     def _supports_serialized_fmu_state(self) -> bool:
         interface = getattr(self._md, "modelExchange", None) if self._use_me else getattr(self._md, "coSimulation", None)
         if interface is None:
@@ -1508,13 +1534,26 @@ class FmuSession:
             and getattr(interface, "canSerializeFMUstate", getattr(interface, "canSerializeFMUState", False))
         )
 
-    def validate_initial_values(self, values: dict[str, Any]) -> dict[str, Any]:
+    def validate_initial_values(
+        self,
+        values: dict[str, Any],
+        *,
+        execution_interface: str | None = None,
+        external_solver: bool | None = None,
+    ) -> dict[str, Any]:
         """Validate initialization parameters before a scenario is charged."""
         if self._terminated:
             raise RuntimeError("Session already terminated")
         if self._initialised:
             raise RuntimeError("Session already initialised")
-        return self._validate_values(values, phase="initialization")
+        if execution_interface is not None and execution_interface not in {"CoSimulation", "ModelExchange"}:
+            raise ValueError("executionInterface must be CoSimulation or ModelExchange")
+        return self._validate_values(
+            values,
+            phase="initialization",
+            execution_interface=execution_interface,
+            external_solver=external_solver,
+        )
 
     def validate_inputs(self, values: dict[str, Any]) -> dict[str, Any]:
         """Validate and normalize runtime variable writes without changing FMU state."""
@@ -2761,11 +2800,28 @@ class FmuSession:
         except (TypeError, ValueError, OverflowError):
             return False
 
-    def _validate_values(self, params: dict[str, Any], *, phase: str) -> dict[str, Any]:
+    def _validate_values(
+        self,
+        params: dict[str, Any],
+        *,
+        phase: str,
+        execution_interface: str | None = None,
+        external_solver: bool | None = None,
+    ) -> dict[str, Any]:
         if not isinstance(params, dict):
             raise ValueError("Variable values must be an object")
         if not self._md:
             raise RuntimeError("FMU model description is not loaded")
+        model_exchange = (
+            execution_interface == "ModelExchange"
+            if execution_interface is not None
+            else bool(self._use_me)
+        )
+        use_external_solver = (
+            external_solver if external_solver is not None else bool(self._external_solver)
+        )
+        if use_external_solver and not model_exchange:
+            raise ValueError("External solver execution requires the ModelExchange interface")
         var_map = {v.name: v for v in self._md.modelVariables}
         normalized: dict[str, Any] = {}
         dimension_values: dict[int, int] = {}
@@ -2780,7 +2836,12 @@ class FmuSession:
                 var = var_map.get(name)
                 if var is None or getattr(var, "causality", None) != "structuralParameter":
                     continue
-                self._validate_write_access(var, phase=phase)
+                self._validate_write_access(
+                    var,
+                    phase=phase,
+                    model_exchange=model_exchange,
+                    external_solver=use_external_solver,
+                )
                 values = self._coerce_values(var, value)
                 normalized[name] = values if self._is_array(var) else values[0]
                 value_reference = int(var.valueReference)
@@ -2797,12 +2858,26 @@ class FmuSession:
             var = var_map.get(name)
             if var is None:
                 raise ValueError(f"Unknown FMU variable '{name}'")
-            self._validate_write_access(var, phase=phase)
+            self._validate_write_access(
+                var,
+                phase=phase,
+                model_exchange=model_exchange,
+                external_solver=use_external_solver,
+            )
             values = self._coerce_values(var, value, dimension_values=dimension_values)
             normalized[name] = values if self._is_array(var) else values[0]
         return normalized
 
-    def _validate_write_access(self, var: Any, *, phase: str) -> None:
+    def _validate_write_access(
+        self,
+        var: Any,
+        *,
+        phase: str,
+        model_exchange: bool | None = None,
+        external_solver: bool | None = None,
+    ) -> None:
+        model_exchange = bool(self._use_me) if model_exchange is None else model_exchange
+        external_solver = bool(self._external_solver) if external_solver is None else external_solver
         causality = str(getattr(var, "causality", ""))
         variability = str(getattr(var, "variability", ""))
         if phase == "initialization":
@@ -2815,8 +2890,8 @@ class FmuSession:
                     and variability in {"fixed", "tunable"}
                 )
                 or (
-                    self._external_solver
-                    and self._use_me
+                    external_solver
+                    and model_exchange
                     and int(getattr(var, "valueReference", -1)) in self._model_exchange_state_value_references()
                     and getattr(var, "initial", None) in {"exact", "approx"}
                 )
@@ -3246,15 +3321,17 @@ class FmuSession:
             self._me_integrator = None
         slave = getattr(self, "_slave", None)
         if slave is not None:
-            try:
-                slave.terminate()
-            except Exception:
-                logger.debug("FMU terminate failed for session %s", getattr(self, "session_id", "unknown"), exc_info=True)
+            if not getattr(self, "_source_fmu_terminated", False):
+                try:
+                    slave.terminate()
+                except Exception:
+                    logger.debug("FMU terminate failed for session %s", getattr(self, "session_id", "unknown"), exc_info=True)
             try:
                 slave.freeInstance()
             except Exception:
                 logger.debug("FMU freeInstance failed for session %s", getattr(self, "session_id", "unknown"), exc_info=True)
         self._slave = None
+        self._source_fmu_terminated = False
         self._fmi3_input_clock_references = []
         self._fmi3_clock_schedules = []
         self._fmi3_clock_runtime = None

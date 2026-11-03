@@ -63,6 +63,8 @@ class OutputReadRateLimitError(Exception):
 _REALTIME_METHODS = {
     "load",
     "initialize",
+    "exit_initialization_mode",
+    "terminate_fmu",
     "model_exchange_call",
     "validate_initial_values",
     "step",
@@ -262,6 +264,11 @@ def _realtime_snapshot(session: Any, *, include_model: bool = True) -> dict[str,
         "finishedReason": getattr(session, "_finished_reason", None),
         "initialised": bool(session._initialised),
         "terminated": bool(session._terminated),
+        "sourceFmuTerminated": bool(getattr(session, "_source_fmu_terminated", False)),
+        "executionInterface": getattr(session, "_execution_interface", None),
+        "externalSolver": bool(getattr(session, "_external_solver", False)),
+        "externalSolverMode": str(getattr(session, "_external_solver_mode", "instantiated")),
+        "deferInitializationExit": bool(getattr(session, "_defer_initialization_exit", False)),
     }
     if include_model:
         snapshot.update({
@@ -422,6 +429,11 @@ class RealtimeSession:
         self._finished_reason = None
         self._initialised = False
         self._terminated = False
+        self._source_fmu_terminated = False
+        self._execution_interface: str | None = None
+        self._external_solver = False
+        self._external_solver_mode = "instantiated"
+        self._defer_initialization_exit = False
         self._md = None
         self._attached = False
         self._attach_deadline: float | None = None
@@ -527,6 +539,22 @@ class RealtimeSession:
         self._finished_reason = snapshot.get("finishedReason", self._finished_reason)
         self._initialised = bool(snapshot.get("initialised", self._initialised))
         self._terminated = bool(snapshot.get("terminated", self._terminated))
+        self._source_fmu_terminated = bool(
+            snapshot.get("sourceFmuTerminated", getattr(self, "_source_fmu_terminated", False))
+        )
+        execution_interface = snapshot.get("executionInterface", getattr(self, "_execution_interface", None))
+        self._execution_interface = execution_interface if isinstance(execution_interface, str) else None
+        self._external_solver = bool(snapshot.get("externalSolver", getattr(self, "_external_solver", False)))
+        external_solver_mode = snapshot.get(
+            "externalSolverMode", getattr(self, "_external_solver_mode", "instantiated")
+        )
+        self._external_solver_mode = (
+            external_solver_mode if isinstance(external_solver_mode, str)
+            else getattr(self, "_external_solver_mode", "instantiated")
+        )
+        self._defer_initialization_exit = bool(
+            snapshot.get("deferInitializationExit", getattr(self, "_defer_initialization_exit", False))
+        )
         variables = snapshot.get("modelVariables")
         default_experiment = snapshot.get("defaultExperiment")
         if isinstance(variables, list):
@@ -667,8 +695,27 @@ class RealtimeSession:
             raise ProcessExecutionError("FMU worker returned an invalid Model Exchange result")
         return result
 
-    def validate_initial_values(self, values: dict[str, Any]) -> dict[str, Any]:
-        result = self._rpc("validate_initial_values", values)
+    def validate_initial_values(
+        self,
+        values: dict[str, Any],
+        *,
+        execution_interface: str | None = None,
+        external_solver: bool | None = None,
+    ) -> dict[str, Any]:
+        result = self._rpc(
+            "validate_initial_values",
+            values,
+            execution_interface=execution_interface,
+            external_solver=external_solver,
+        )
+        return result if isinstance(result, dict) else {}
+
+    def exit_initialization_mode(self) -> dict[str, Any]:
+        result = self._rpc("exit_initialization_mode")
+        return result if isinstance(result, dict) else {}
+
+    def terminate_fmu(self) -> dict[str, Any]:
+        result = self._rpc("terminate_fmu")
         return result if isinstance(result, dict) else {}
 
     def step(self, step_size: float | None = None) -> dict[str, Any]:

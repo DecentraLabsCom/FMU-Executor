@@ -22,6 +22,62 @@ def test_realtime_model_description_is_cached_for_the_immutable_session():
     session._rpc.assert_called_once_with("load")
 
 
+def test_realtime_snapshot_preserves_fmi_execution_context():
+    worker_session = SimpleNamespace(
+        state="initialized",
+        _time=0.0,
+        _start_time=0.0,
+        _stop_time=1.0,
+        _step_size=0.1,
+        _initialised=True,
+        _terminated=False,
+        _execution_interface="ModelExchange",
+        _external_solver=True,
+        _external_solver_mode="initialization",
+        _defer_initialization_exit=True,
+        _source_fmu_terminated=False,
+        _md=None,
+    )
+    snapshot = process_runner._realtime_snapshot(worker_session)
+    session = process_runner.RealtimeSession.__new__(process_runner.RealtimeSession)
+    session._state = "new"
+    session._time = 0.0
+    session._start_time = 0.0
+    session._stop_time = None
+    session._step_size = 0.1
+    session._time_mode = "simtime"
+    session._playback_speed = 1.0
+    session._finished_reason = None
+    session._initialised = False
+    session._terminated = False
+    session._execution_interface = None
+    session._external_solver = False
+    session._external_solver_mode = "instantiated"
+    session._defer_initialization_exit = False
+    session._source_fmu_terminated = False
+    session._md = None
+
+    session._apply_snapshot(snapshot)
+
+    assert session._execution_interface == "ModelExchange"
+    assert session._external_solver is True
+    assert session._external_solver_mode == "initialization"
+    assert session._defer_initialization_exit is True
+
+
+def test_realtime_session_exposes_proxy_lifecycle_methods():
+    session = process_runner.RealtimeSession.__new__(process_runner.RealtimeSession)
+    session._rpc = Mock(return_value={"state": "initialized"})
+
+    assert session.exit_initialization_mode() == {"state": "initialized"}
+    session._rpc.assert_called_once_with("exit_initialization_mode")
+    session._rpc.reset_mock()
+    assert session.terminate_fmu() == {"state": "initialized"}
+    session._rpc.assert_called_once_with("terminate_fmu")
+    assert "exit_initialization_mode" in process_runner._REALTIME_METHODS
+    assert "terminate_fmu" in process_runner._REALTIME_METHODS
+
+
 class FakeQueue:
     def __init__(self, *items):
         self.items = list(items)

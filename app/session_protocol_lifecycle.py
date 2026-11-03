@@ -22,6 +22,7 @@ LIFECYCLE_COMMAND_TYPES = frozenset({
     "model.describe",
     "sim.initialize",
     "sim.exitInitializationMode",
+    "sim.terminateFMU",
     "sim.modelExchangeCall",
     "sim.captureFMUState",
     "sim.restoreFMUState",
@@ -177,7 +178,12 @@ async def _handle_sim_initialize(
     if defer_initialization_exit and execution_interface == "ModelExchange" and not external_solver:
         raise HTTPException(status_code=400, detail="DEFERRED_MODEL_EXCHANGE_INITIALIZATION_REQUIRES_EXTERNAL_SOLVER")
     try:
-        await asyncio.to_thread(session.validate_initial_values, params)
+        await asyncio.to_thread(
+            session.validate_initial_values,
+            params,
+            execution_interface=execution_interface,
+            external_solver=external_solver,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=f"INVALID_INPUT - {exc}") from exc
     except RuntimeError as exc:
@@ -222,6 +228,7 @@ async def _handle_sim_initialize(
         "executionInterface": getattr(session, "_execution_interface", None),
         "externalSolver": getattr(session, "_external_solver", False),
         "_deferredInitializationExit": getattr(session, "_defer_initialization_exit", False),
+        "_sourceFmuTerminated": bool(getattr(session, "_source_fmu_terminated", False)),
     }
     if getattr(session, "_external_solver", False):
         response["_restoredModelExchangeMode"] = getattr(session, "_external_solver_mode", "instantiated")
@@ -282,7 +289,7 @@ async def _handle_fmu_state_message(
         restored = await asyncio.to_thread(session.restore_fmu_state, snapshot)
         outputs: dict[str, Any] = {}
         output_event_metadata: dict[str, Any] = {}
-        if variables:
+        if variables and not getattr(session, "_source_fmu_terminated", False):
             model_description = session._md
             if model_description is None:
                 raise HTTPException(409, "MODEL_DESCRIPTION_NOT_LOADED")
@@ -313,9 +320,14 @@ async def _handle_fmu_state_message(
         "outputs": outputs,
         "_restoredInitializationMode": restored.get("initializationMode", False),
         "_deferredInitializationExit": getattr(session, "_defer_initialization_exit", False),
+        "_sourceFmuTerminated": bool(getattr(session, "_source_fmu_terminated", False)),
     }
     if isinstance(restored.get("externalSolverMode"), str):
         response["_restoredModelExchangeMode"] = restored["externalSolverMode"]
+        if "executionInterface" in restored:
+            response["executionInterface"] = restored["executionInterface"]
+        if "externalSolver" in restored:
+            response["externalSolver"] = restored["externalSolver"]
     for key in ("nextEventTimeDefined", "nextEventTime"):
         if key in output_event_metadata:
             response[key] = output_event_metadata[key]
@@ -491,6 +503,21 @@ async def handle_lifecycle_command(
             "executionInterface": "CoSimulation",
         }
 
+    if msg_type == "sim.terminateFMU":
+        if stop_runner is not None:
+            await stop_runner()
+        try:
+            result = await asyncio.to_thread(session.terminate_fmu)
+        except RuntimeError as exc:
+            raise HTTPException(409, detail=f"FMU_TERMINATION_FAILED - {exc}") from exc
+        return {
+            "type": "sim.state",
+            "sessionId": session.session_id,
+            "state": session.state,
+            "simTime": session._time,
+            "_sourceFmuTerminated": bool(result.get("fmuTerminated", False)),
+        }
+
     if msg_type in {"sim.captureFMUState", "sim.restoreFMUState"}:
         return await _handle_fmu_state_message(msg_type, msg, session, stop_runner)
 
@@ -557,6 +584,12 @@ async def handle_lifecycle_command(
             "sessionId": session.session_id,
             "state": session.state,
             "simTime": session._time,
+            "executionInterface": getattr(session, "_execution_interface", None),
+            "externalSolver": False,
+            "_deferredInitializationExit": False,
+            "_sourceFmuTerminated": False,
+            "_restoredInitializationMode": False,
+            "_restoredModelExchangeMode": "instantiated",
         }
 
     raise HTTPException(400, f"INVALID_COMMAND - unsupported lifecycle type {msg_type!r}")
