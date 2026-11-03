@@ -164,6 +164,31 @@ def _sanitize_worker_environment() -> None:
     thread_limit = str(config.NATIVE_THREAD_LIMIT)
     for name in _NATIVE_THREAD_ENVIRONMENT:
         os.environ[name] = thread_limit
+    _limit_worker_cpu_affinity()
+
+
+def _limit_worker_cpu_affinity() -> None:
+    """Keep native runtimes from sizing thread pools to the host CPU count."""
+    get_affinity = getattr(os, "sched_getaffinity", None)
+    set_affinity = getattr(os, "sched_setaffinity", None)
+    if get_affinity is None or set_affinity is None:
+        return
+
+    try:
+        allowed_cpus = sorted(get_affinity(0))
+        if not allowed_cpus:
+            return
+        worker_cpus = allowed_cpus[: min(config.NATIVE_THREAD_LIMIT, len(allowed_cpus))]
+        if len(worker_cpus) < len(allowed_cpus):
+            set_affinity(0, set(worker_cpus))
+            logger.debug(
+                "Limited FMU worker CPU affinity to %s CPUs for native thread pools",
+                len(worker_cpus),
+            )
+    except OSError:
+        # This is a performance bound, not a security boundary. Native thread
+        # environment limits remain in force if the platform denies affinity changes.
+        logger.warning("Unable to limit FMU worker CPU affinity", exc_info=True)
 
 
 def _start_worker_process(process: Any) -> None:

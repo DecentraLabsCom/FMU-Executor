@@ -107,6 +107,24 @@ def describe_model_description(
         }
         if var.type:
             entry["type"] = var.type
+        if var.type == "Clock":
+            interval_variability = getattr(var, "intervalVariability", None)
+            if interval_variability in {
+                "constant", "fixed", "tunable", "changing", "countdown", "triggered",
+            }:
+                entry["intervalVariability"] = interval_variability
+            for attribute in ("canBeDeactivated", "supportsFraction"):
+                value = getattr(var, attribute, None)
+                if isinstance(value, bool):
+                    entry[attribute] = value
+            for attribute in ("intervalDecimal", "shiftDecimal"):
+                value = finite_number(getattr(var, attribute, None))
+                if value is not None:
+                    entry[attribute] = value
+            for attribute in ("priority", "resolution", "intervalCounter", "shiftCounter"):
+                value = finite_number(getattr(var, attribute, None), integer=True)
+                if isinstance(value, int) and value >= 0:
+                    entry[attribute] = value
         clock_references = []
         for clock in getattr(var, "clocks", None) or []:
             reference = getattr(clock, "valueReference", clock)
@@ -270,6 +288,7 @@ def describe_model_description(
             "canSerializeFMUstate",
             "canSerializeFMUState",
             "canHandleVariableCommunicationStepSize",
+            "hasEventMode",
             "providesDirectionalDerivative",
             "providesAdjointDerivatives",
         ):

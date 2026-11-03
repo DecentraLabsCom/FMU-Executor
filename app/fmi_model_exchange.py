@@ -17,6 +17,16 @@ class _NoScheduledInput:
         return None
 
 
+def _coerce_relative_tolerance(value: float | str | None) -> float:
+    if isinstance(value, bool) or value is None:
+        return 1e-5
+    try:
+        tolerance = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return 1e-5
+    return tolerance if math.isfinite(tolerance) and tolerance > 0 else 1e-5
+
+
 class FmiModelExchangeIntegrator:
     """Integrate an FMI 2/3 Model Exchange FMU between session advances.
 
@@ -34,7 +44,7 @@ class FmiModelExchangeIntegrator:
         *,
         start_time: float,
         max_step: float,
-        relative_tolerance: float | None,
+        relative_tolerance: float | str | None,
         clock_runtime: Fmi3ClockRuntime | None = None,
         initial_input_clock_references: set[int] | None = None,
     ):
@@ -47,8 +57,7 @@ class FmiModelExchangeIntegrator:
             raise ValueError("Model Exchange execution requires FMI 2 or FMI 3")
         if not math.isfinite(max_step) or max_step <= 0:
             raise ValueError("Model Exchange maximum integration step must be positive")
-        if relative_tolerance is None or not math.isfinite(relative_tolerance) or relative_tolerance <= 0:
-            relative_tolerance = 1e-5
+        relative_tolerance = _coerce_relative_tolerance(relative_tolerance)
 
         self._event_states_changed = False
         self._event_nominals_changed = False

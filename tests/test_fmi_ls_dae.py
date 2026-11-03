@@ -119,14 +119,8 @@ def test_dae_manifest_requires_layered_standard_description():
         parse_fmi_ls_dae_manifest(xml, _model_description())
 
 
-def test_dae_integrator_rejects_event_indicators_it_cannot_integrate():
-    definition = parse_fmi_ls_dae_manifest(_manifest(), _model_description())
-    with pytest.raises(ValueError, match="event indicators is not supported"):
-        from app.fmi_ls_dae import Fmi3DaeIntegrator
-
-        Fmi3DaeIntegrator(
-            object(),
-            definition,
-            model_description=_model_description(),
-            start_time=0,
-        )
+def test_dae_manifest_event_indicator_count_must_match_model_description():
+    model_description = _model_description()
+    model_description.numberOfEventIndicators = 0
+    with pytest.raises(ValueError, match="EventIndicator declarations do not match"):
+        parse_fmi_ls_dae_manifest(_manifest(), model_description)

@@ -22,6 +22,8 @@ class Session:
         "claims": {},
     }
     state = "initialized"
+    _state = "initialized"
+    _finished_reason = None
     _time = 0.0
     _stop_time = 1.0
     _start_time = 0.0
@@ -45,6 +47,8 @@ class Session:
         return values
     def initialize(self, *, start_time, stop_time, step_size=None, parameters=None, time_mode="simtime", playback_speed=1.0, early_return_allowed=False, execution_interface=None):
         self.state = "initialized"
+        self._state = "initialized"
+        self._finished_reason = None
         self._time = start_time
         self._stop_time = stop_time
         self._step_size = step_size or 0.1
@@ -52,15 +56,15 @@ class Session:
         self._playback_speed = playback_speed
         self._execution_interface = execution_interface or "CoSimulation"
         self.initialized_with = (start_time, stop_time, step_size, parameters)
-    def resume(self): self.state = "running"
-    def pause(self): self.state = "paused"
-    def reset(self, defer_initialization=False): self.state = "initialized"; self._time = 0.0
+    def resume(self): self.state = "running"; self._state = "running"
+    def pause(self): self.state = "paused"; self._state = "paused"
+    def reset(self, defer_initialization=False): self.state = "initialized"; self._state = "initialized"; self._time = 0.0
     def step(self, delta=None): self._time += delta or self._step_size
     def run_until(self, target, step_size=None): self._time = target
     def set_inputs(self, values): self.inputs = values
     def reconfigure_structural_parameters(self, values): self.reconfigured = values
     def get_outputs(self, refs=None): self.output_refs = refs; return {"outputs": {"x": 9}}
-    def terminate(self): self._terminated = True; self.state = "terminated"
+    def terminate(self): self._terminated = True; self.state = "terminated"; self._state = "stopped"
 
 
 @pytest.fixture

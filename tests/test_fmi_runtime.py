@@ -20,6 +20,7 @@ def _variable(name: str, value_reference: int, variable_type: str, causality: st
     variable.declaredType = None
     variable.shape = shape
     variable.dimensions = []
+    variable.clocks = None
     return variable
 
 

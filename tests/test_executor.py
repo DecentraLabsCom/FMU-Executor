@@ -1042,6 +1042,9 @@ class TestSubscriptionBackpressure:
         session.fmu_path = Path("dummy.fmu")
         session._md = MagicMock()
         session._slave = MagicMock()
+        session._use_dae = False
+        session._dae_integrator = None
+        session._fmi3_clock_runtime = None
         session._time = 1.0
         session._initialised = True
         session._terminated = False
@@ -1100,6 +1103,9 @@ class TestSubscriptionBackpressure:
         session.fmu_path = Path("dummy.fmu")
         session._md = MagicMock()
         session._slave = MagicMock()
+        session._use_dae = False
+        session._dae_integrator = None
+        session._fmi3_clock_runtime = None
         session._time = 0.0
         session._initialised = True
         session._terminated = False
@@ -1148,6 +1154,9 @@ class TestSubscriptionBackpressure:
         session.fmu_path = Path("dummy.fmu")
         session._md = MagicMock()
         session._slave = MagicMock()
+        session._use_dae = False
+        session._dae_integrator = None
+        session._fmi3_clock_runtime = None
         session._time = 0.5
         session._initialised = True
         session._terminated = False
