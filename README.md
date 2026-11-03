@@ -37,6 +37,7 @@ connection.
 | [Configuration and installation](docs/configuration.md) | Runtime settings, storage, Windows service context, tokens and container releases |
 | [Private API](docs/api.md) | Internal HTTP and WebSocket contracts used by Lab Gateway |
 | [Runtime and FMI support](docs/runtime.md) | FMI behavior, variable metadata, execution lifecycle, isolation, limits and validation |
+| [Dependency audit](docs/dependency-audit.md) | Dependency audit policy and the narrowly scoped upstream advisory exception |
 | [Reference FMUs](examples/reference-fmus/README.md) | Included reference models, provenance, licenses and supported platforms |
 | [Smart Warehouse Cell](examples/smart-warehouse-cell/README.md) | Included visual FMI example, assets and build instructions |
 

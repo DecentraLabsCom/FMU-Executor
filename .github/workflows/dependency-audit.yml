@@ -44,4 +44,7 @@ jobs:
         uses: pypa/gh-action-pip-audit@v1.1.0
         with:
           virtual-environment: .venv-audit/
+          # Jaxonomy requires SimpleEval <1.0; its CLI-only evaluator is not
+          # used by the Executor. Track this upstream constraint explicitly.
+          ignore-vulns: PYSEC-2026-132
           internal-be-careful-extra-flags: --skip-editable
