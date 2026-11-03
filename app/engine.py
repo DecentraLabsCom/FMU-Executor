@@ -332,14 +332,14 @@ class FmuSession:
             and not isinstance(structural_parameters[variable.name], bool)
         }
         pre_initialization_values: dict[str, Any] = {}
-        if self._external_solver and self._use_me and self._fmi_major() == "2":
+        if self._external_solver and self._use_me:
             state_references = self._model_exchange_state_value_references()
             pre_initialization_values = {
                 name: value
                 for name, value in validated_parameters.items()
                 if (variable := next((item for item in self._md.modelVariables if item.name == name), None)) is not None
                 and int(variable.valueReference) in state_references
-                and getattr(variable, "initial", None) == "approx"
+                and getattr(variable, "initial", None) in {"exact", "approx"}
             }
         self._pending_event_outputs = None
         if self._fmi_major() == "3":
@@ -349,6 +349,8 @@ class FmuSession:
                     self._apply_validated_values(structural_parameters)
                 self._apply_structural_array_shapes(dimension_values)
                 slave.exitConfigurationMode()
+            if pre_initialization_values:
+                self._apply_validated_values(pre_initialization_values)
             slave.enterInitializationMode(
                 startTime=self._start_time,
                 stopTime=self._stop_time,
@@ -1843,7 +1845,7 @@ class FmuSession:
         if self._md is None:
             return 0
         unknowns = getattr(self._md, attribute, None)
-        if isinstance(unknowns, (list, tuple)):
+        if isinstance(unknowns, (list, tuple)) and unknowns:
             total = 0
             for unknown in unknowns:
                 variable = getattr(unknown, "variable", None)
@@ -1851,7 +1853,10 @@ class FmuSession:
                     continue
                 total += self._variable_size(variable)
             return total
-        return int(getattr(self._md, fallback_attribute, 0) or 0)
+        declared_count = getattr(self._md, fallback_attribute, 0)
+        if isinstance(declared_count, bool) or not isinstance(declared_count, int) or declared_count < 0:
+            return 0
+        return declared_count
 
     def _model_exchange_state_value_references(self) -> set[int]:
         """Return state variables paired with the ordered derivative unknowns."""
@@ -2754,14 +2759,7 @@ class FmuSession:
                     self._external_solver
                     and self._use_me
                     and int(getattr(var, "valueReference", -1)) in self._model_exchange_state_value_references()
-                    and getattr(var, "initial", None) == "exact"
-                )
-                or (
-                    self._external_solver
-                    and self._use_me
-                    and self._fmi_major() == "2"
-                    and int(getattr(var, "valueReference", -1)) in self._model_exchange_state_value_references()
-                    and getattr(var, "initial", None) == "approx"
+                    and getattr(var, "initial", None) in {"exact", "approx"}
                 )
             )
         elif phase == "runtime":
@@ -3029,21 +3027,25 @@ class FmuSession:
                     extent = int(getattr(referenced_variable, "start"))
                 resolved_shape.append(extent)
             variable.shape = tuple(resolved_shape)
-        for attribute, count_attribute in (
-            ("derivatives", "numberOfContinuousStates"),
-            ("eventIndicators", "numberOfEventIndicators"),
-        ):
-            variables = getattr(self._md, attribute, None)
-            if isinstance(variables, (list, tuple)):
-                setattr(
-                    self._md,
-                    count_attribute,
-                    sum(
-                        self._variable_size(getattr(unknown, "variable", None))
-                        for unknown in variables
-                        if getattr(unknown, "variable", None) is not None
-                    ),
-                )
+        # FMI 2 reports these counts as explicit root attributes. FMPy exposes
+        # empty ModelStructure lists for FMI 2, so deriving counts from those
+        # lists would silently erase a valid numberOfEventIndicators value.
+        if self._fmi_major() == "3":
+            for attribute, count_attribute in (
+                ("derivatives", "numberOfContinuousStates"),
+                ("eventIndicators", "numberOfEventIndicators"),
+            ):
+                variables = getattr(self._md, attribute, None)
+                if isinstance(variables, (list, tuple)) and variables:
+                    setattr(
+                        self._md,
+                        count_attribute,
+                        sum(
+                            self._variable_size(getattr(unknown, "variable", None))
+                            for unknown in variables
+                            if getattr(unknown, "variable", None) is not None
+                        ),
+                    )
 
     @staticmethod
     def _is_array(var: Any) -> bool:

@@ -708,3 +708,52 @@ def test_attach_and_lifecycle_guards_cover_expiry_reset_and_termination(tmp_path
     session.terminate()
     session.terminate()
     assert session.state == "terminated"
+
+
+def test_fmi2_event_indicator_count_uses_declared_count_when_model_structure_is_empty(tmp_path):
+    session = make_live_session(tmp_path, version="2.0")
+    model = _model_description(session)
+    model.numberOfContinuousStates = 1
+    model.numberOfEventIndicators = 1
+    model.derivatives = []
+    model.eventIndicators = []
+
+    session._apply_structural_array_shapes({})
+
+    assert session._model_exchange_structure_value_count(
+        "eventIndicators", "numberOfEventIndicators"
+    ) == 1
+
+
+@pytest.mark.parametrize("version", ["2.0", "3.0"])
+@pytest.mark.parametrize("initial", ["exact", "approx"])
+def test_external_model_exchange_accepts_declared_initial_state_values(tmp_path, version, initial):
+    session = make_live_session(tmp_path, version=version)
+    session._external_solver = True
+    session._use_me = True
+    state = SimpleNamespace(
+        name="x",
+        valueReference=1,
+        type="Real",
+        causality="local",
+        variability="continuous",
+        initial=initial,
+        start=0.25,
+        dimensions=[],
+    )
+    derivative = SimpleNamespace(
+        name="der_x",
+        valueReference=2,
+        type="Real",
+        causality="local",
+        variability="continuous",
+        derivative=state,
+        dimensions=[],
+    )
+    model = _model_description(session)
+    model.modelExchange = SimpleNamespace(modelIdentifier="Model")
+    model.coSimulation = None
+    model.modelVariables = [state, derivative]
+    model.derivatives = [SimpleNamespace(variable=derivative)]
+
+    assert session._validate_values({"x": 0.8}, phase="initialization") == {"x": 0.8}
