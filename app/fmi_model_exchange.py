@@ -47,6 +47,7 @@ class FmiModelExchangeIntegrator:
         relative_tolerance: float | str | None,
         clock_runtime: Fmi3ClockRuntime | None = None,
         initial_input_clock_references: set[int] | None = None,
+        restoring_state: bool = False,
     ):
         self._fmu = fmu
         self._model_description = model_description
@@ -63,9 +64,10 @@ class FmiModelExchangeIntegrator:
         self._event_nominals_changed = False
         self._next_event_time_defined = False
         self._next_event_time: float | None = None
-        next_event_time_defined, next_event_time = self._initialize_event_mode(start_time)
-        self._next_event_time_defined = next_event_time_defined
-        self._next_event_time = next_event_time
+        if not restoring_state:
+            next_event_time_defined, next_event_time = self._initialize_event_mode(start_time)
+            self._next_event_time_defined = next_event_time_defined
+            self._next_event_time = next_event_time
 
         self._solver: Any | None = CVodeSolver(
             nx=int(getattr(model_description, "numberOfContinuousStates", 0) or 0),

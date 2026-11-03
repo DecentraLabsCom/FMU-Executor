@@ -1097,47 +1097,42 @@ class FmuSession:
         from .fmu_state import MAX_FMU_STATE_BYTES
         if len(serialized) > MAX_FMU_STATE_BYTES:
             raise ValueError("FMU state checkpoint exceeds the size limit")
+        execution_mode = (
+            "fmiLsDae" if self._use_me and self._use_dae
+            else "modelExchange" if self._use_me
+            else "coSimulation"
+        )
+        simulation: dict[str, Any] = {
+            "executionMode": execution_mode,
+            "time": self._time,
+            "startTime": self._start_time,
+            "stopTime": self._stop_time,
+            "stepSize": self._step_size,
+            "stepCount": self._step_count,
+            "timeMode": self._time_mode,
+            "playbackSpeed": self._playback_speed,
+            "earlyReturnAllowed": self._early_return_allowed,
+            "initialParameters": copy.deepcopy(self._initial_parameters),
+        }
+        if self._dae_integrator is not None:
+            simulation["fmiLsDae"] = self._dae_integrator.snapshot_event_schedule()
+        if self._me_integrator is not None:
+            simulation["modelExchange"] = self._me_integrator.snapshot_event_schedule()
+        if self._fmi_major() == "3" and not self._use_me:
+            fmi3_cosimulation: dict[str, Any] = {
+                "nextEventTimeDefined": self._fmi3_cs_next_event_time_defined,
+            }
+            if self._fmi3_clock_runtime is not None:
+                fmi3_cosimulation.update(self._fmi3_clock_runtime.snapshot())
+            if self._fmi3_cs_next_event_time_defined and self._fmi3_cs_next_event_time is not None:
+                fmi3_cosimulation["nextEventTime"] = self._fmi3_cs_next_event_time
+            simulation["fmi3CoSimulation"] = fmi3_cosimulation
         return {
             "fmuSha256": self.fmu_sha256,
             "fmiVersion": str(getattr(self._md, "fmiVersion", "")),
             "platform": f"{platform.system().lower()}/{platform.machine().lower()}",
             "serializedState": base64.b64encode(bytes(serialized)).decode("ascii"),
-            "simulation": {
-                "time": self._time,
-                "startTime": self._start_time,
-                "stopTime": self._stop_time,
-                "stepSize": self._step_size,
-                "stepCount": self._step_count,
-                "timeMode": self._time_mode,
-                "playbackSpeed": self._playback_speed,
-                "earlyReturnAllowed": self._early_return_allowed,
-                "initialParameters": copy.deepcopy(self._initial_parameters),
-                **(
-                    {"fmiLsDae": self._dae_integrator.snapshot_event_schedule()}
-                    if self._dae_integrator is not None
-                    else {}
-                ),
-                **(
-                    {"modelExchange": self._me_integrator.snapshot_event_schedule()}
-                    if self._me_integrator is not None
-                    else {}
-                ),
-                **(
-                    {
-                        "fmi3CoSimulation": {
-                            **self._fmi3_clock_runtime.snapshot(),
-                            "nextEventTimeDefined": self._fmi3_cs_next_event_time_defined,
-                            **(
-                                {"nextEventTime": self._fmi3_cs_next_event_time}
-                                if self._fmi3_cs_next_event_time_defined
-                                else {}
-                            ),
-                        }
-                    }
-                    if self._fmi3_clock_runtime is not None and not self._use_me
-                    else {}
-                ),
-            },
+            "simulation": simulation,
         }
 
     def restore_fmu_state(self, snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -1166,6 +1161,7 @@ class FmuSession:
         model_exchange_event_state: dict[str, Any] = {}
         raw_dae_event_state: Any = None
         raw_fmi3_cosimulation_clock_state: Any = None
+        execution_mode: str | None = None
         fmi3_cs_next_event_time_defined = False
         fmi3_cs_next_event_time: float | None = None
         try:
@@ -1179,6 +1175,7 @@ class FmuSession:
             time_value = float(raw_time)
             step_count = raw_step_count
             initial_parameters = simulation["initialParameters"]
+            execution_mode = simulation["executionMode"]
             raw_model_exchange_event_state = simulation.get("modelExchange")
             raw_dae_event_state = simulation.get("fmiLsDae")
             raw_fmi3_cosimulation_clock_state = simulation.get("fmi3CoSimulation")
@@ -1192,20 +1189,28 @@ class FmuSession:
             raise ValueError("FMU state checkpoint exceeds the simulation step budget")
         if not isinstance(initial_parameters, dict):
             raise ValueError("FMU state checkpoint is invalid or incompatible")
-        if self._me_integrator is not None:
+        if execution_mode not in {"coSimulation", "modelExchange", "fmiLsDae"}:
+            raise ValueError("FMU state checkpoint has an invalid execution mode")
+        checkpoint_uses_me = execution_mode in {"modelExchange", "fmiLsDae"}
+        if checkpoint_uses_me != self._use_me:
+            raise ValueError("FMU state checkpoint uses a different FMI execution interface")
+        checkpoint_uses_dae = execution_mode == "fmiLsDae"
+        if checkpoint_uses_dae and (self._fmi_major() != "3" or self._fmi_ls_dae is None):
+            raise ValueError("FMU state checkpoint requires unavailable FMI-LS-DAE support")
+        if execution_mode == "modelExchange":
             if not isinstance(raw_model_exchange_event_state, dict):
                 raise ValueError("FMU state checkpoint is missing Model Exchange event metadata")
             for key, value in raw_model_exchange_event_state.items():
                 if not isinstance(key, str):
                     raise ValueError("FMU state checkpoint has invalid Model Exchange event metadata")
                 model_exchange_event_state[key] = value
-            self._me_integrator.validate_event_schedule(model_exchange_event_state, time_value)
-        if self._dae_integrator is not None and not isinstance(raw_dae_event_state, dict):
+            if self._me_integrator is not None and not self._use_dae:
+                self._me_integrator.validate_event_schedule(model_exchange_event_state, time_value)
+        if checkpoint_uses_dae and not isinstance(raw_dae_event_state, dict):
             raise ValueError("FMU state checkpoint is missing FMI-LS-DAE event metadata")
-        if self._fmi3_clock_runtime is not None and not self._use_me:
+        if self._fmi_major() == "3" and not checkpoint_uses_me:
             if not isinstance(raw_fmi3_cosimulation_clock_state, dict):
-                raise ValueError("FMU state checkpoint is missing FMI 3 Co-Simulation Clock metadata")
-            self._fmi3_clock_runtime.validate_snapshot(raw_fmi3_cosimulation_clock_state, time_value)
+                raise ValueError("FMU state checkpoint is missing FMI 3 Co-Simulation event metadata")
             raw_next_event_defined = raw_fmi3_cosimulation_clock_state.get("nextEventTimeDefined")
             raw_next_event_time = raw_fmi3_cosimulation_clock_state.get("nextEventTime")
             if type(raw_next_event_defined) is not bool:
@@ -1220,6 +1225,8 @@ class FmuSession:
                 ):
                     raise ValueError("FMU state checkpoint has an FMI 3 Co-Simulation event before its time")
                 fmi3_cs_next_event_time_defined = True
+            if self._fmi3_clock_runtime is not None:
+                self._fmi3_clock_runtime.validate_snapshot(raw_fmi3_cosimulation_clock_state, time_value)
         state = None
         try:
             state = slave.deserializeFMUState(serialized)
@@ -1234,17 +1241,62 @@ class FmuSession:
                     logger.debug("Could not free restored FMU state for session %s", self.session_id, exc_info=True)
         self._time = time_value
         self._step_count = step_count
-        if self._dae_integrator is not None:
+        if checkpoint_uses_me:
+            if self._dae_integrator is not None:
+                self._dae_integrator.close()
+                self._dae_integrator = None
+            if self._me_integrator is not None:
+                self._me_integrator.close()
+                self._me_integrator = None
             slave.setTime(self._time)
-            self._dae_integrator.restore_event_schedule(raw_dae_event_state, self._time)
-            self._dae_integrator.restart_after_input_change(self._time, step_size=self._step_size)
-        if self._me_integrator is not None:
-            self._me_integrator.restore_event_schedule(model_exchange_event_state, self._time)
-            self._me_integrator.reset_after_restore(self._time)
-        if self._fmi3_clock_runtime is not None and not self._use_me:
-            self._fmi3_clock_runtime.restore_snapshot(raw_fmi3_cosimulation_clock_state, self._time)
+            if checkpoint_uses_dae:
+                dae_definition = self._fmi_ls_dae
+                model_description = self._md
+                if dae_definition is None or model_description is None:
+                    raise ValueError("FMU state checkpoint requires unavailable FMI-LS-DAE metadata")
+                clocked_outputs = raw_dae_event_state.get("clockedOutputCache", {})
+                if not isinstance(clocked_outputs, dict):
+                    raise ValueError("FMU state checkpoint has invalid DAE clocked output metadata")
+                self._fmi3_clock_runtime = None
+                self._dae_integrator = Fmi3DaeIntegrator(
+                    slave,
+                    dae_definition,
+                    model_description=model_description,
+                    start_time=self._time,
+                    relative_tolerance=getattr(getattr(self._md, "defaultExperiment", None), "tolerance", None),
+                    input_clock_references=self._fmi3_input_clock_references,
+                    clock_schedules=self._fmi3_clock_schedules,
+                    initial_clocked_outputs=clocked_outputs,
+                    restoring_state=True,
+                )
+                self._dae_integrator.restore_event_schedule(raw_dae_event_state, self._time)
+                self._use_dae = True
+            else:
+                self._fmi3_clock_runtime = (
+                    self._create_fmi3_clock_runtime()
+                    if self._fmi_major() == "3" and self._fmi3_model_has_clocks()
+                    else None
+                )
+                self._me_integrator = FmiModelExchangeIntegrator(
+                    slave,
+                    self._md,
+                    start_time=self._time,
+                    max_step=self._step_size,
+                    relative_tolerance=getattr(getattr(self._md, "defaultExperiment", None), "tolerance", None),
+                    clock_runtime=self._fmi3_clock_runtime,
+                    restoring_state=True,
+                )
+                self._me_integrator.restore_event_schedule(model_exchange_event_state, self._time)
+                self._use_dae = False
+            self._pending_event_outputs = None
+        if self._fmi_major() == "3" and not checkpoint_uses_me:
+            if self._fmi3_clock_runtime is not None:
+                self._fmi3_clock_runtime.restore_snapshot(raw_fmi3_cosimulation_clock_state, self._time)
             self._fmi3_cs_next_event_time_defined = fmi3_cs_next_event_time_defined
             self._fmi3_cs_next_event_time = fmi3_cs_next_event_time
+        elif not checkpoint_uses_me:
+            self._fmi3_cs_next_event_time_defined = False
+            self._fmi3_cs_next_event_time = None
         self._initial_parameters = copy.deepcopy(initial_parameters)
         self._finished_reason = None
         self._terminated = False

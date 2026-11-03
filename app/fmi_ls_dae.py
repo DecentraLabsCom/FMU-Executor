@@ -759,6 +759,7 @@ class Fmi3DaeIntegrator:
         initial_input_clock_references: set[int] | None = None,
         initial_clocked_outputs: dict[str, Any] | None = None,
         initial_unknown_values: dict[int, Any] | None = None,
+        restoring_state: bool = False,
     ):
         try:
             from sundials4py import core, idas
@@ -922,13 +923,19 @@ class Fmi3DaeIntegrator:
         self._linear_solver = None
         self._matrix = None
         try:
-            self._initialize_event_mode(float(start_time))
-            self._initialize_solver(float(start_time))
+            if not restoring_state:
+                self._initialize_event_mode(float(start_time))
+            self._initialize_solver(float(start_time), calculate_consistent_initial_conditions=not restoring_state)
         except Exception:
             self.close()
             raise
 
-    def _initialize_solver(self, start_time: float) -> None:
+    def _initialize_solver(
+        self,
+        start_time: float,
+        *,
+        calculate_consistent_initial_conditions: bool = True,
+    ) -> None:
         context_status, self._context = self._core.SUNContext_Create(0)
         self._check_sundials(context_status, "create SUNDIALS context")
         self._ida_view = self._idas.IDACreate(self._context)
@@ -999,7 +1006,8 @@ class Fmi3DaeIntegrator:
                     no_inactive_warning(self._ida_memory),
                     "configure inactive event indicator handling",
                 )
-        self._calculate_consistent_initial_conditions(start_time, 1e-6)
+        if calculate_consistent_initial_conditions:
+            self._calculate_consistent_initial_conditions(start_time, 1e-6)
 
     def _initialize_event_mode(self, start_time: float) -> None:
         """Resolve FMI 3 initialization events and clocks due at simulation start."""
