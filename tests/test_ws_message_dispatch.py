@@ -31,6 +31,8 @@ class Session:
     _time_mode = "simtime"
     _playback_speed = 1.0
     _execution_interface = None
+    _external_solver = False
+    _defer_initialization_exit = False
     _terminated = False
     _initialised = True
     _md = SimpleNamespace(modelVariables=[SimpleNamespace(name="x", valueReference=4, causality="output", type="Real")])
@@ -68,7 +70,13 @@ class Session:
         self._time_mode = time_mode
         self._playback_speed = playback_speed
         self._execution_interface = execution_interface or "CoSimulation"
+        self._external_solver = external_solver
+        self._defer_initialization_exit = defer_initialization_exit
         self.initialized_with = (start_time, stop_time, step_size, parameters)
+    def exit_initialization_mode(self):
+        self._defer_initialization_exit = False
+        self.exited_initialization_mode = True
+        return {"state": "initialized", "simTime": self._time}
     def resume(self): self.state = "running"; self._state = "running"
     def pause(self): self.state = "paused"; self._state = "paused"
     def reset(self, defer_initialization=False): self.state = "initialized"; self._state = "initialized"; self._time = 0.0
@@ -167,6 +175,24 @@ def test_advance_batches_use_the_same_authorized_session_and_validate_before_exe
     assert call({"type": "ping"})["type"] == "session.pong"
     assert call({"type": "session.terminate"})["reason"] == "client_terminated"
     assert session._terminated
+
+
+def test_deferred_cosimulation_initialization_exits_through_lifecycle_command(dispatch):
+    session, call = dispatch
+    initialized = call({
+        "type": "sim.initialize",
+        "options": {
+            "executionInterface": "CoSimulation",
+            "deferInitializationExit": True,
+        },
+    }, stop_runner=lambda: asyncio.sleep(0))
+
+    assert initialized["_deferredInitializationExit"] is True
+    assert session._defer_initialization_exit is True
+
+    exited = call({"type": "sim.exitInitializationMode"}, stop_runner=lambda: asyncio.sleep(0))
+    assert exited["state"] == "initialized"
+    assert session.exited_initialization_mode is True
 
 
 def test_advance_reserves_scheduled_input_quota_and_settles_only_applied_events(dispatch, monkeypatch):

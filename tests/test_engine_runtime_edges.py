@@ -344,6 +344,43 @@ def test_initialization_validates_model_and_finite_time_contract(tmp_path, monke
     assert slave.exitInitializationMode.call_count == 1
 
 
+def test_deferred_cosimulation_initialization_can_be_captured_and_exited(monkeypatch, tmp_path):
+    session = make_live_session(tmp_path)
+    session._initialised = False
+    session._state = "loaded"
+    session._execution_interface = "CoSimulation"
+    session._use_me = False
+    session.fmu_sha256 = "checkpoint-model-hash"
+    model = _model_description(session)
+    model.coSimulation.canGetAndSetFMUstate = True
+    model.coSimulation.canSerializeFMUstate = True
+    monkeypatch.setattr(session, "_available_execution_interfaces", lambda: ["CoSimulation"])
+    slave = _fmu_slave(session)
+    slave.getFMUState.return_value = object()
+    slave.serializeFMUState.return_value = b"serialized-fmu-state"
+    slave.deserializeFMUState.return_value = object()
+    monkeypatch.setattr(session, "_instantiate", lambda: slave)
+
+    initialized = session.initialize(defer_initialization_exit=True)
+    assert initialized["_deferredInitializationExit"] is True
+    slave.exitInitializationMode.assert_not_called()
+
+    with pytest.raises(RuntimeError, match="still in Initialization Mode"):
+        session.step()
+
+    checkpoint = session.capture_fmu_state()
+    assert checkpoint["simulation"]["initializationMode"] is True
+    restored = session.restore_fmu_state(checkpoint)
+    assert restored["initializationMode"] is True
+    assert session._defer_initialization_exit is True
+
+    response = session.exit_initialization_mode()
+
+    assert response["state"] == "initialized"
+    assert session._defer_initialization_exit is False
+    slave.exitInitializationMode.assert_called_once_with()
+
+
 def test_step_clamps_to_stop_and_enforces_state_and_external_time(tmp_path, monkeypatch):
     session = make_live_session(tmp_path)
     session._time = 0.9

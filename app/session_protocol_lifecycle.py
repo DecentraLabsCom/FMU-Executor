@@ -21,6 +21,7 @@ SESSION_BOOTSTRAP_COMMAND_TYPES = frozenset({"session.create", "session.attach"}
 LIFECYCLE_COMMAND_TYPES = frozenset({
     "model.describe",
     "sim.initialize",
+    "sim.exitInitializationMode",
     "sim.modelExchangeCall",
     "sim.captureFMUState",
     "sim.restoreFMUState",
@@ -171,8 +172,10 @@ async def _handle_sim_initialize(
     defer_initialization_exit = options.get("deferInitializationExit", False)
     if type(defer_initialization_exit) is not bool:
         raise HTTPException(status_code=400, detail="INVALID_DEFER_INITIALIZATION_EXIT_OPTION")
-    if defer_initialization_exit and not external_solver:
-        raise HTTPException(status_code=400, detail="DEFERRED_INITIALIZATION_EXIT_REQUIRES_EXTERNAL_MODEL_EXCHANGE")
+    if defer_initialization_exit and execution_interface not in {"CoSimulation", "ModelExchange"}:
+        raise HTTPException(status_code=400, detail="DEFERRED_INITIALIZATION_EXIT_REQUIRES_EXPLICIT_INTERFACE")
+    if defer_initialization_exit and execution_interface == "ModelExchange" and not external_solver:
+        raise HTTPException(status_code=400, detail="DEFERRED_MODEL_EXCHANGE_INITIALIZATION_REQUIRES_EXTERNAL_SOLVER")
     try:
         await asyncio.to_thread(session.validate_initial_values, params)
     except ValueError as exc:
@@ -209,7 +212,7 @@ async def _handle_sim_initialize(
             await asyncio.to_thread(session.restore_fmu_state, checkpoint_snapshot)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=f"INVALID_SIMULATION_OPTIONS - {exc}") from exc
-    return {
+    response = {
         "type": "sim.state",
         "sessionId": session.session_id,
         "state": session.state,
@@ -218,7 +221,12 @@ async def _handle_sim_initialize(
         "playbackSpeed": session._playback_speed,
         "executionInterface": getattr(session, "_execution_interface", None),
         "externalSolver": getattr(session, "_external_solver", False),
+        "_deferredInitializationExit": getattr(session, "_defer_initialization_exit", False),
     }
+    if getattr(session, "_external_solver", False):
+        response["_restoredModelExchangeMode"] = getattr(session, "_external_solver_mode", "instantiated")
+    response["_restoredInitializationMode"] = getattr(session, "_defer_initialization_exit", False)
+    return response
 
 
 async def _handle_fmu_state_message(
@@ -303,7 +311,11 @@ async def _handle_fmu_state_message(
         "state": restored.get("state", session.state),
         "simTime": restored.get("simTime", session._time),
         "outputs": outputs,
+        "_restoredInitializationMode": restored.get("initializationMode", False),
+        "_deferredInitializationExit": getattr(session, "_defer_initialization_exit", False),
     }
+    if isinstance(restored.get("externalSolverMode"), str):
+        response["_restoredModelExchangeMode"] = restored["externalSolverMode"]
     for key in ("nextEventTimeDefined", "nextEventTime"):
         if key in output_event_metadata:
             response[key] = output_event_metadata[key]
@@ -457,6 +469,26 @@ async def handle_lifecycle_command(
             "sessionId": session.session_id,
             "operation": operation,
             "result": result,
+        }
+
+    if msg_type == "sim.exitInitializationMode":
+        if not getattr(session, "_defer_initialization_exit", False):
+            raise HTTPException(409, detail="COSIMULATION_INITIALIZATION_EXIT_NOT_PENDING")
+        if getattr(session, "_execution_interface", None) != "CoSimulation" or getattr(session, "_external_solver", False):
+            raise HTTPException(409, detail="COSIMULATION_INITIALIZATION_EXIT_NOT_AVAILABLE")
+        if stop_runner is not None:
+            await stop_runner()
+        try:
+            result = await asyncio.to_thread(session.exit_initialization_mode)
+        except RuntimeError as exc:
+            raise HTTPException(409, detail=f"INITIALIZATION_MODE_EXIT_FAILED - {exc}") from exc
+        return {
+            "type": "sim.state",
+            "sessionId": session.session_id,
+            "state": result.get("state", session.state),
+            "simTime": result.get("simTime", session._time),
+            "_deferredInitializationExit": False,
+            "executionInterface": "CoSimulation",
         }
 
     if msg_type in {"sim.captureFMUState", "sim.restoreFMUState"}:

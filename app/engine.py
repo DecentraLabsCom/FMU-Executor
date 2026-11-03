@@ -244,8 +244,8 @@ class FmuSession:
             raise ValueError("External solver execution requires the ModelExchange interface")
         if type(defer_initialization_exit) is not bool:
             raise ValueError("deferInitializationExit must be Boolean")
-        if defer_initialization_exit and not external_solver:
-            raise ValueError("Deferred initialization exit requires an external Model Exchange solver")
+        if defer_initialization_exit and self._use_me and not external_solver:
+            raise ValueError("Deferred Model Exchange initialization requires an external solver")
         self._external_solver = external_solver
         self._defer_initialization_exit = defer_initialization_exit
         self._external_solver_mode = "instantiated"
@@ -448,9 +448,14 @@ class FmuSession:
                 initial_input_clock_references=initial_clock_references,
             )
             self._collect_me_event_outputs()
-        else:
+        elif not self._defer_initialization_exit:
             slave.exitInitializationMode()
-        if self._fmi_major() == "3" and self._fmi3_event_mode_used and not self._external_solver:
+        if (
+            self._fmi_major() == "3"
+            and self._fmi3_event_mode_used
+            and not self._external_solver
+            and not self._defer_initialization_exit
+        ):
             # FMI 3 Co-Simulation enters Event Mode when Event Mode is enabled.
             # Perform the initial discrete-state iteration before Step Mode.
             initial_clock_references = (
@@ -491,10 +496,13 @@ class FmuSession:
             "timeMode": self._time_mode,
             "playbackSpeed": self._playback_speed,
             "executionInterface": self._execution_interface,
+            "_deferredInitializationExit": self._defer_initialization_exit,
         }
 
     def step(self, step_size: float | None = None) -> dict[str, Any]:
         slave = self._require_slave()
+        if self._defer_initialization_exit:
+            raise RuntimeError("FMU is still in Initialization Mode")
         if self._state in {"paused", "stopped", "error"}:
             raise RuntimeError(f"Session cannot step from state {self._state}")
         h = self._step_size if step_size is None else step_size
@@ -535,6 +543,8 @@ class FmuSession:
 
     def run_until(self, target_time: float, step_size: float | None = None) -> dict[str, Any]:
         slave = self._require_slave()
+        if self._defer_initialization_exit:
+            raise RuntimeError("FMU is still in Initialization Mode")
         if not math.isfinite(target_time):
             raise ValueError("targetTime must be finite")
         if target_time < self._time:
@@ -619,6 +629,8 @@ class FmuSession:
         _execution_started: list[bool] | None = None,
     ) -> Generator[dict[str, Any], None, None]:
         """Step until *target_time*, yielding output snapshots at each step."""
+        if self._defer_initialization_exit:
+            raise RuntimeError("FMU is still in Initialization Mode")
         if type(_sample_every_steps) is not int or _sample_every_steps < 1:
             raise ValueError("sampleEverySteps must be a positive integer")
         if _sample_step_offset is None:
@@ -758,6 +770,8 @@ class FmuSession:
         max_compute_ms: float | None = None,
     ) -> dict[str, Any]:
         """Advance one bounded request, optionally applying timed inputs and sampling sparsely."""
+        if self._defer_initialization_exit:
+            raise AdvancePreExecutionError("FMU is still in Initialization Mode")
         started_at = _time.perf_counter()
         if type(max_samples) is not int or not 1 <= max_samples <= 256:
             raise AdvancePreExecutionError("maxSamples must be an integer between 1 and 256")
@@ -1177,6 +1191,7 @@ class FmuSession:
             "playbackSpeed": self._playback_speed,
             "earlyReturnAllowed": self._early_return_allowed,
             "initialParameters": copy.deepcopy(self._initial_parameters),
+            "initializationMode": self._defer_initialization_exit,
         }
         if self._dae_integrator is not None:
             simulation["fmiLsDae"] = self._dae_integrator.snapshot_event_schedule()
@@ -1237,6 +1252,7 @@ class FmuSession:
         execution_mode: str | None = None
         fmi3_cs_next_event_time_defined = False
         fmi3_cs_next_event_time: float | None = None
+        initialization_mode = False
         try:
             serialized = base64.b64decode(encoded_state, validate=True)
             raw_time = simulation["time"]
@@ -1253,6 +1269,10 @@ class FmuSession:
             raw_dae_event_state = simulation.get("fmiLsDae")
             raw_fmi3_cosimulation_clock_state = simulation.get("fmi3CoSimulation")
             raw_external_solver_state = simulation.get("externalSolver")
+            raw_initialization_mode = simulation.get("initializationMode", False)
+            if type(raw_initialization_mode) is not bool:
+                raise ValueError("invalid initialization mode")
+            initialization_mode = raw_initialization_mode
         except (KeyError, TypeError, ValueError, OverflowError) as exc:
             raise ValueError("FMU state checkpoint is invalid or incompatible") from exc
         if not math.isfinite(time_value) or time_value < self._start_time or (
@@ -1269,6 +1289,8 @@ class FmuSession:
         if checkpoint_uses_me != self._use_me:
             raise ValueError("FMU state checkpoint uses a different FMI execution interface")
         checkpoint_uses_dae = execution_mode == "fmiLsDae"
+        if initialization_mode and checkpoint_uses_me and not self._external_solver:
+            raise ValueError("FMU state checkpoint requires an external Model Exchange solver during initialization")
         if checkpoint_uses_dae and (self._fmi_major() != "3" or self._fmi_ls_dae is None):
             raise ValueError("FMU state checkpoint requires unavailable FMI-LS-DAE support")
         if checkpoint_uses_me and self._external_solver:
@@ -1364,6 +1386,7 @@ class FmuSession:
                     logger.debug("Could not free restored FMU state for session %s", self.session_id, exc_info=True)
         self._time = time_value
         self._step_count = step_count
+        self._defer_initialization_exit = initialization_mode
         if checkpoint_uses_me:
             if self._dae_integrator is not None:
                 self._dae_integrator.close()
@@ -1439,6 +1462,39 @@ class FmuSession:
         # explicit sim.advance. Keep that newly initialized session runnable;
         # restoring into an existing paused session should remain paused.
         self._state = "initialized" if initialized_for_run else "paused"
+        result = {"state": self._state, "simTime": self._time}
+        result["initializationMode"] = initialization_mode
+        if self._external_solver:
+            result["externalSolverMode"] = self._external_solver_mode
+        result.update(self._fmi3_event_time_metadata())
+        return result
+
+    def exit_initialization_mode(self) -> dict[str, Any]:
+        """Complete a deferred Co-Simulation initialization on the source FMU."""
+        slave = self._require_slave()
+        if not self._defer_initialization_exit or self._external_solver or self._use_me:
+            raise RuntimeError("Co-Simulation initialization is not awaiting exit")
+        if self._state != "initialized":
+            raise RuntimeError("Co-Simulation initialization can only exit from the initialized state")
+        slave.exitInitializationMode()
+        self._defer_initialization_exit = False
+        if self._fmi_major() == "3" and self._fmi3_event_mode_used:
+            active_input_clocks = set(
+                self._active_fmi3_input_clock_references(self._initial_parameters)
+            )
+            if self._fmi3_clock_runtime is not None:
+                active_input_clocks.update(
+                    self._fmi3_clock_runtime.due_input_clock_references(self._start_time)
+                )
+            if self._resolve_fmi3_event(
+                slave,
+                enter_event_mode=False,
+                current_time=self._start_time,
+                active_input_clocks=active_input_clocks,
+                defer_input_clock_activation=bool(active_input_clocks),
+            ):
+                self._finished_reason = "fmu_terminated"
+                self._state = "stopped"
         result = {"state": self._state, "simTime": self._time}
         result.update(self._fmi3_event_time_metadata())
         return result
@@ -1546,6 +1602,7 @@ class FmuSession:
             self._require_external_solver_mode("initialization")
             self._check_external_fmi_status(operation, self._slave.exitInitializationMode())
             self._external_solver_mode = "event"
+            self._defer_initialization_exit = False
             return {"mode": "event"}
 
         if operation in {
@@ -1925,6 +1982,8 @@ class FmuSession:
     def resume(self) -> dict[str, Any]:
         """Mark the session runnable; the websocket loop performs stepping."""
         self._ensure_live()
+        if self._defer_initialization_exit:
+            raise RuntimeError("FMU is still in Initialization Mode")
         if self._time_mode == "external":
             raise RuntimeError("EXTERNAL_STEP_MODE does not support automatic stepping")
         if self._state not in ("paused", "initialized"):
@@ -3205,6 +3264,7 @@ class FmuSession:
         self._pending_event_outputs = None
         if hasattr(self, "_initialised"):
             self._initialised = False
+        self._defer_initialization_exit = False
 
     def _cleanup_temp(self) -> None:
         extract_dir = getattr(self, "_extract_dir", None)
