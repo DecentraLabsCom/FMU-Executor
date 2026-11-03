@@ -239,6 +239,18 @@ def _select_native_execution_interface(
     fmi_ls_dae: Any | None,
 ) -> tuple[str | None, list[str], str | None]:
     """Select the first declared execution interface with a native host binary."""
+    interfaces = _available_native_execution_interface_details(path, model_description)
+    if not interfaces:
+        return None, [], None
+    interface_name, (binaries, model_identifier) = next(iter(interfaces.items()))
+    return interface_name, binaries, model_identifier
+
+
+def _available_native_execution_interface_details(
+    path: Path,
+    model_description: Any,
+) -> dict[str, tuple[list[str], str]]:
+    """Return each declared interface with a native binary for this host."""
     host_dirs = _host_binary_directories()
     extensions = {
         "windows": (".dll",),
@@ -258,6 +270,7 @@ def _select_native_execution_interface(
     if model_description.modelExchange is not None:
         interfaces.append(("ModelExchange", model_description.modelExchange))
 
+    available: dict[str, tuple[list[str], str]] = {}
     for interface_name, interface in interfaces:
         model_identifier = str(getattr(interface, "modelIdentifier", "") or "")
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", model_identifier):
@@ -275,8 +288,8 @@ def _select_native_execution_interface(
                 if name.lower() in lower_names
             }
         if matched:
-            return interface_name, sorted(matched), model_identifier
-    return None, [], None
+            available[interface_name] = (sorted(matched), model_identifier)
+    return available
 
 
 def _archive_report(path: Path) -> tuple[bool, list[str], str | None, int | None, int | None, int | None]:
@@ -569,6 +582,9 @@ def describe_path(
         fmi_ls_dae=fmi_ls_dae,
         fmi_ls_dae_issue=fmi_ls_dae_issue,
         execution_interface=execution_interface,
+    )
+    description["availableExecutionInterfaces"] = list(
+        _available_native_execution_interface_details(path, md)
     )
     fmi_ls_struct = read_fmi_ls_struct(
         path,

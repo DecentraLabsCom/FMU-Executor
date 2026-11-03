@@ -98,6 +98,28 @@ class FmiLsDaeDefinition:
             "manifestVersion": self.manifest_version,
             "enableDAEParameter": self.enable_dae_variable_name,
             "algebraicVariables": list(self.algebraic_names),
+            "algebraicValueReferences": list(self.algebraic_value_references),
+            "residualVariables": [
+                {"name": name, "valueReference": reference, "type": value_type}
+                for name, reference, value_type in zip(
+                    self.residual_names,
+                    self.residual_value_references,
+                    self.residual_types,
+                    strict=True,
+                )
+            ],
+            "modelStructure": [
+                {
+                    "kind": entry.kind,
+                    "valueReference": entry.value_reference,
+                    **({"dependencies": list(entry.dependencies)} if entry.dependencies is not None else {}),
+                    **(
+                        {"dependenciesKind": list(entry.dependencies_kind)}
+                        if entry.dependencies_kind is not None else {}
+                    ),
+                }
+                for entry in self.model_structure
+            ],
             "residualVariableCount": len(self.residual_value_references),
         }
 

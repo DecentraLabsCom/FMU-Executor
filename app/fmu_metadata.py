@@ -244,6 +244,73 @@ def describe_model_description(
     cs = md.coSimulation
     me = md.modelExchange
 
+    def describe_model_structure(unknowns: Any, *, include_state_reference: bool = False) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+        for unknown in unknowns or []:
+            variable = getattr(unknown, "variable", None)
+            value_reference = getattr(variable, "valueReference", None)
+            if isinstance(value_reference, bool) or not isinstance(value_reference, int) or value_reference < 0:
+                continue
+            entry: dict[str, Any] = {"valueReference": value_reference}
+            variable_name = getattr(variable, "name", None)
+            if isinstance(variable_name, str) and variable_name:
+                entry["name"] = variable_name
+            if include_state_reference:
+                state_variable = getattr(variable, "derivative", None)
+                state_reference = getattr(state_variable, "valueReference", None)
+                if isinstance(state_reference, int) and not isinstance(state_reference, bool) and state_reference >= 0:
+                    entry["stateValueReference"] = state_reference
+                    state_name = getattr(state_variable, "name", None)
+                    if isinstance(state_name, str) and state_name:
+                        entry["stateName"] = state_name
+            dependencies = []
+            dependency_names = []
+            for dependency in getattr(unknown, "dependencies", None) or []:
+                reference = getattr(dependency, "valueReference", None)
+                if isinstance(reference, int) and not isinstance(reference, bool) and reference >= 0:
+                    dependencies.append(reference)
+                    dependency_name = getattr(dependency, "name", None)
+                    if isinstance(dependency_name, str) and dependency_name:
+                        dependency_names.append(dependency_name)
+            if dependencies:
+                entry["dependencies"] = dependencies
+                if len(dependency_names) == len(dependencies):
+                    entry["dependencyNames"] = dependency_names
+                dependency_kinds = [
+                    str(kind)
+                    for kind in getattr(unknown, "dependenciesKind", None) or []
+                    if isinstance(kind, str)
+                ]
+                if dependency_kinds and len(dependency_kinds) == len(dependencies):
+                    entry["dependenciesKind"] = dependency_kinds
+            result.append(entry)
+        return result
+
+    model_structure = {
+        "outputs": describe_model_structure(getattr(md, "outputs", None)),
+        "derivatives": describe_model_structure(getattr(md, "derivatives", None), include_state_reference=True),
+        "clockedStates": describe_model_structure(getattr(md, "clockedStates", None)),
+        "initialUnknowns": describe_model_structure(getattr(md, "initialUnknowns", None)),
+        "eventIndicators": describe_model_structure(getattr(md, "eventIndicators", None)),
+    }
+    model_exchange_capabilities = None
+    if me is not None:
+        model_exchange_capabilities = {}
+        for attribute in (
+            "needsExecutionTool",
+            "canBeInstantiatedOnlyOncePerProcess",
+            "canNotUseMemoryManagementFunctions",
+            "canGetAndSetFMUstate",
+            "canSerializeFMUstate",
+            "providesDirectionalDerivative",
+            "providesAdjointDerivatives",
+            "completedIntegratorStepNotNeeded",
+            "needsCompletedIntegratorStep",
+        ):
+            value = getattr(me, attribute, None)
+            if value is not None:
+                model_exchange_capabilities[attribute] = bool(value)
+
     result: dict[str, Any] = {
         "modelName": md.modelName,
         "guid": md.guid,
@@ -254,6 +321,12 @@ def describe_model_description(
         "supportsExecution": execution_interface in {"CoSimulation", "ModelExchange"},
         "modelVariables": variables,
     }
+    if me is not None:
+        result["numberOfContinuousStates"] = int(getattr(md, "numberOfContinuousStates", 0) or 0)
+        result["numberOfEventIndicators"] = int(getattr(md, "numberOfEventIndicators", 0) or 0)
+        result["modelStructure"] = model_structure
+        if model_exchange_capabilities:
+            result["modelExchangeCapabilities"] = model_exchange_capabilities
     if execution_interface in {"CoSimulation", "ModelExchange"}:
         result["executionInterface"] = execution_interface
     if fmi_ls_dae is not None:

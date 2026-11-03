@@ -21,6 +21,7 @@ SESSION_BOOTSTRAP_COMMAND_TYPES = frozenset({"session.create", "session.attach"}
 LIFECYCLE_COMMAND_TYPES = frozenset({
     "model.describe",
     "sim.initialize",
+    "sim.modelExchangeCall",
     "sim.captureFMUState",
     "sim.restoreFMUState",
     "sim.start",
@@ -162,6 +163,16 @@ async def _handle_sim_initialize(
         or execution_interface not in {"CoSimulation", "ModelExchange"}
     ):
         raise HTTPException(status_code=400, detail="INVALID_EXECUTION_INTERFACE")
+    external_solver = options.get("externalSolver", False)
+    if type(external_solver) is not bool:
+        raise HTTPException(status_code=400, detail="INVALID_EXTERNAL_SOLVER_OPTION")
+    if external_solver and execution_interface != "ModelExchange":
+        raise HTTPException(status_code=400, detail="EXTERNAL_SOLVER_REQUIRES_MODEL_EXCHANGE")
+    defer_initialization_exit = options.get("deferInitializationExit", False)
+    if type(defer_initialization_exit) is not bool:
+        raise HTTPException(status_code=400, detail="INVALID_DEFER_INITIALIZATION_EXIT_OPTION")
+    if defer_initialization_exit and not external_solver:
+        raise HTTPException(status_code=400, detail="DEFERRED_INITIALIZATION_EXIT_REQUIRES_EXTERNAL_MODEL_EXCHANGE")
     try:
         await asyncio.to_thread(session.validate_initial_values, params)
     except ValueError as exc:
@@ -188,6 +199,8 @@ async def _handle_sim_initialize(
         }
         if execution_interface is not None:
             initialization_options["execution_interface"] = execution_interface
+        initialization_options["external_solver"] = external_solver
+        initialization_options["defer_initialization_exit"] = defer_initialization_exit
         await asyncio.to_thread(
             session.initialize,
             **initialization_options,
@@ -204,6 +217,7 @@ async def _handle_sim_initialize(
         "timeMode": session._time_mode,
         "playbackSpeed": session._playback_speed,
         "executionInterface": getattr(session, "_execution_interface", None),
+        "externalSolver": getattr(session, "_external_solver", False),
     }
 
 
@@ -380,6 +394,70 @@ async def handle_lifecycle_command(
 
     if msg_type == "sim.initialize":
         return await _handle_sim_initialize(msg, session, access_key, services, stop_runner)
+
+    if msg_type == "sim.modelExchangeCall":
+        operation = msg.get("operation")
+        arguments = msg.get("arguments", {})
+        if not isinstance(operation, str) or not isinstance(arguments, dict):
+            raise HTTPException(400, detail="INVALID_MODEL_EXCHANGE_CALL")
+        if getattr(session, "_execution_interface", None) != "ModelExchange" or not getattr(session, "_external_solver", False):
+            raise HTTPException(409, detail="MODEL_EXCHANGE_EXTERNAL_SOLVER_NOT_ACTIVE")
+        allowed_operations = {
+            "setTime",
+            "exitInitializationMode",
+            "getContinuousStates",
+            "setContinuousStates",
+            "getDerivatives",
+            "getContinuousStateDerivatives",
+            "getEventIndicators",
+            "getNominalsOfContinuousStates",
+            "completedIntegratorStep",
+            "enterEventMode",
+            "newDiscreteStates",
+            "updateDiscreteStates",
+            "enterContinuousTimeMode",
+            "getNumberOfContinuousStates",
+            "getNumberOfEventIndicators",
+            "getValues",
+            "setValues",
+        }
+        if operation not in allowed_operations:
+            raise HTTPException(400, detail="UNSUPPORTED_MODEL_EXCHANGE_OPERATION")
+        allowed_arguments = {
+            "setTime": {"time"},
+            "exitInitializationMode": set(),
+            "getContinuousStates": set(),
+            "setContinuousStates": {"values"},
+            "getDerivatives": set(),
+            "getContinuousStateDerivatives": set(),
+            "getEventIndicators": set(),
+            "getNominalsOfContinuousStates": set(),
+            "completedIntegratorStep": {"noSetFMUStatePriorToCurrentPoint"},
+            "enterEventMode": set(),
+            "newDiscreteStates": set(),
+            "updateDiscreteStates": set(),
+            "enterContinuousTimeMode": set(),
+            "getNumberOfContinuousStates": set(),
+            "getNumberOfEventIndicators": set(),
+            "getValues": {"valueType", "valueReferences"},
+            "setValues": {"valueType", "valueReferences", "values"},
+        }
+        if set(arguments) - allowed_arguments[operation]:
+            raise HTTPException(400, detail="INVALID_MODEL_EXCHANGE_ARGUMENTS")
+        if stop_runner is not None:
+            await stop_runner()
+        try:
+            result = await asyncio.to_thread(session.model_exchange_call, operation, arguments)
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(400, detail=f"INVALID_MODEL_EXCHANGE_CALL - {exc}") from exc
+        except RuntimeError as exc:
+            raise HTTPException(409, detail=f"MODEL_EXCHANGE_CALL_FAILED - {exc}") from exc
+        return {
+            "type": "sim.modelExchangeResult",
+            "sessionId": session.session_id,
+            "operation": operation,
+            "result": result,
+        }
 
     if msg_type in {"sim.captureFMUState", "sim.restoreFMUState"}:
         return await _handle_fmu_state_message(msg_type, msg, session, stop_runner)

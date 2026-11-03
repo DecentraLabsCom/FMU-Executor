@@ -63,6 +63,7 @@ class OutputReadRateLimitError(Exception):
 _REALTIME_METHODS = {
     "load",
     "initialize",
+    "model_exchange_call",
     "validate_initial_values",
     "step",
     "run_until",
@@ -659,6 +660,12 @@ class RealtimeSession:
 
     def initialize(self, **kwargs: Any) -> dict[str, Any]:
         return self._rpc("initialize", **kwargs)
+
+    def model_exchange_call(self, operation: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+        result = self._rpc("model_exchange_call", operation, arguments)
+        if not isinstance(result, dict):
+            raise ProcessExecutionError("FMU worker returned an invalid Model Exchange result")
+        return result
 
     def validate_initial_values(self, values: dict[str, Any]) -> dict[str, Any]:
         result = self._rpc("validate_initial_values", values)

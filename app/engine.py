@@ -5,11 +5,13 @@ from __future__ import annotations
 import base64
 import binascii
 import copy
+import ctypes
 import logging
 import math
 import json
 import re
 import platform
+from collections.abc import Iterable
 from functools import reduce
 from operator import mul
 import shutil
@@ -135,6 +137,12 @@ class FmuSession:
         self._fmi_ls_dae: FmiLsDaeDefinition | None = None
         self._fmi_ls_dae_issue: str | None = None
         self._execution_interface: str | None = None
+        self._external_solver = False
+        self._defer_initialization_exit = False
+        self._external_solver_mode = "instantiated"
+        self._external_solver_evaluations = 0
+        self._external_solver_completed_integrator_times: list[float] = []
+        self._external_solver_last_event_time: float | None = None
         self._dae_integrator: Fmi3DaeIntegrator | None = None
         self._me_integrator: FmiModelExchangeIntegrator | None = None
         self._fmi3_input_clock_references: list[int] = []
@@ -205,6 +213,8 @@ class FmuSession:
         playback_speed: float = 1.0,
         early_return_allowed: bool = False,
         execution_interface: str | None = None,
+        external_solver: bool = False,
+        defer_initialization_exit: bool = False,
     ) -> dict[str, Any]:
         if self._initialised:
             raise RuntimeError("Session already initialised")
@@ -228,6 +238,20 @@ class FmuSession:
             detail = self._fmi_ls_dae_issue or "FMU has no executable Co-Simulation or Model Exchange binary"
             raise RuntimeError(detail)
         self._use_me = self._execution_interface == "ModelExchange"
+        if type(external_solver) is not bool:
+            raise ValueError("externalSolver must be Boolean")
+        if external_solver and not self._use_me:
+            raise ValueError("External solver execution requires the ModelExchange interface")
+        if type(defer_initialization_exit) is not bool:
+            raise ValueError("deferInitializationExit must be Boolean")
+        if defer_initialization_exit and not external_solver:
+            raise ValueError("Deferred initialization exit requires an external Model Exchange solver")
+        self._external_solver = external_solver
+        self._defer_initialization_exit = defer_initialization_exit
+        self._external_solver_mode = "instantiated"
+        self._external_solver_evaluations = 0
+        self._external_solver_completed_integrator_times = []
+        self._external_solver_last_event_time = None
         self._use_dae = False
 
         default_experiment = self._md.defaultExperiment
@@ -257,6 +281,7 @@ class FmuSession:
         if type(early_return_allowed) is not bool:
             raise ValueError("earlyReturnAllowed must be Boolean")
         self._time = self._start_time
+        self._external_solver_last_event_time = self._start_time if external_solver else None
         if parameters is not None and not isinstance(parameters, dict):
             raise ValueError("Initialization values must be an object")
         original_parameters = parameters if parameters is not None else {}
@@ -306,6 +331,16 @@ class FmuSession:
             and str(getattr(variable, "type", "")) == "UInt64"
             and not isinstance(structural_parameters[variable.name], bool)
         }
+        pre_initialization_values: dict[str, Any] = {}
+        if self._external_solver and self._use_me and self._fmi_major() == "2":
+            state_references = self._model_exchange_state_value_references()
+            pre_initialization_values = {
+                name: value
+                for name, value in validated_parameters.items()
+                if (variable := next((item for item in self._md.modelVariables if item.name == name), None)) is not None
+                and int(variable.valueReference) in state_references
+                and getattr(variable, "initial", None) == "approx"
+            }
         self._pending_event_outputs = None
         if self._fmi_major() == "3":
             if structural_variables:
@@ -323,24 +358,27 @@ class FmuSession:
                 startTime=self._start_time,
                 stopTime=self._stop_time,
             )
+            if pre_initialization_values:
+                self._apply_validated_values(pre_initialization_values)
             slave.enterInitializationMode()
 
         remaining_parameters = {
             name: value for name, value in validated_parameters.items()
             if name not in structural_parameters
             and not self._is_fmi3_input_clock(name)
+            and name not in pre_initialization_values
         }
         if remaining_parameters:
             self._apply_validated_values(remaining_parameters)
 
         initial_clocked_outputs: dict[str, Any] = {}
         initial_unknown_values: dict[int, Any] = {}
-        if self._fmi_major() == "3":
+        if self._fmi_major() == "3" and not self._external_solver:
             (
                 self._fmi3_input_clock_references,
                 self._fmi3_clock_schedules,
             ) = read_fmi3_input_clock_schedules(slave, self._md, self._start_time)
-            if self._use_dae and self._use_me and self._fmi_ls_dae is not None:
+            if self._use_dae and self._use_me and self._fmi_ls_dae is not None and not self._external_solver:
                 clocked_output_names = {
                     str(variable.name)
                     for variable in self._effective_output_variables()
@@ -352,7 +390,7 @@ class FmuSession:
                     if name in clocked_output_names
                 }
                 initial_unknown_values = self._read_fmi_ls_dae_initial_unknowns()
-            elif self._fmi3_model_has_clocks():
+            elif self._fmi3_model_has_clocks() and not self._external_solver:
                 initial_outputs = self._read_outputs()
                 self._fmi3_clock_runtime = Fmi3ClockRuntime(
                     slave,
@@ -365,8 +403,21 @@ class FmuSession:
                     initial_outputs=initial_outputs,
                 )
 
-        slave.exitInitializationMode()
-        if self._use_dae:
+        if self._external_solver:
+            if self._defer_initialization_exit:
+                # Keep the source FMU in Initialization Mode until the native
+                # proxy receives FMI's ExitInitializationMode call. This lets
+                # the importing tool perform legal reads/writes in the same
+                # order as it would against a local FMU.
+                self._external_solver_mode = "initialization"
+            else:
+                slave.exitInitializationMode()
+                # FMI 2 and FMI 3 Model Exchange enter Event Mode on leaving
+                # Initialization Mode. The importing tool owns the integrator
+                # and performs the subsequent discrete-state iteration.
+                self._external_solver_mode = "event"
+        elif self._use_dae:
+            slave.exitInitializationMode()
             if self._fmi_ls_dae is None:
                 raise RuntimeError("FMI-LS-DAE declarations are unavailable")
             default_tolerance = getattr(default_experiment, "tolerance", None)
@@ -384,6 +435,7 @@ class FmuSession:
             )
             self._collect_dae_event_outputs()
         elif self._use_me:
+            slave.exitInitializationMode()
             self._me_integrator = FmiModelExchangeIntegrator(
                 slave,
                 self._md,
@@ -394,7 +446,9 @@ class FmuSession:
                 initial_input_clock_references=initial_clock_references,
             )
             self._collect_me_event_outputs()
-        if self._fmi_major() == "3" and self._fmi3_event_mode_used:
+        else:
+            slave.exitInitializationMode()
+        if self._fmi_major() == "3" and self._fmi3_event_mode_used and not self._external_solver:
             # FMI 3 Co-Simulation enters Event Mode when Event Mode is enabled.
             # Perform the initial discrete-state iteration before Step Mode.
             initial_clock_references = (
@@ -960,12 +1014,20 @@ class FmuSession:
             else self._use_dae
         )
         try:
-            if self._use_me:
+            if self._use_me and not self._external_solver:
                 slave.enterEventMode()
             slave.enterConfigurationMode()
             self._apply_validated_values(validated)
             self._apply_structural_array_shapes(dimension_values)
             slave.exitConfigurationMode()
+
+            if self._use_me and self._external_solver:
+                # The importing tool owns the integration. Reconfiguration
+                # changes the FMU's structure/mode, but must not create the
+                # Executor's internal ODE or DAE integrator.
+                self._use_dae = target_dae_mode
+                self._external_solver_mode = "event"
+                return
 
             if self._use_me:
                 initial_clocked_outputs = (
@@ -1359,6 +1421,404 @@ class FmuSession:
             result["finished"] = self._state == "stopped"
         return result
 
+    def model_exchange_call(self, operation: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Execute one allowlisted Model Exchange API operation for an importing solver."""
+        self._ensure_live()
+        if not self._external_solver or not self._use_me:
+            raise RuntimeError("External Model Exchange calls require an externally integrated ME session")
+        if not isinstance(operation, str) or not isinstance(arguments, dict):
+            raise ValueError("Model Exchange operation and arguments are invalid")
+        if self._slave is None or self._md is None:
+            raise RuntimeError("FMU instance is not initialized")
+        self._external_solver_evaluations += 1
+        if self._external_solver_evaluations > config.MAX_SIMULATION_STEPS:
+            raise RuntimeError("MAX_MODEL_EXCHANGE_EVALUATIONS_EXCEEDED")
+
+        state_count = self._model_exchange_structure_value_count("derivatives", "numberOfContinuousStates")
+        event_count = self._model_exchange_structure_value_count("eventIndicators", "numberOfEventIndicators")
+        if operation == "getNumberOfContinuousStates":
+            return {"value": state_count}
+        if operation == "getNumberOfEventIndicators":
+            return {"value": event_count}
+
+        if operation == "setTime":
+            time_value = arguments.get("time")
+            if isinstance(time_value, bool) or not isinstance(time_value, (int, float)) or not math.isfinite(float(time_value)):
+                raise ValueError("Model Exchange time must be finite")
+            requested_time = float(time_value)
+            if self._fmi_major() == "3":
+                self._require_external_solver_mode("continuous")
+                lower_bound = self._start_time
+                if len(self._external_solver_completed_integrator_times) >= 2:
+                    lower_bound = max(lower_bound, self._external_solver_completed_integrator_times[-2])
+                if self._external_solver_last_event_time is not None:
+                    lower_bound = max(lower_bound, self._external_solver_last_event_time)
+            else:
+                self._require_external_solver_mode("event", "continuous")
+                lower_bound = max(
+                    self._start_time,
+                    self._external_solver_last_event_time
+                    if self._external_solver_last_event_time is not None
+                    else self._start_time,
+                )
+            if requested_time < lower_bound:
+                raise ValueError("Model Exchange time cannot move before the current FMI rollback boundary")
+            if self._stop_time is not None and requested_time > self._stop_time:
+                raise ValueError("Model Exchange time cannot advance beyond the defined stop time")
+            self._check_external_fmi_status(operation, self._slave.setTime(requested_time))
+            self._time = requested_time
+            return {"time": self._time}
+
+        if operation == "exitInitializationMode":
+            self._require_external_solver_mode("initialization")
+            self._check_external_fmi_status(operation, self._slave.exitInitializationMode())
+            self._external_solver_mode = "event"
+            return {"mode": "event"}
+
+        if operation in {
+            "getContinuousStates",
+            "getDerivatives",
+            "getContinuousStateDerivatives",
+            "getEventIndicators",
+            "getNominalsOfContinuousStates",
+        }:
+            if operation == "getNominalsOfContinuousStates":
+                self._require_external_solver_mode("event", "continuous")
+            else:
+                self._require_external_solver_mode("initialization", "event", "continuous")
+            if operation == "getContinuousStates":
+                count = state_count
+                method_name = "getContinuousStates"
+            elif operation in {"getDerivatives", "getContinuousStateDerivatives"}:
+                count = state_count
+                method_name = "getContinuousStateDerivatives" if self._fmi_major() == "3" else "getDerivatives"
+            elif operation == "getEventIndicators":
+                count = event_count
+                method_name = "getEventIndicators"
+            else:
+                count = state_count
+                method_name = "getNominalsOfContinuousStates"
+            if count > 100_000:
+                raise ValueError("Model Exchange vector exceeds the supported size")
+            values = (ctypes.c_double * count)()
+            method = getattr(self._slave, method_name, None)
+            if not callable(method):
+                raise RuntimeError(f"FMU does not implement {method_name}")
+            status = method(values, count)
+            self._check_external_fmi_status(operation, status)
+            result = [float(value) for value in values]
+            if any(not math.isfinite(value) for value in result):
+                raise RuntimeError(f"FMU returned non-finite values from {operation}")
+            return {"values": result}
+
+        if operation == "setContinuousStates":
+            if self._fmi_major() == "2":
+                self._require_external_solver_mode("event", "continuous")
+            else:
+                self._require_external_solver_mode("continuous")
+            values = self._finite_number_vector(arguments.get("values"), state_count, "continuous states")
+            vector = (ctypes.c_double * state_count)(*values)
+            self._check_external_fmi_status(
+                operation,
+                self._slave.setContinuousStates(vector, state_count),
+            )
+            return {"values": values}
+
+        if operation == "completedIntegratorStep":
+            self._require_external_solver_mode("continuous")
+            no_set_state = arguments.get("noSetFMUStatePriorToCurrentPoint", True)
+            if type(no_set_state) is not bool:
+                raise ValueError("noSetFMUStatePriorToCurrentPoint must be Boolean")
+            enter_event_mode, terminate = self._slave.completedIntegratorStep(no_set_state)
+            if type(enter_event_mode) is not bool or type(terminate) is not bool:
+                raise RuntimeError("FMU returned invalid completedIntegratorStep flags")
+            self._external_solver_completed_integrator_times.append(self._time)
+            if len(self._external_solver_completed_integrator_times) > 2:
+                del self._external_solver_completed_integrator_times[:-2]
+            if terminate:
+                self._state = "stopped"
+                self._finished_reason = "fmu_termination_requested"
+            return {"enterEventMode": enter_event_mode, "terminateSimulation": terminate}
+
+        if operation == "enterEventMode":
+            self._require_external_solver_mode("continuous")
+            status = self._slave.enterEventMode()
+            self._check_external_fmi_status(operation, status)
+            self._external_solver_mode = "event"
+            self._external_solver_last_event_time = self._time
+            return {"mode": "event"}
+
+        if operation in {"updateDiscreteStates", "newDiscreteStates"}:
+            self._require_external_solver_mode("event")
+            fmi_operation = "updateDiscreteStates" if self._fmi_major() == "3" else "newDiscreteStates"
+            if operation != fmi_operation:
+                raise ValueError(f"{operation} is not available for FMI {self._fmi_major()}")
+            result = self._slave.updateDiscreteStates() if self._fmi_major() == "3" else self._slave.newDiscreteStates()
+            if not isinstance(result, tuple) or len(result) != 6:
+                raise RuntimeError(f"FMU returned invalid {operation} event information")
+            needs_update, terminate, nominals_changed, states_changed, next_time_defined, next_time = result
+            flags = (needs_update, terminate, nominals_changed, states_changed, next_time_defined)
+            if any(type(flag) is not bool for flag in flags):
+                raise RuntimeError(f"FMU returned invalid {operation} event flags")
+            if isinstance(next_time, bool) or not isinstance(next_time, (int, float)):
+                raise RuntimeError(f"FMU returned an invalid next event time from {operation}")
+            if next_time_defined and not math.isfinite(float(next_time)):
+                raise RuntimeError(f"FMU returned a non-finite next event time from {operation}")
+            if terminate:
+                self._state = "stopped"
+                self._finished_reason = "fmu_termination_requested"
+            return {
+                "discreteStatesNeedUpdate": needs_update,
+                "terminateSimulation": terminate,
+                "nominalsOfContinuousStatesChanged": nominals_changed,
+                "valuesOfContinuousStatesChanged": states_changed,
+                "nextEventTimeDefined": next_time_defined,
+                "nextEventTime": float(next_time) if next_time_defined else None,
+            }
+
+        if operation == "enterContinuousTimeMode":
+            self._require_external_solver_mode("event")
+            status = self._slave.enterContinuousTimeMode()
+            self._check_external_fmi_status(operation, status)
+            self._external_solver_mode = "continuous"
+            return {"mode": "continuous"}
+
+        if operation in {"getValues", "setValues"}:
+            if self._external_solver_mode not in {"initialization", "event", "continuous"}:
+                raise RuntimeError(
+                    f"Model Exchange value access is not allowed while the FMU is in {self._external_solver_mode} mode"
+                )
+            return self._external_solver_values(operation, arguments)
+
+        raise ValueError(f"Unsupported Model Exchange operation '{operation}'")
+
+    def _external_solver_values(self, operation: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        if self._md is None or self._slave is None:
+            raise RuntimeError("FMU instance is not initialized")
+        value_type = arguments.get("valueType")
+        references = arguments.get("valueReferences")
+        if not isinstance(value_type, str) or not isinstance(references, list) or not references or len(references) > 512:
+            raise ValueError("Model Exchange value request is invalid")
+        if any(type(reference) is not int or reference < 0 or reference > 0xFFFFFFFF for reference in references):
+            raise ValueError("Model Exchange value references are invalid")
+        if self._fmi_major() == "2" and value_type == "Float64":
+            value_type = "Real"
+        elif self._fmi_major() == "3" and value_type == "Real":
+            value_type = "Float64"
+        aliases: dict[int, list[Any]] = {}
+        for variable in self._md.modelVariables:
+            try:
+                reference = int(variable.valueReference)
+            except (AttributeError, TypeError, ValueError, OverflowError):
+                continue
+            aliases.setdefault(reference, []).append(variable)
+        selected: list[Any] = []
+        declared_types: list[str] = []
+        sizes: list[int] = []
+        dae_algebraic_references = (
+            set(self._fmi_ls_dae.algebraic_value_references)
+            if self._use_dae and self._fmi_ls_dae is not None
+            else set()
+        )
+        state_references = self._model_exchange_state_value_references()
+        for reference in references:
+            candidates = aliases.get(reference, [])
+            compatible = [variable for variable in candidates if self._variable_type(variable) == value_type]
+            if not compatible:
+                raise ValueError("Model Exchange request references an unknown or differently typed variable")
+            if operation == "setValues":
+                if self._external_solver_mode == "initialization":
+                    writable = [
+                        variable for variable in compatible
+                        if getattr(variable, "causality", None) == "input"
+                        or (
+                            getattr(variable, "causality", None) == "parameter"
+                            and (
+                                self._fmi_major() == "2"
+                                and getattr(variable, "variability", None) != "constant"
+                                or self._fmi_major() == "3"
+                                and getattr(variable, "initial", None) == "exact"
+                            )
+                        )
+                        or (
+                            reference in state_references
+                            and getattr(variable, "initial", None) == "exact"
+                        )
+                    ]
+                elif self._external_solver_mode == "event":
+                    writable = [
+                        variable for variable in compatible
+                        if getattr(variable, "causality", None) == "input"
+                        or (
+                            getattr(variable, "causality", None) == "parameter"
+                            and getattr(variable, "variability", None) == "tunable"
+                        )
+                        or (
+                            self._fmi_major() == "3"
+                            and reference in state_references
+                            and getattr(variable, "reinit", None) is False
+                        )
+                        or (
+                            reference in dae_algebraic_references
+                            and getattr(variable, "causality", None) == "local"
+                        )
+                    ]
+                else:
+                    writable = [
+                        variable for variable in compatible
+                        if (
+                            getattr(variable, "causality", None) == "input"
+                            and getattr(variable, "variability", None) == "continuous"
+                        )
+                        or (
+                            reference in dae_algebraic_references
+                            and getattr(variable, "causality", None) == "local"
+                        )
+                        or (
+                            self._fmi_major() == "3"
+                            and self._external_solver_mode == "continuous"
+                            and reference in state_references
+                        )
+                    ]
+                if writable:
+                    compatible = writable
+            variable = compatible[0]
+            selected.append(variable)
+            declared_types.append(self._variable_type(variable))
+            sizes.append(self._variable_size(variable))
+        total_size = sum(sizes)
+        if total_size > 100_000:
+            raise ValueError("Model Exchange value request exceeds the supported size")
+        normalized_type = value_type
+        if any(item != value_type for item in declared_types):
+            raise ValueError("Model Exchange request uses inconsistent variable types")
+        if operation == "getValues":
+            getter = getattr(self._slave, f"get{normalized_type}", None)
+            if not callable(getter):
+                raise ValueError(f"FMU does not support reading FMI type {value_type}")
+            result: list[Any] = []
+            for reference, variable, size in zip(references, selected, sizes, strict=True):
+                if getattr(variable, "causality", None) == "independent":
+                    result.append(self._time)
+                    continue
+                raw = getter([reference], nValues=size) if self._fmi_major() == "3" else getter([reference])
+                if not isinstance(raw, Iterable):
+                    raise RuntimeError("FMU returned non-iterable Model Exchange values")
+                result.extend(self._normalise_output(value_type, value) for value in raw)
+            if len(result) != total_size:
+                raise RuntimeError("FMU returned an unexpected Model Exchange value count")
+            if value_type in {"Int64", "UInt64"}:
+                result = [str(int(value)) for value in result]
+            return {"values": result}
+
+        raw_values = arguments.get("values")
+        if not isinstance(raw_values, list) or len(raw_values) != total_size:
+            raise ValueError("Model Exchange write has an unexpected value count")
+        names_to_values: dict[str, Any] = {}
+        offset = 0
+        for variable, size in zip(selected, sizes, strict=True):
+            chunk = raw_values[offset:offset + size]
+            offset += size
+            names_to_values[str(variable.name)] = chunk if self._is_array(variable) else chunk[0]
+
+        phase = "initialization" if self._external_solver_mode == "initialization" else "runtime"
+        dae_local_values: dict[str, Any] = {}
+        ordinary_values: dict[str, Any] = {}
+        for variable in selected:
+            reference = int(variable.valueReference)
+            name = str(variable.name)
+            if (
+                reference in dae_algebraic_references
+                and getattr(variable, "causality", None) == "local"
+                and self._external_solver_mode in {"event", "continuous"}
+            ):
+                coerced = self._coerce_values(variable, names_to_values[name])
+                dae_local_values[name] = coerced if self._is_array(variable) else coerced[0]
+            elif (
+                reference in state_references
+                and self._fmi_major() == "3"
+                and (
+                    self._external_solver_mode == "continuous"
+                    or (
+                        self._external_solver_mode == "event"
+                        and getattr(variable, "reinit", None) is False
+                    )
+                )
+            ):
+                coerced = self._coerce_values(variable, names_to_values[name])
+                dae_local_values[name] = coerced if self._is_array(variable) else coerced[0]
+            else:
+                ordinary_values[name] = names_to_values[name]
+        validated = self._validate_values(ordinary_values, phase=phase) if ordinary_values else {}
+        if dae_local_values:
+            validated.update(dae_local_values)
+        values_by_name = {str(variable.name): variable for variable in selected}
+        references_by_type: dict[str, list[int]] = {}
+        flattened_by_type: dict[str, list[Any]] = {}
+        for name, value in validated.items():
+            variable = values_by_name[name]
+            fmi_type = self._variable_type(variable)
+            references_by_type.setdefault(fmi_type, []).append(int(variable.valueReference))
+            flattened_by_type.setdefault(fmi_type, []).extend(value if self._is_array(variable) else [value])
+        for fmi_type, refs in references_by_type.items():
+            setter = getattr(self._slave, f"set{fmi_type}", None)
+            if not callable(setter):
+                raise ValueError(f"FMU does not support writing FMI type {fmi_type}")
+            setter(refs, flattened_by_type[fmi_type])
+        return {"values": raw_values}
+
+    def _model_exchange_structure_value_count(self, attribute: str, fallback_attribute: str) -> int:
+        if self._md is None:
+            return 0
+        unknowns = getattr(self._md, attribute, None)
+        if isinstance(unknowns, (list, tuple)):
+            total = 0
+            for unknown in unknowns:
+                variable = getattr(unknown, "variable", None)
+                if variable is None:
+                    continue
+                total += self._variable_size(variable)
+            return total
+        return int(getattr(self._md, fallback_attribute, 0) or 0)
+
+    def _model_exchange_state_value_references(self) -> set[int]:
+        """Return state variables paired with the ordered derivative unknowns."""
+        if self._md is None:
+            return set()
+        references: set[int] = set()
+        for unknown in getattr(self._md, "derivatives", None) or []:
+            derivative_variable = getattr(unknown, "variable", None)
+            state_variable = getattr(derivative_variable, "derivative", None)
+            reference = getattr(state_variable, "valueReference", None)
+            if isinstance(reference, int) and not isinstance(reference, bool) and reference >= 0:
+                references.add(reference)
+        if self._fmi_ls_dae is not None:
+            references.update(self._fmi_ls_dae.state_value_references)
+        return references
+
+    def _require_external_solver_mode(self, *allowed: str) -> None:
+        if self._external_solver_mode not in allowed:
+            raise RuntimeError(
+                f"Model Exchange operation requires {' or '.join(allowed)} mode; "
+                f"FMU is in {self._external_solver_mode} mode"
+            )
+
+    @staticmethod
+    def _check_external_fmi_status(operation: str, status: Any) -> None:
+        if isinstance(status, int) and not isinstance(status, bool) and status >= 3:
+            raise RuntimeError(f"FMU {operation} failed with FMI status {status}")
+
+    @staticmethod
+    def _finite_number_vector(value: Any, expected_length: int, label: str) -> list[float]:
+        if not isinstance(value, list) or len(value) != expected_length or expected_length > 100_000:
+            raise ValueError(f"Model Exchange {label} have an unexpected size")
+        converted: list[float] = []
+        for item in value:
+            if isinstance(item, bool) or not isinstance(item, (int, float)) or not math.isfinite(float(item)):
+                raise ValueError(f"Model Exchange {label} must contain finite numbers")
+            converted.append(float(item))
+        return converted
+
     def _fmi3_event_time_metadata(self) -> dict[str, Any]:
         if self._fmi_major() != "3":
             return {}
@@ -1423,6 +1883,9 @@ class FmuSession:
             time_mode=self._time_mode,
             playback_speed=self._playback_speed,
             early_return_allowed=self._early_return_allowed,
+            execution_interface=self._execution_interface,
+            external_solver=self._external_solver,
+            defer_initialization_exit=self._defer_initialization_exit,
         )
 
     @property
@@ -2045,12 +2508,14 @@ class FmuSession:
         # The isolated worker may only access the staged FMU path, not the
         # catalog root used to resolve access keys. Reuse its parsed model
         # description and avoid opening a large modelDescription.xml twice.
-        return describe_model_description(
+        description = describe_model_description(
             self._md,
             fmi_ls_dae=self._fmi_ls_dae,
             fmi_ls_dae_issue=self._fmi_ls_dae_issue,
             execution_interface=self._execution_interface,
         )
+        description["availableExecutionInterfaces"] = self._available_execution_interfaces()
+        return description
 
     def _merge_declared_start_values(self, values: dict[str, Any]) -> dict[str, Any]:
         """Seed writable FMI starts before applying explicit initialization values."""
@@ -2212,6 +2677,19 @@ class FmuSession:
                     self._fmi_major() == "3"
                     and causality == "structuralParameter"
                     and variability in {"fixed", "tunable"}
+                )
+                or (
+                    self._external_solver
+                    and self._use_me
+                    and int(getattr(var, "valueReference", -1)) in self._model_exchange_state_value_references()
+                    and getattr(var, "initial", None) == "exact"
+                )
+                or (
+                    self._external_solver
+                    and self._use_me
+                    and self._fmi_major() == "2"
+                    and int(getattr(var, "valueReference", -1)) in self._model_exchange_state_value_references()
+                    and getattr(var, "initial", None) == "approx"
                 )
             )
         elif phase == "runtime":
