@@ -293,7 +293,11 @@ def test_fmi3_dae_selector_explicit_false_keeps_ode_mode(tmp_path, monkeypatch):
         defaultExperiment=None, modelVariables=[selector],
     )
     session._md = cast(Any, model)
-    session._fmi_ls_dae = cast(Any, SimpleNamespace(enable_dae_value_reference=7))
+    session._fmi_ls_dae = cast(Any, SimpleNamespace(
+        enable_dae_value_reference=7,
+        output_value_references=(),
+        initial_unknown_value_references=(),
+    ))
     monkeypatch.setattr(session, "_available_execution_interfaces", lambda: ["ModelExchange"])
     monkeypatch.setattr(session, "_execution_interface", "ModelExchange")
     fmu = Mock()
@@ -302,9 +306,48 @@ def test_fmi3_dae_selector_explicit_false_keeps_ode_mode(tmp_path, monkeypatch):
     integrator.take_event_outputs.return_value = {}
     monkeypatch.setattr(engine, "FmiModelExchangeIntegrator", lambda *_args, **_kwargs: integrator)
     dae_integrator = Mock()
+    dae_integrator.take_event_outputs.return_value = {}
     monkeypatch.setattr(engine, "Fmi3DaeIntegrator", lambda *_args, **_kwargs: dae_integrator)
 
     session.initialize(parameters={"enableDAE": False}, execution_interface="ModelExchange")
+
+    fmu.setBoolean.assert_called_once_with([7], [False])
+    assert session._use_dae is False
+    assert session._me_integrator is integrator
+    assert session._dae_integrator is None
+    dae_integrator.assert_not_called()
+
+
+def test_fmi3_dae_selector_defaults_to_the_fmi_start_value(tmp_path, monkeypatch):
+    session = engine.FmuSession("dae-default-test", tmp_path / "model.fmu")
+    session._extract_dir = tmp_path
+    selector = SimpleNamespace(
+        name="enableDAE", type="Boolean", causality="structuralParameter", variability="tunable",
+        valueReference=7, min=None, max=None, start=False, declaredType=None, shape=None, dimensions=[],
+    )
+    model = SimpleNamespace(
+        fmiVersion="3.0", guid="dae-default-guid", coSimulation=None,
+        modelExchange=SimpleNamespace(modelIdentifier="ModelExchange", needsCompletedIntegratorStep=False),
+        defaultExperiment=None, modelVariables=[selector],
+    )
+    session._md = cast(Any, model)
+    session._fmi_ls_dae = cast(Any, SimpleNamespace(
+        enable_dae_value_reference=7,
+        output_value_references=(),
+        initial_unknown_value_references=(),
+    ))
+    monkeypatch.setattr(session, "_available_execution_interfaces", lambda: ["ModelExchange"])
+    monkeypatch.setattr(session, "_execution_interface", "ModelExchange")
+    fmu = Mock()
+    monkeypatch.setattr(engine, "instantiate_fmi3_model_exchange", lambda *_args: fmu)
+    integrator = Mock()
+    integrator.take_event_outputs.return_value = {}
+    monkeypatch.setattr(engine, "FmiModelExchangeIntegrator", lambda *_args, **_kwargs: integrator)
+    dae_integrator = Mock()
+    dae_integrator.take_event_outputs.return_value = {}
+    monkeypatch.setattr(engine, "Fmi3DaeIntegrator", lambda *_args, **_kwargs: dae_integrator)
+
+    session.initialize(execution_interface="ModelExchange")
 
     fmu.setBoolean.assert_called_once_with([7], [False])
     assert session._use_dae is False

@@ -267,10 +267,6 @@ class FmuSession:
             requested_dae_value = original_parameters.get(dae_enable_name)
             if not self._use_me and requested_dae_value is True:
                 raise ValueError("FMI-LS-DAE can only be enabled with the ModelExchange execution interface")
-            if self._use_me and dae_enable_name not in original_parameters:
-                # The Executor can run the declared DAE formulation by default;
-                # callers can explicitly pass false to retain the FMI ODE mode.
-                initialization_values[dae_enable_name] = True
         validated_parameters = self._validate_values(initialization_values, phase="initialization")
         if self._use_me and dae_enable_variable is not None:
             self._use_dae = validated_parameters.get(str(dae_enable_variable.name)) is True
