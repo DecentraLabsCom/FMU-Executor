@@ -199,6 +199,98 @@ def test_fmi3_model_exchange_checkpoint_restores_by_rebuilding_dae_initialized_s
     slave.setTime.assert_called_once_with(0.5)
 
 
+@pytest.mark.parametrize("external_mode", ["continuous", "event"])
+@pytest.mark.parametrize("use_dae", [False, True])
+def test_external_model_exchange_checkpoint_restores_external_mode_without_integrator(
+    monkeypatch,
+    tmp_path,
+    external_mode,
+    use_dae,
+):
+    session = make_live_session(tmp_path, version="3.0")
+    session.fmu_sha256 = "checkpoint-model-hash"
+    model = _model_description(session)
+    model.coSimulation = None
+    model.modelExchange = SimpleNamespace(
+        modelIdentifier="ModelExchange",
+        canGetAndSetFMUstate=True,
+        canSerializeFMUstate=True,
+    )
+    session._execution_interface = "ModelExchange"
+    session._use_me = True
+    session._use_dae = use_dae
+    if use_dae:
+        session._fmi_ls_dae = cast(Any, SimpleNamespace())
+    session._external_solver = True
+    session._external_solver_mode = external_mode
+    session._external_solver_evaluations = 17
+    session._external_solver_completed_integrator_times = [0.25, 0.5]
+    session._external_solver_last_event_time = 0.25
+    session._time = 0.5
+    slave = _fmu_slave(session)
+    slave.getFMUState.return_value = object()
+    slave.serializeFMUState.return_value = b"serialized-fmu-state"
+
+    checkpoint = session.capture_fmu_state()
+    assert checkpoint["simulation"]["externalSolver"] == {
+        "mode": external_mode,
+        "evaluations": 17,
+        "completedIntegratorTimes": [0.25, 0.5],
+        "lastEventTime": 0.25,
+    }
+
+    slave.deserializeFMUState.return_value = object()
+    slave.updateDiscreteStates.return_value = (False, False, False, False, False, 0.0)
+    session._external_solver_mode = "initialization"
+    monkeypatch.setattr(
+        engine,
+        "FmiModelExchangeIntegrator",
+        lambda *_args, **_kwargs: pytest.fail("external solver restore must not create an ME integrator"),
+    )
+    monkeypatch.setattr(
+        engine,
+        "Fmi3DaeIntegrator",
+        lambda *_args, **_kwargs: pytest.fail("external solver restore must not create a DAE integrator"),
+    )
+    restored = session.restore_fmu_state(checkpoint)
+
+    assert restored["simTime"] == 0.5
+    assert session._me_integrator is None
+    assert session._dae_integrator is None
+    assert session._use_dae is use_dae
+    assert session._external_solver_mode == external_mode
+    assert session._external_solver_evaluations == 17
+    assert session._external_solver_completed_integrator_times == [0.25, 0.5]
+    assert session._external_solver_last_event_time == 0.25
+    slave.setFMUState.assert_called_once()
+    slave.exitInitializationMode.assert_not_called()
+    slave.enterContinuousTimeMode.assert_not_called()
+    slave.setTime.assert_not_called()
+    slave.enterEventMode.assert_not_called()
+
+
+@pytest.mark.parametrize(("version", "allowed"), [("2.0", False), ("3.0", True)])
+def test_get_nominals_initialization_mode_matches_fmi_version(tmp_path, version, allowed):
+    session = make_live_session(tmp_path, version=version)
+    model = _model_description(session)
+    model.coSimulation = None
+    model.modelExchange = SimpleNamespace(modelIdentifier="ModelExchange")
+    model.numberOfContinuousStates = 1
+    session._execution_interface = "ModelExchange"
+    session._use_me = True
+    session._external_solver = True
+    session._external_solver_mode = "initialization"
+    slave = _fmu_slave(session)
+
+    if allowed:
+        assert session.model_exchange_call("getNominalsOfContinuousStates", {}) == {"values": [0.0]}
+        slave.getNominalsOfContinuousStates.assert_called_once()
+    else:
+        with pytest.raises(RuntimeError, match="requires event or continuous mode"):
+            session.model_exchange_call("getNominalsOfContinuousStates", {})
+        slave.getNominalsOfContinuousStates.assert_not_called()
+
+
 def test_load_extracts_once_and_returns_describe(monkeypatch, tmp_path):
     monkeypatch.setattr(engine.config, "TEMP_DIR", tmp_path)
     extracted = Mock()

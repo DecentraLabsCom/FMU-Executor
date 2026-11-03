@@ -45,7 +45,20 @@ class Session:
         return values
     def validate_reconfiguration_values(self, values):
         return values
-    def initialize(self, *, start_time, stop_time, step_size=None, parameters=None, time_mode="simtime", playback_speed=1.0, early_return_allowed=False, execution_interface=None):
+    def initialize(
+        self,
+        *,
+        start_time,
+        stop_time,
+        step_size=None,
+        parameters=None,
+        time_mode="simtime",
+        playback_speed=1.0,
+        early_return_allowed=False,
+        execution_interface=None,
+        external_solver=False,
+        defer_initialization_exit=False,
+    ):
         self.state = "initialized"
         self._state = "initialized"
         self._finished_reason = None

@@ -1180,6 +1180,13 @@ class FmuSession:
             simulation["fmiLsDae"] = self._dae_integrator.snapshot_event_schedule()
         if self._me_integrator is not None:
             simulation["modelExchange"] = self._me_integrator.snapshot_event_schedule()
+        if self._external_solver:
+            simulation["externalSolver"] = {
+                "mode": self._external_solver_mode,
+                "evaluations": self._external_solver_evaluations,
+                "completedIntegratorTimes": list(self._external_solver_completed_integrator_times),
+                "lastEventTime": self._external_solver_last_event_time,
+            }
         if self._fmi_major() == "3" and not self._use_me:
             fmi3_cosimulation: dict[str, Any] = {
                 "nextEventTimeDefined": self._fmi3_cs_next_event_time_defined,
@@ -1223,6 +1230,8 @@ class FmuSession:
         model_exchange_event_state: dict[str, Any] = {}
         raw_dae_event_state: Any = None
         raw_fmi3_cosimulation_clock_state: Any = None
+        raw_external_solver_state: Any = None
+        external_solver_state: dict[str, Any] | None = None
         execution_mode: str | None = None
         fmi3_cs_next_event_time_defined = False
         fmi3_cs_next_event_time: float | None = None
@@ -1241,6 +1250,7 @@ class FmuSession:
             raw_model_exchange_event_state = simulation.get("modelExchange")
             raw_dae_event_state = simulation.get("fmiLsDae")
             raw_fmi3_cosimulation_clock_state = simulation.get("fmi3CoSimulation")
+            raw_external_solver_state = simulation.get("externalSolver")
         except (KeyError, TypeError, ValueError, OverflowError) as exc:
             raise ValueError("FMU state checkpoint is invalid or incompatible") from exc
         if not math.isfinite(time_value) or time_value < self._start_time or (
@@ -1259,7 +1269,56 @@ class FmuSession:
         checkpoint_uses_dae = execution_mode == "fmiLsDae"
         if checkpoint_uses_dae and (self._fmi_major() != "3" or self._fmi_ls_dae is None):
             raise ValueError("FMU state checkpoint requires unavailable FMI-LS-DAE support")
-        if execution_mode == "modelExchange":
+        if checkpoint_uses_me and self._external_solver:
+            if not isinstance(raw_external_solver_state, dict):
+                raise ValueError("FMU state checkpoint is missing external Model Exchange context")
+            raw_external_mode = raw_external_solver_state.get("mode")
+            raw_evaluations = raw_external_solver_state.get("evaluations")
+            raw_completed_times = raw_external_solver_state.get("completedIntegratorTimes")
+            raw_last_event_time = raw_external_solver_state.get("lastEventTime")
+            if (
+                raw_external_mode not in {"initialization", "event", "continuous"}
+                or type(raw_evaluations) is not int
+                or raw_evaluations < 0
+                or raw_evaluations > config.MAX_SIMULATION_STEPS
+                or not isinstance(raw_completed_times, list)
+                or len(raw_completed_times) > 2
+            ):
+                raise ValueError("FMU state checkpoint has invalid external Model Exchange context")
+            completed_times: list[float] = []
+            for raw_completed_time in raw_completed_times:
+                if isinstance(raw_completed_time, bool) or not isinstance(raw_completed_time, (int, float)):
+                    raise ValueError("FMU state checkpoint has invalid external Model Exchange context")
+                completed_time = float(raw_completed_time)
+                if (
+                    not math.isfinite(completed_time)
+                    or completed_time < self._start_time
+                    or completed_time > time_value + max(1e-12, abs(time_value) * 1e-12)
+                ):
+                    raise ValueError("FMU state checkpoint has invalid external Model Exchange context")
+                completed_times.append(completed_time)
+            if completed_times != sorted(completed_times):
+                raise ValueError("FMU state checkpoint has invalid external Model Exchange context")
+            last_event_time: float | None = None
+            if raw_last_event_time is not None:
+                if isinstance(raw_last_event_time, bool) or not isinstance(raw_last_event_time, (int, float)):
+                    raise ValueError("FMU state checkpoint has invalid external Model Exchange context")
+                last_event_time = float(raw_last_event_time)
+                if (
+                    not math.isfinite(last_event_time)
+                    or last_event_time < self._start_time
+                    or last_event_time > time_value + max(1e-12, abs(time_value) * 1e-12)
+                ):
+                    raise ValueError("FMU state checkpoint has invalid external Model Exchange context")
+            external_solver_state = {
+                "mode": raw_external_mode,
+                "evaluations": raw_evaluations,
+                "completedIntegratorTimes": completed_times,
+                "lastEventTime": last_event_time,
+            }
+        elif raw_external_solver_state is not None:
+            raise ValueError("FMU state checkpoint uses a different Model Exchange execution context")
+        if execution_mode == "modelExchange" and not self._external_solver:
             if not isinstance(raw_model_exchange_event_state, dict):
                 raise ValueError("FMU state checkpoint is missing Model Exchange event metadata")
             for key, value in raw_model_exchange_event_state.items():
@@ -1268,7 +1327,7 @@ class FmuSession:
                 model_exchange_event_state[key] = value
             if self._me_integrator is not None and not self._use_dae:
                 self._me_integrator.validate_event_schedule(model_exchange_event_state, time_value)
-        if checkpoint_uses_dae and not isinstance(raw_dae_event_state, dict):
+        if checkpoint_uses_dae and not self._external_solver and not isinstance(raw_dae_event_state, dict):
             raise ValueError("FMU state checkpoint is missing FMI-LS-DAE event metadata")
         if self._fmi_major() == "3" and not checkpoint_uses_me:
             if not isinstance(raw_fmi3_cosimulation_clock_state, dict):
@@ -1310,8 +1369,20 @@ class FmuSession:
             if self._me_integrator is not None:
                 self._me_integrator.close()
                 self._me_integrator = None
-            slave.setTime(self._time)
-            if checkpoint_uses_dae:
+            if self._external_solver:
+                if external_solver_state is None:
+                    raise ValueError("FMU state checkpoint is missing external Model Exchange context")
+                self._external_solver_mode = external_solver_state["mode"]
+                self._external_solver_evaluations = external_solver_state["evaluations"]
+                self._external_solver_completed_integrator_times = list(
+                    external_solver_state["completedIntegratorTimes"]
+                )
+                self._external_solver_last_event_time = external_solver_state["lastEventTime"]
+                self._fmi3_clock_runtime = None
+                self._use_dae = checkpoint_uses_dae
+            else:
+                slave.setTime(self._time)
+            if checkpoint_uses_dae and not self._external_solver:
                 dae_definition = self._fmi_ls_dae
                 model_description = self._md
                 if dae_definition is None or model_description is None:
@@ -1333,7 +1404,7 @@ class FmuSession:
                 )
                 self._dae_integrator.restore_event_schedule(raw_dae_event_state, self._time)
                 self._use_dae = True
-            else:
+            elif not self._external_solver:
                 self._fmi3_clock_runtime = (
                     self._create_fmi3_clock_runtime()
                     if self._fmi_major() == "3" and self._fmi3_model_has_clocks()
@@ -1483,7 +1554,8 @@ class FmuSession:
             "getNominalsOfContinuousStates",
         }:
             if operation == "getNominalsOfContinuousStates":
-                self._require_external_solver_mode("event", "continuous")
+                allowed_modes = ("initialization", "event", "continuous") if self._fmi_major() == "3" else ("event", "continuous")
+                self._require_external_solver_mode(*allowed_modes)
             else:
                 self._require_external_solver_mode("initialization", "event", "continuous")
             if operation == "getContinuousStates":
