@@ -27,7 +27,7 @@ def find_protocol_source() -> Path:
 
 
 def sync_protocol_sdk(protocol_source: Path, destination: Path) -> None:
-    """Refresh every runtime module in the companion SDK copy."""
+    """Refresh SDK modules using canonical LF endings for reproducible ZIPs."""
     source_root = protocol_source.resolve(strict=True).parent
     sources = sorted(source_root.glob("*.js"))
     if not sources:
@@ -39,7 +39,9 @@ def sync_protocol_sdk(protocol_source: Path, destination: Path) -> None:
         if stale_module.name not in source_names:
             stale_module.unlink()
     for source in sources:
-        shutil.copyfile(source, destination / source.name)
+        source_bytes = source.read_bytes()
+        normalized_bytes = source_bytes.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+        (destination / source.name).write_bytes(normalized_bytes)
 
 
 def build(three_root: Path) -> None:

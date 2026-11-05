@@ -49,6 +49,18 @@ def test_sdk_sync_copies_each_protocol_module_from_the_canonical_source(tmp_path
     assert not (destination / "obsolete.js").exists()
 
 
+def test_sdk_sync_normalizes_windows_line_endings_to_lf(tmp_path):
+    builder = _load_builder()
+    source = tmp_path / "digital-twin-app-protocol"
+    destination = tmp_path / "webapp" / "sdk"
+    source.mkdir()
+    (source / "index.js").write_bytes(b"export {\r\n  value,\r  other,\n};\r\n")
+
+    builder.sync_protocol_sdk(source / "index.js", destination)
+
+    assert (destination / "index.js").read_bytes() == b"export {\n  value,\n  other,\n};\n"
+
+
 def test_checked_in_warehouse_sdk_matches_marketplace_source_when_available():
     marketplace_sdk = PROJECT_ROOT.parent / "Marketplace" / "packages" / "digital-twin-app-protocol"
     if not marketplace_sdk.is_dir():
@@ -59,7 +71,9 @@ def test_checked_in_warehouse_sdk_matches_marketplace_source_when_available():
     checked_in_files = {path.name for path in checked_in_sdk.glob("*.js")}
     assert checked_in_files == canonical_files
     for filename in canonical_files:
-        assert (checked_in_sdk / filename).read_bytes() == (marketplace_sdk / filename).read_bytes()
+        canonical_bytes = (marketplace_sdk / filename).read_bytes()
+        normalized_canonical_bytes = canonical_bytes.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+        assert (checked_in_sdk / filename).read_bytes() == normalized_canonical_bytes
 
 
 def test_packaged_warehouse_sdk_matches_checked_in_copy():
