@@ -651,6 +651,7 @@ async def companion_app_asset(
 
 @app.get("/internal/fmu/describe", dependencies=[Depends(_check_token)])
 async def describe(
+    request: Request,
     access_key: str = Header(..., alias="X-FMU-Access-Key"),
     public_only: bool = Query(False, alias="publicOnly"),
     causality: str | None = Query(
@@ -661,7 +662,57 @@ async def describe(
     access_key = _validated_access_key(access_key)
     if not fmu_storage.fmu_exists(access_key):
         raise HTTPException(404, "FMU_NOT_FOUND")
-    return fmu_storage.describe(access_key, public_only=public_only, causality=causality)
+    fmu_path = fmu_storage.get_fmu_path(access_key)
+
+    def etag_for_current_file() -> str:
+        stat = fmu_path.stat()
+        revision = "|".join(str(value) for value in (
+            str(fmu_path.resolve()),
+            stat.st_dev,
+            stat.st_ino,
+            stat.st_size,
+            stat.st_mtime_ns,
+            stat.st_ctime_ns,
+            "public" if public_only else "internal",
+            causality or "",
+        ))
+        return f'"{hashlib.sha256(revision.encode("utf-8")).hexdigest()}"'
+
+    def if_none_match_matches(value: str | None, etag: str) -> bool:
+        if not value:
+            return False
+        return any(
+            candidate.strip() == "*"
+            or candidate.strip() == etag
+            or candidate.strip() == f"W/{etag}"
+            for candidate in value.split(",")
+        )
+
+    response_headers = {
+        "Cache-Control": "private, no-cache",
+        "Vary": "X-FMU-Access-Key",
+        "X-Content-Type-Options": "nosniff",
+    }
+    etag = etag_for_current_file()
+    if if_none_match_matches(request.headers.get("if-none-match"), etag):
+        if etag_for_current_file() == etag:
+            return Response(status_code=304, headers={**response_headers, "ETag": etag})
+
+    # FMUs are replaced atomically by provisioning. If a replacement races
+    # with metadata extraction, retry against the new file identity so the
+    # validator always describes the payload returned below.
+    for _ in range(3):
+        etag_before = etag_for_current_file()
+        description = fmu_storage.describe(access_key, public_only=public_only, causality=causality)
+        etag_after = etag_for_current_file()
+        if etag_before == etag_after:
+            body = json.dumps(description, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+            return Response(
+                content=body,
+                media_type="application/json",
+                headers={**response_headers, "ETag": etag_after},
+            )
+    raise HTTPException(status_code=503, detail="FMU changed while reading its model description")
 
 
 # ── Validate / Quarantine ────────────────────────────────────────
