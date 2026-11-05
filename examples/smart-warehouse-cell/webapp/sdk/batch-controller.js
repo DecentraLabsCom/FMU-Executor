@@ -84,6 +84,58 @@ export function getAdaptiveBatchSize(controller) {
   return Math.max(1, Math.min(controller.sampleCount, controller.maxSamples, MAX_SAMPLES_PER_BATCH))
 }
 
+export function getRealtimePacedBatchSize({
+  currentTime,
+  stopTime,
+  stepSize,
+  sampleEverySteps = 1,
+  maxSamples,
+  paceClock,
+  now,
+}) {
+  if (![currentTime, stepSize, sampleEverySteps, maxSamples, now,
+    paceClock?.simTime, paceClock?.wallTime].every(Number.isFinite)
+    || (stopTime !== undefined && stopTime !== null && !Number.isFinite(stopTime))
+    || stepSize <= 0 || sampleEverySteps < 1 || !Number.isInteger(sampleEverySteps)
+    || maxSamples < 1 || maxSamples > MAX_SAMPLES_PER_BATCH || !Number.isInteger(maxSamples)) {
+    throw new TypeError('A valid real-time batch clock and simulation interval are required.')
+  }
+
+  const elapsedRealTime = Math.max(0, now - paceClock.wallTime) / 1000
+  const availableSimulationTime = paceClock.simTime + elapsedRealTime
+  const sampleInterval = stepSize * sampleEverySteps
+  const tolerance = Math.max(1e-9, Math.abs(sampleInterval) * 1e-7)
+  let availableSamples = Math.floor((availableSimulationTime - currentTime + tolerance) / sampleInterval)
+  if (Number.isFinite(stopTime) && stopTime - currentTime < sampleInterval - tolerance
+    && availableSimulationTime >= stopTime - tolerance) {
+    availableSamples = Math.max(availableSamples, 1)
+  }
+
+  return Math.min(maxSamples, Math.max(1, availableSamples))
+}
+
+export function getRealtimePaceWaitMs({
+  currentTime,
+  stopTime,
+  stepSize,
+  sampleEverySteps = 1,
+  paceClock,
+  now,
+}) {
+  if (![currentTime, stepSize, sampleEverySteps, now,
+    paceClock?.simTime, paceClock?.wallTime].every(Number.isFinite)
+    || (stopTime !== undefined && stopTime !== null && !Number.isFinite(stopTime))
+    || stepSize <= 0 || sampleEverySteps < 1 || !Number.isInteger(sampleEverySteps)) {
+    throw new TypeError('A valid real-time batch clock and simulation interval are required.')
+  }
+
+  const nextTime = Number.isFinite(stopTime)
+    ? Math.min(stopTime, currentTime + stepSize * sampleEverySteps)
+    : currentTime + stepSize * sampleEverySteps
+  const dueAt = paceClock.wallTime + Math.max(0, nextTime - paceClock.simTime) * 1000
+  return Math.max(0, dueAt - now)
+}
+
 export function observeAdaptiveBatch(controller, {
   responseMs,
   computeMs,

@@ -1,5 +1,6 @@
 import importlib.util
 import sys
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -28,7 +29,14 @@ def test_sdk_sync_copies_each_protocol_module_from_the_canonical_source(tmp_path
     destination = tmp_path / "webapp" / "sdk"
     source.mkdir()
     expected = {}
-    for filename in ("index.js", "client.js", "fmu-client.js", "batch-controller.js", "input-update-quota.js"):
+    for filename in (
+        "index.js",
+        "client.js",
+        "fmu-client.js",
+        "batch-controller.js",
+        "input-update-quota.js",
+        "simulation-stream.js",
+    ):
         payload = f"// canonical {filename}\n".encode()
         (source / filename).write_bytes(payload)
         expected[filename] = payload
@@ -52,3 +60,19 @@ def test_checked_in_warehouse_sdk_matches_marketplace_source_when_available():
     assert checked_in_files == canonical_files
     for filename in canonical_files:
         assert (checked_in_sdk / filename).read_bytes() == (marketplace_sdk / filename).read_bytes()
+
+
+def test_packaged_warehouse_sdk_matches_checked_in_copy():
+    checked_in_sdk = EXAMPLE_ROOT / "webapp" / "sdk"
+    artifact = EXAMPLE_ROOT / "SmartWarehouseCell.webapp.zip"
+
+    with zipfile.ZipFile(artifact) as archive:
+        packaged_files = {
+            name.removeprefix("sdk/")
+            for name in archive.namelist()
+            if name.startswith("sdk/") and name.endswith(".js")
+        }
+        checked_in_files = {path.name for path in checked_in_sdk.glob("*.js")}
+        assert packaged_files == checked_in_files
+        for filename in checked_in_files:
+            assert archive.read(f"sdk/{filename}") == (checked_in_sdk / filename).read_bytes()

@@ -16,6 +16,11 @@ export const DIGITAL_TWIN_MESSAGE = Object.freeze({
   CONNECTION_REQUEST: 'decentralabs:fmu-connection-request',
   CONNECTION_READY: 'decentralabs:fmu-connection-ready',
   CONNECTION_ERROR: 'decentralabs:fmu-connection-error',
+  BATCH_EXECUTION_REQUEST: 'decentralabs:batch-execution-request',
+  BATCH_EXECUTION_CANCEL: 'decentralabs:batch-execution-cancel',
+  BATCH_EXECUTION_ACK: 'decentralabs:batch-execution-ack',
+  BATCH_EXECUTION_EVENT: 'decentralabs:batch-execution-event',
+  BATCH_EXECUTION_END: 'decentralabs:batch-execution-end',
   EXECUTION_STATE: 'decentralabs:execution-state',
   EXECUTION_CANCEL: 'decentralabs:execution-cancel',
   PLAYBACK_CONTROL: 'decentralabs:fmi-playback-control',
@@ -40,12 +45,15 @@ export const APP_TO_HOST_MESSAGE_TYPES = Object.freeze([
   DIGITAL_TWIN_MESSAGE.APP_READY, DIGITAL_TWIN_MESSAGE.APP_ERROR, DIGITAL_TWIN_MESSAGE.CONNECTION_REQUEST,
   DIGITAL_TWIN_MESSAGE.EXECUTION_STATE, DIGITAL_TWIN_MESSAGE.MODEL_CHANGE,
   DIGITAL_TWIN_MESSAGE.FMU_STATE_SAVED, DIGITAL_TWIN_MESSAGE.FMU_STATE_ERROR,
+  DIGITAL_TWIN_MESSAGE.BATCH_EXECUTION_REQUEST, DIGITAL_TWIN_MESSAGE.BATCH_EXECUTION_CANCEL,
+  DIGITAL_TWIN_MESSAGE.BATCH_EXECUTION_ACK,
 ])
 export const HOST_TO_APP_MESSAGE_TYPES = Object.freeze([
   DIGITAL_TWIN_MESSAGE.HOST_READY, DIGITAL_TWIN_MESSAGE.CONNECTION_READY, DIGITAL_TWIN_MESSAGE.CONNECTION_ERROR,
   DIGITAL_TWIN_MESSAGE.EXECUTION_CANCEL, DIGITAL_TWIN_MESSAGE.PLAYBACK_CONTROL,
   DIGITAL_TWIN_MESSAGE.FMI_LS_PARAMETER_PRESET, DIGITAL_TWIN_MESSAGE.FMI_LS_EXPERIMENT,
   DIGITAL_TWIN_MESSAGE.FMU_STATE_CONFIGURATION, DIGITAL_TWIN_MESSAGE.FMU_STATE_CAPTURE,
+  DIGITAL_TWIN_MESSAGE.BATCH_EXECUTION_EVENT, DIGITAL_TWIN_MESSAGE.BATCH_EXECUTION_END,
 ])
 export const isRecord = (v) => v !== null && typeof v === 'object' && !Array.isArray(v)
 const keys = (v, allowed) => Object.keys(v).every((key) => allowed.includes(key))
@@ -112,7 +120,19 @@ export function isValidAppMessage(v) {
     case DIGITAL_TWIN_MESSAGE.APP_READY: return isValidAppReadyMessage(v)
     case DIGITAL_TWIN_MESSAGE.APP_ERROR: return isValidAppErrorMessage(v)
     case DIGITAL_TWIN_MESSAGE.CONNECTION_REQUEST:
-      return keys(v, ['type', 'version', 'requestId', 'options']) && isValidProtocolId(v.requestId) && (v.options === undefined || isValidOptions(v.options))
+      return keys(v, ['type', 'version', 'requestId', 'options', 'transport', 'executionPace']) && isValidProtocolId(v.requestId)
+        && (v.options === undefined || isValidOptions(v.options))
+        && (v.transport === undefined || ['websocket', 'batch-http'].includes(v.transport))
+        && (v.executionPace === undefined || ['fastest', 'realtime'].includes(v.executionPace))
+    case DIGITAL_TWIN_MESSAGE.BATCH_EXECUTION_REQUEST:
+      return keys(v, ['type', 'version', 'requestId', 'runId', 'body', 'batchOptions'])
+        && isValidProtocolId(v.requestId) && isValidProtocolId(v.runId)
+        && isValidBatchSimulationBody(v.body) && isValidBatchOptions(v.batchOptions)
+    case DIGITAL_TWIN_MESSAGE.BATCH_EXECUTION_CANCEL:
+      return keys(v, ['type', 'version', 'requestId']) && isValidProtocolId(v.requestId)
+    case DIGITAL_TWIN_MESSAGE.BATCH_EXECUTION_ACK:
+      return keys(v, ['type', 'version', 'requestId', 'eventId']) && isValidProtocolId(v.requestId)
+        && Number.isSafeInteger(v.eventId) && v.eventId >= 1
     case DIGITAL_TWIN_MESSAGE.EXECUTION_STATE:
       return keys(v, ['type', 'version', 'runId', 'state', 'options']) && isValidProtocolId(v.runId)
         && ['idle', 'running', 'completed', 'cancelled', 'error'].includes(v.state) && (v.options === undefined || isValidOptions(v.options))
@@ -131,7 +151,17 @@ export function isValidHostMessage(v) {
     case DIGITAL_TWIN_MESSAGE.HOST_READY:
       return keys(v, ['type', 'version', 'extensions']) && (v.extensions === undefined || (isRecord(v.extensions) && Object.keys(v.extensions).length <= 32))
     case DIGITAL_TWIN_MESSAGE.CONNECTION_READY:
-      return keys(v, ['type', 'version', 'requestId', 'connection', 'inputSchedule', 'executionPace']) && isValidProtocolId(v.requestId) && isValidConnectionConfig(v.connection) && (v.inputSchedule === undefined || isValidInputSchedule(v.inputSchedule)) && (v.executionPace === undefined || ['fastest', 'realtime'].includes(v.executionPace))
+      return keys(v, ['type', 'version', 'requestId', 'transport', 'connection', 'inputSchedule', 'executionPace', 'defaultStartTime', 'defaultStepSize', 'captureFmuStateAvailable'])
+        && isValidProtocolId(v.requestId)
+        && (v.transport === undefined || ['websocket', 'batch-http'].includes(v.transport))
+        && (v.transport === 'batch-http'
+          ? v.connection === undefined
+          : isValidConnectionConfig(v.connection))
+        && (v.inputSchedule === undefined || isValidInputSchedule(v.inputSchedule))
+        && (v.executionPace === undefined || ['fastest', 'realtime'].includes(v.executionPace))
+        && (v.defaultStartTime === undefined || Number.isFinite(v.defaultStartTime))
+        && (v.defaultStepSize === undefined || (Number.isFinite(v.defaultStepSize) && v.defaultStepSize > 0))
+        && (v.captureFmuStateAvailable === undefined || typeof v.captureFmuStateAvailable === 'boolean')
     case DIGITAL_TWIN_MESSAGE.CONNECTION_ERROR:
       return keys(v, ['type', 'version', 'requestId', 'code']) && isValidProtocolId(v.requestId) && text(v.code)
     case DIGITAL_TWIN_MESSAGE.EXECUTION_CANCEL:
@@ -152,8 +182,56 @@ export function isValidHostMessage(v) {
         && typeof v.resume === 'boolean' && typeof v.captureOnCompletion === 'boolean'
     case DIGITAL_TWIN_MESSAGE.FMU_STATE_CAPTURE:
       return keys(v, ['type', 'version'])
+    case DIGITAL_TWIN_MESSAGE.BATCH_EXECUTION_EVENT:
+      return keys(v, ['type', 'version', 'requestId', 'eventId', 'event']) && isValidProtocolId(v.requestId)
+        && Number.isSafeInteger(v.eventId) && v.eventId >= 1
+        && isValidBatchSimulationEvent(v.event)
+    case DIGITAL_TWIN_MESSAGE.BATCH_EXECUTION_END:
+      return keys(v, ['type', 'version', 'requestId', 'code']) && isValidProtocolId(v.requestId)
+        && (v.code === undefined || text(v.code))
     default: return false
   }
+}
+export function isValidBatchSimulationBody(v) {
+  return isRecord(v)
+    && keys(v, ['parameters', 'options', 'inputSchedule', 'checkpoint', 'captureFmuState'])
+    && isValidParameters(v.parameters)
+    && isRecord(v.options)
+    && keys(v.options, ['startTime', 'stopTime', 'stepSize'])
+    && Number.isFinite(v.options.startTime) && Number.isFinite(v.options.stopTime)
+    && v.options.stopTime > v.options.startTime
+    && Number.isFinite(v.options.stepSize) && v.options.stepSize > 0
+    && (v.inputSchedule === undefined || isValidInputSchedule(v.inputSchedule))
+    && (v.checkpoint === undefined || isValidFmuStateCheckpoint(v.checkpoint))
+    && (v.captureFmuState === undefined || typeof v.captureFmuState === 'boolean')
+}
+export function isValidBatchOptions(v) {
+  return isRecord(v) && keys(v, ['maxSamples', 'outputVariables', 'outputSampleEverySteps'])
+    && Number.isInteger(v.maxSamples) && v.maxSamples >= 1 && v.maxSamples <= MAX_SAMPLES_PER_BATCH
+    && (v.outputVariables === undefined || (Array.isArray(v.outputVariables)
+      && v.outputVariables.length > 0 && v.outputVariables.length <= MAX_OUTPUTS_PER_SAMPLE
+      && new Set(v.outputVariables).size === v.outputVariables.length
+      && v.outputVariables.every((name) => text(name, 256))))
+    && (v.outputSampleEverySteps === undefined || (Number.isInteger(v.outputSampleEverySteps)
+      && v.outputSampleEverySteps >= 1 && v.outputSampleEverySteps <= 100000))
+}
+export function isValidBatchSimulationEvent(v) {
+  if (!isRecord(v) || typeof v.kind !== 'string') return false
+  if (v.kind === 'samples') {
+    if (!keys(v, ['kind', 'samples']) || !Array.isArray(v.samples) || !v.samples.length
+      || v.samples.length > MAX_SAMPLES_PER_BATCH || !v.samples.every(isValidSample)) return false
+    try { return new TextEncoder().encode(JSON.stringify(v)).length <= MAX_SAMPLE_BATCH_JSON_CHARS } catch { return false }
+  }
+  if (v.kind === 'completed') {
+    return keys(v, ['kind', 'time', 'finishReason', 'checkpoint', 'checkpointTime', 'checkpointSample'])
+      && Number.isFinite(v.time)
+      && (v.finishReason === undefined || text(v.finishReason))
+      && (v.checkpoint === undefined || isValidFmuStateCheckpoint(v.checkpoint))
+      && (v.checkpointTime === undefined || Number.isFinite(v.checkpointTime))
+      && (v.checkpointSample === undefined || isValidSample(v.checkpointSample))
+  }
+  return v.kind === 'error' && keys(v, ['kind', 'code', 'message']) && text(v.code)
+    && (v.message === undefined || text(v.message, 512))
 }
 export function isValidFmiLsExperiment(v) {
   return isRecord(v)

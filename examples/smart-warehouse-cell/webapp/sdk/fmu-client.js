@@ -34,6 +34,62 @@ export function isValidFmuStateCheckpointBundle(value) {
   try { return new TextEncoder().encode(JSON.stringify(value)).length <= 4096 } catch { return false }
 }
 
+/** Open a reservation-authorized batch stream directly against Lab Gateway.
+ * The session ticket is sent only as a Bearer header; it is never placed in a URL,
+ * request body, cookie, or persistent browser storage.
+ */
+export function postFmuSimulationStream(connection, body, { signal, fetchImpl = globalThis.fetch } = {}) {
+  if (!isValidConnectionConfig(connection) || connection.ticketExpiresAt <= Date.now() / 1000) {
+    throw failure('The FMU connection grant is invalid or expired.', 'INVALID_CONNECTION_GRANT')
+  }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    throw failure('The simulation request is invalid.', 'INVALID_RUN_REQUEST')
+  }
+  if (typeof fetchImpl !== 'function') {
+    throw failure('The FMU simulation transport is unavailable.', 'FMU_CONNECTION_FAILED')
+  }
+  if (body.labId !== undefined && String(body.labId) !== connection.labId) {
+    throw failure('The FMU connection grant does not match this laboratory.', 'INVALID_CONNECTION_GRANT')
+  }
+
+  const streamUrl = new URL(connection.gatewayWsUrl)
+  const localPreview = connection.sessionTicket.startsWith('preview_')
+  if (localPreview && streamUrl.pathname !== '/dev-fmu/sessions') {
+    throw failure('The local FMU preview grant is invalid.', 'INVALID_CONNECTION_GRANT')
+  }
+  if (!localPreview && streamUrl.pathname !== '/fmu/api/v1/fmu/sessions') {
+    throw failure('The FMU connection grant has an invalid Gateway endpoint.', 'INVALID_CONNECTION_GRANT')
+  }
+  streamUrl.protocol = streamUrl.protocol === 'wss:' ? 'https:' : 'http:'
+  streamUrl.pathname = localPreview ? '/dev-fmu/simulations/stream' : '/fmu/api/v1/simulations/stream'
+  streamUrl.search = ''
+  streamUrl.hash = ''
+  const requestBody = { ...body, labId: connection.labId }
+  if (localPreview) {
+    if (body.reservationKey !== undefined && String(body.reservationKey) !== connection.reservationKey) {
+      throw failure('The local FMU preview grant does not match this reservation.', 'INVALID_CONNECTION_GRANT')
+    }
+    requestBody.reservationKey = connection.reservationKey
+  } else {
+    delete requestBody.reservationKey
+  }
+  delete requestBody.gatewayUrl
+
+  return fetchImpl(streamUrl.toString(), {
+    method: 'POST',
+    mode: 'cors',
+    credentials: 'omit',
+    cache: 'no-store',
+    redirect: 'error',
+    ...(signal ? { signal } : {}),
+    headers: {
+      Authorization: `Bearer ${connection.sessionTicket}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(requestBody),
+  })
+}
+
 function waitForRetry(delayMs, signal) {
   signal?.throwIfAborted()
   return new Promise((resolve, reject) => {
