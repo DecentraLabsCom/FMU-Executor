@@ -27,6 +27,12 @@ def test_worker_startup_trace_is_opt_in(monkeypatch, tmp_path):
     monkeypatch.setenv("FMU_WORKER_STARTUP_TRACE", "1")
     process_runner._write_worker_startup_trace(str(worker_directory), "worker-entered")
     assert "worker-entered" in trace_path.read_text(encoding="utf-8")
+    stack_path = worker_directory / ".worker-stack-trace.txt"
+    stack_path.write_text("worker stack", encoding="utf-8")
+    assert process_runner._read_worker_startup_diagnostics(worker_directory) == (
+        trace_path.read_text(encoding="utf-8").strip(),
+        "worker stack",
+    )
 
 
 def test_realtime_model_description_is_cached_for_the_immutable_session():

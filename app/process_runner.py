@@ -8,6 +8,7 @@ not take the Station HTTP/WebSocket control plane down with it.
 from __future__ import annotations
 
 import base64
+import faulthandler
 import hashlib
 import json
 import logging
@@ -169,6 +170,20 @@ def _write_worker_startup_trace(worker_directory: str | None, stage: str) -> Non
             trace_file.write(f"{time.monotonic():.6f} pid={os.getpid()} {stage}\n")
     except OSError:
         logger.debug("Unable to write FMU worker startup trace", exc_info=True)
+
+
+def _read_worker_startup_diagnostics(worker_directory: Path) -> tuple[str, str]:
+    startup_path = worker_directory / ".worker-startup-trace.txt"
+    stack_path = worker_directory / ".worker-stack-trace.txt"
+    try:
+        startup_trace = startup_path.read_text(encoding="utf-8").strip() or "<empty>"
+    except OSError as exc:
+        startup_trace = f"<unavailable: {type(exc).__name__}>"
+    try:
+        stack_trace = stack_path.read_text(encoding="utf-8").strip()[-12000:] or "<empty>"
+    except OSError as exc:
+        stack_trace = f"<unavailable: {type(exc).__name__}>"
+    return startup_trace, stack_trace
 
 
 def _sanitize_worker_environment() -> None:
@@ -998,8 +1013,20 @@ def _execute_worker(
 ) -> None:
     """Worker entry point; imports native FMU code only after OS limits apply."""
     session = None
+    stack_trace_file = None
     try:
         _write_worker_startup_trace(worker_directory, "worker-entered")
+        if os.environ.get("FMU_WORKER_STARTUP_TRACE") == "1" and worker_directory:
+            try:
+                stack_trace_file = (Path(worker_directory) / ".worker-stack-trace.txt").open(
+                    "a", encoding="utf-8"
+                )
+                faulthandler.dump_traceback_later(3, repeat=True, file=stack_trace_file)
+            except (OSError, RuntimeError):
+                if stack_trace_file is not None:
+                    stack_trace_file.close()
+                stack_trace_file = None
+                logger.debug("Unable to start FMU worker stack trace", exc_info=True)
         if expected_parent_pid is not None:
             bind_worker_to_parent(expected_parent_pid)
             _write_worker_startup_trace(worker_directory, "parent-bound")
@@ -1271,8 +1298,13 @@ def _execute_worker(
             "retryable": False,
         })
     finally:
-        if session is not None:
-            session.terminate()
+        try:
+            if session is not None:
+                session.terminate()
+        finally:
+            if stack_trace_file is not None:
+                faulthandler.cancel_dump_traceback_later()
+                stack_trace_file.close()
 
 
 def _new_process(
@@ -1419,17 +1451,14 @@ def run(
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 if os.environ.get("FMU_WORKER_STARTUP_TRACE") == "1":
-                    trace_path = worker_directory / ".worker-startup-trace.txt"
-                    try:
-                        startup_trace = trace_path.read_text(encoding="utf-8").strip()
-                    except OSError as exc:
-                        startup_trace = f"<unavailable: {type(exc).__name__}>"
+                    startup_trace, stack_trace = _read_worker_startup_diagnostics(worker_directory)
                     logger.error(
-                        "FMU worker timed out (pid=%s, alive=%s, exitcode=%s, startup_trace=%s)",
+                        "FMU worker timed out (pid=%s, alive=%s, exitcode=%s, startup_trace=%s, stack_trace=%s)",
                         process.pid,
                         process.is_alive(),
                         process.exitcode,
-                        startup_trace or "<empty>",
+                        startup_trace,
+                        stack_trace,
                     )
                 terminate_worker(process, job)
                 job = None
@@ -1534,17 +1563,14 @@ def stream(
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 if os.environ.get("FMU_WORKER_STARTUP_TRACE") == "1":
-                    trace_path = worker_directory / ".worker-startup-trace.txt"
-                    try:
-                        startup_trace = trace_path.read_text(encoding="utf-8").strip()
-                    except OSError as exc:
-                        startup_trace = f"<unavailable: {type(exc).__name__}>"
+                    startup_trace, stack_trace = _read_worker_startup_diagnostics(worker_directory)
                     logger.error(
-                        "FMU worker timed out (pid=%s, alive=%s, exitcode=%s, startup_trace=%s)",
+                        "FMU worker timed out (pid=%s, alive=%s, exitcode=%s, startup_trace=%s, stack_trace=%s)",
                         process.pid,
                         process.is_alive(),
                         process.exitcode,
-                        startup_trace or "<empty>",
+                        startup_trace,
+                        stack_trace,
                     )
                 terminate_worker(process, job)
                 job = None
