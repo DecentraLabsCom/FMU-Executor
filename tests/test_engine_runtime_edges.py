@@ -82,6 +82,39 @@ def _state_checkpoint(mode: str, event_metadata: dict[str, Any]) -> dict[str, An
     }
 
 
+def test_fmu_extract_directory_retries_only_existing_names(tmp_path, monkeypatch):
+    candidates = iter(("collision", "available"))
+    monkeypatch.setattr(
+        engine,
+        "uuid",
+        SimpleNamespace(uuid4=lambda: SimpleNamespace(hex=next(candidates))),
+        raising=False,
+    )
+    (tmp_path / "fmu_session_collision").mkdir()
+
+    extract_dir = engine._create_fmu_extract_directory(tmp_path, "session")
+
+    assert extract_dir == tmp_path / "fmu_session_available"
+    assert extract_dir.is_dir()
+
+
+def test_fmu_extract_directory_propagates_permission_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        engine,
+        "uuid",
+        SimpleNamespace(uuid4=lambda: SimpleNamespace(hex="denied")),
+        raising=False,
+    )
+
+    def deny_directory_creation(self, mode=0o777, parents=False, exist_ok=False):
+        raise PermissionError("AppContainer cannot create a directory here")
+
+    monkeypatch.setattr(Path, "mkdir", deny_directory_creation)
+
+    with pytest.raises(PermissionError, match="AppContainer cannot create a directory"):
+        engine._create_fmu_extract_directory(tmp_path, "session")
+
+
 def test_fmi3_cosimulation_checkpoint_preserves_next_event_without_clocks(tmp_path):
     session = make_live_session(tmp_path, version="3.0")
     session.fmu_sha256 = "checkpoint-model-hash"

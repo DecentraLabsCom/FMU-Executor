@@ -16,8 +16,8 @@ from collections.abc import Iterable
 from functools import reduce
 from operator import mul
 import shutil
-import tempfile
 import time as _time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Generator, Optional
@@ -43,6 +43,25 @@ from .fmu_metadata import describe_model_description
 from .simulation_defaults import DEFAULT_STEP_SIZE, resolve_simulation_time_options
 
 logger = logging.getLogger(__name__)
+
+
+def _create_fmu_extract_directory(root: Path, session_id: str) -> Path:
+    """Create one private extraction directory, retrying only genuine name collisions.
+
+    tempfile.mkdtemp() treats Windows PermissionError as a possible name
+    collision whenever the parent directory appears writable. In an
+    AppContainer that can hide a denied subdirectory creation in an endless
+    retry loop. UUID names make collisions negligible; if one occurs, retry it
+    explicitly and let permission errors surface immediately.
+    """
+    for _ in range(8):
+        extract_dir = root / f"fmu_{session_id}_{uuid.uuid4().hex}"
+        try:
+            extract_dir.mkdir(mode=0o700)
+        except FileExistsError:
+            continue
+        return extract_dir
+    raise FileExistsError("Unable to allocate a unique FMU extraction directory")
 
 
 def _trace_worker_load_stage(stage: str) -> None:
@@ -197,10 +216,7 @@ class FmuSession:
         """Extract and read model description. Returns describe dict."""
         if self._md is not None:
             return self._describe()
-        self._extract_dir = Path(tempfile.mkdtemp(
-            prefix=f"fmu_{self.session_id}_",
-            dir=str(config.TEMP_DIR),
-        ))
+        self._extract_dir = _create_fmu_extract_directory(config.TEMP_DIR, self.session_id)
         _trace_worker_load_stage("before-fmu-extract")
         fmpy_extract(str(self.fmu_path), unzipdir=str(self._extract_dir))
         _trace_worker_load_stage("fmu-extracted")
