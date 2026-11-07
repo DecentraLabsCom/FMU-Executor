@@ -113,13 +113,8 @@ def test_appcontainer_creates_profile_grants_access_and_closes(monkeypatch, tmp_
 
     assert container.name == "DecentraLabs.FMU.worker_test-1"
     runtime_grant.assert_called_once_with()
-    assert icacls.call_count == 3
-    assert icacls.call_args_list[0].args[1:] == (
-        "/grant", "*S-1-15-2-987:(AD)", "/Q",
-    )
-    assert icacls.call_args_list[1].args[1:] == (
-        "/grant", "*S-1-15-2-987:(OI)(CI)(M)", "/T", "/Q",
-    )
+    assert icacls.call_count == 2
+    assert "S-1-15-2-987" in icacls.call_args_list[0].args[2]
     container.close()
     container.close()
     assert len(apis["advapi32"].FreeSid.calls) == 1

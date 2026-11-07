@@ -115,6 +115,23 @@ def test_fmu_extract_directory_propagates_permission_error(tmp_path, monkeypatch
         engine._create_fmu_extract_directory(tmp_path, "session")
 
 
+def test_windows_fmu_extract_directory_inherits_worker_acl(tmp_path, monkeypatch):
+    observed_modes = []
+    original_mkdir = Path.mkdir
+
+    def capture_mkdir(self, mode=0o777, parents=False, exist_ok=False):
+        observed_modes.append(mode)
+        return original_mkdir(self, mode=mode, parents=parents, exist_ok=exist_ok)
+
+    monkeypatch.setattr(engine, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(Path, "mkdir", capture_mkdir)
+
+    extract_dir = engine._create_fmu_extract_directory(tmp_path, "session")
+
+    assert extract_dir.is_dir()
+    assert observed_modes == [0o777]
+
+
 def test_fmi3_cosimulation_checkpoint_preserves_next_event_without_clocks(tmp_path):
     session = make_live_session(tmp_path, version="3.0")
     session.fmu_sha256 = "checkpoint-model-hash"

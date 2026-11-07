@@ -57,7 +57,13 @@ def _create_fmu_extract_directory(root: Path, session_id: str) -> Path:
     for _ in range(8):
         extract_dir = root / f"fmu_{session_id}_{uuid.uuid4().hex}"
         try:
-            extract_dir.mkdir(mode=0o700)
+            if os.name == "nt":
+                # CPython's Windows mkdir(mode=0o700) installs a protected
+                # DACL that drops the AppContainer SID. Inherit the private
+                # worker-directory ACL instead; keep 0700 isolation on POSIX.
+                extract_dir.mkdir()
+            else:
+                extract_dir.mkdir(mode=0o700)
         except FileExistsError:
             continue
         return extract_dir

@@ -96,32 +96,6 @@ def _icacls(path: Path, *arguments: str) -> None:
         raise WorkerIsolationError("Unable to configure Windows FMU worker access rules")
 
 
-def _trace_worker_directory_acl(path: Path) -> None:
-    """Log the private worker ACL only when the frozen-runtime smoke opts in."""
-    if os.environ.get("FMU_WORKER_STARTUP_TRACE") != "1":
-        return
-    system_root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
-    executable = system_root / "System32" / "icacls.exe"
-    try:
-        result = subprocess.run(
-            [str(executable), str(path)],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            check=False,
-            text=True,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-        logger.warning(
-            "FMU worker directory ACL (path=%s, exit=%s): %s",
-            path,
-            result.returncode,
-            (result.stdout or "").strip(),
-        )
-    except OSError:
-        logger.warning("Unable to inspect FMU worker directory ACL", exc_info=True)
-
-
 def _runtime_directories() -> set[Path]:
     """Return code/runtime directories that an AppContainer worker must read."""
     if getattr(sys, "frozen", False):
@@ -211,14 +185,6 @@ class WindowsAppContainer:
         try:
             sid_text = self._sid_to_string(sid)
             _grant_runtime_read_access()
-            # Grant direct directory creation explicitly; the worker must add
-            # its extraction directory beneath this otherwise-private folder.
-            _icacls(
-                self.worker_directory,
-                "/grant",
-                f"*{sid_text}:(AD)",
-                "/Q",
-            )
             _icacls(
                 self.worker_directory,
                 "/grant",
@@ -227,7 +193,6 @@ class WindowsAppContainer:
                 "/Q",
             )
             _icacls(self.worker_directory, "/setintegritylevel", "(OI)(CI)L", "/T", "/Q")
-            _trace_worker_directory_acl(self.worker_directory)
         except Exception:
             self.close()
             raise
