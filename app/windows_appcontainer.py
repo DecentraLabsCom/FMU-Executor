@@ -185,6 +185,14 @@ class WindowsAppContainer:
         try:
             sid_text = self._sid_to_string(sid)
             _grant_runtime_read_access()
+            # Grant directory creation explicitly; the worker must unpack FMUs
+            # into nested folders inside this otherwise-private directory.
+            _icacls(
+                self.worker_directory,
+                "/grant",
+                f"*{sid_text}:(OI)(CI)(AD)",
+                "/Q",
+            )
             _icacls(
                 self.worker_directory,
                 "/grant",
