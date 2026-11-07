@@ -9,6 +9,7 @@ import ctypes
 import logging
 import math
 import json
+import os
 import re
 import platform
 from collections.abc import Iterable
@@ -42,6 +43,18 @@ from .fmu_metadata import describe_model_description
 from .simulation_defaults import DEFAULT_STEP_SIZE, resolve_simulation_time_options
 
 logger = logging.getLogger(__name__)
+
+
+def _trace_worker_load_stage(stage: str) -> None:
+    """Append opt-in loader breadcrumbs for the frozen AppContainer smoke test."""
+    if os.environ.get("FMU_WORKER_STARTUP_TRACE") != "1":
+        return
+    try:
+        trace_path = Path(config.TEMP_DIR) / ".worker-startup-trace.txt"
+        with trace_path.open("a", encoding="utf-8") as trace_file:
+            trace_file.write(f"{_time.monotonic():.6f} pid={os.getpid()} {stage}\n")
+    except OSError:
+        logger.debug("Unable to write FMU loader startup trace", exc_info=True)
 
 
 class AdvancePreExecutionError(ValueError):
@@ -188,14 +201,22 @@ class FmuSession:
             prefix=f"fmu_{self.session_id}_",
             dir=str(config.TEMP_DIR),
         ))
+        _trace_worker_load_stage("before-fmu-extract")
         fmpy_extract(str(self.fmu_path), unzipdir=str(self._extract_dir))
+        _trace_worker_load_stage("fmu-extracted")
+        _trace_worker_load_stage("before-model-description")
         self._md = read_model_description(str(self.fmu_path))
+        _trace_worker_load_stage("model-description-read")
         try:
+            _trace_worker_load_stage("before-fmi-ls-manifest")
             self._fmi_ls_dae = read_fmi_ls_dae(self.fmu_path, self._md)
+            _trace_worker_load_stage("fmi-ls-manifest-read")
         except ValueError as exc:
             self._fmi_ls_dae_issue = str(exc)
             logger.warning("FMI-LS-DAE manifest is unavailable for %s: %s", self.access_key, exc)
+        _trace_worker_load_stage("before-interface-detection")
         available_interfaces = self._available_execution_interfaces()
+        _trace_worker_load_stage("interfaces-detected")
         if self._fmi_ls_dae is not None and "ModelExchange" in available_interfaces:
             self._execution_interface = "ModelExchange"
         elif "CoSimulation" in available_interfaces:

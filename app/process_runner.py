@@ -1472,6 +1472,15 @@ def run(
                 break
             except queue.Empty as exc:
                 if not process.is_alive():
+                    if os.environ.get("FMU_WORKER_STARTUP_TRACE") == "1":
+                        startup_trace, stack_trace = _read_worker_startup_diagnostics(worker_directory)
+                        logger.error(
+                            "FMU worker exited without a result (pid=%s, exitcode=%s, startup_trace=%s, stack_trace=%s)",
+                            process.pid,
+                            process.exitcode,
+                            startup_trace,
+                            stack_trace,
+                        )
                     raise ProcessExecutionError(
                         "FMU worker exited without a result",
                         code="FMU_EXECUTION_FAILED",
