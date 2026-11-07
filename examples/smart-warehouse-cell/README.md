@@ -115,11 +115,11 @@ Build the browser app bundle from the installed Marketplace Three.js package:
 python build_webapp.py --three-root ../../../Marketplace/node_modules/three
 ```
 
-The builder refreshes every JavaScript module in `webapp/sdk/` from the canonical
-Marketplace package, including the adaptive batch controller and its input
-quota helper, before packaging. It removes stale JavaScript modules and checks
-that the app's local module and asset references are present in the generated
-ZIP. Rebuild the webapp bundle after updating the Marketplace SDK.
+The builder refreshes every JavaScript module and `LICENSE.txt` in `webapp/sdk/`
+from the canonical Marketplace package, including the adaptive batch controller
+and its input quota helper, before packaging. It removes stale JavaScript modules
+and checks that the app's local module and asset references are present in the
+generated ZIP. Rebuild the webapp bundle after updating the Marketplace SDK.
 The browser contract also accepts apps that implement its messages directly.
 The FMU implements FMI 2.0 state get/set and serialization, so Marketplace can
 save a completed laboratory state and resume a later run from that checkpoint.
@@ -147,8 +147,10 @@ either FMU backend. Build scripts package the checked-in default scene as-is.
 
 ## License
 
-The model, Three.js scene and app code are provided under the MIT license in
-`LICENSE.txt`. The app bundle also includes the upstream Three.js license.
+The model, Three.js scene and app-specific code are provided under the MIT
+license in `LICENSE.txt`. The embedded Digital Twin App Protocol SDK is licensed
+separately under Apache-2.0; both notices are included in the app ZIP. The app
+bundle also includes the upstream Three.js license.
 
 The app uses host integration v2 to obtain a one-use connection grant, then
 executes directly over the provider Gateway WebSocket with the same session

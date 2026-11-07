@@ -27,11 +27,14 @@ def find_protocol_source() -> Path:
 
 
 def sync_protocol_sdk(protocol_source: Path, destination: Path) -> None:
-    """Refresh SDK modules using canonical LF endings for reproducible ZIPs."""
+    """Refresh SDK modules and its license using canonical LF endings."""
     source_root = protocol_source.resolve(strict=True).parent
     sources = sorted(source_root.glob("*.js"))
     if not sources:
         raise FileNotFoundError(f"Marketplace protocol SDK has no JavaScript modules: {source_root}")
+    license_source = source_root / "LICENSE.txt"
+    if not license_source.is_file():
+        raise FileNotFoundError(f"Marketplace protocol SDK license is missing: {license_source}")
 
     destination.mkdir(parents=True, exist_ok=True)
     source_names = {source.name for source in sources}
@@ -42,10 +45,16 @@ def sync_protocol_sdk(protocol_source: Path, destination: Path) -> None:
         source_bytes = source.read_bytes()
         normalized_bytes = source_bytes.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
         (destination / source.name).write_bytes(normalized_bytes)
+    shutil.copyfile(license_source, destination / "LICENSE.txt")
 
 
 def build(three_root: Path) -> None:
     three_root = three_root.resolve(strict=True)
+    app_license = ROOT / "LICENSE.txt"
+    if not app_license.is_file():
+        raise FileNotFoundError(f"Smart Warehouse app license is missing: {app_license}")
+    shutil.copyfile(app_license, WEBAPP_ROOT / "LICENSE.txt")
+
     index = (WEBAPP_ROOT / "index.html").read_text(encoding="utf-8")
     required_interface_markers = (
         'role="group" aria-label="Run controls"',
