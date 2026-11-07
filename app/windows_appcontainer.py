@@ -289,20 +289,18 @@ class WindowsAppContainer:
             startup.lpAttributeList = attribute_list
             process_info = _ProcessInformation()
             command_buffer = ctypes.create_unicode_buffer(command_line)
-            child_environment = None
-            flags = int(creation_flags) | 0x00080000  # EXTENDED_STARTUPINFO_PRESENT
-            if environment is not None:
-                environment_values = dict(environment)
-                private_path = str(self.worker_directory)
-                for variable in ("TMP", "TEMP", "TMPDIR", "APPDATA", "LOCALAPPDATA", "USERPROFILE", "HOME"):
-                    for key in tuple(environment_values):
-                        if key.upper() == variable:
-                            environment_values.pop(key)
-                    environment_values[variable] = private_path
-                entries = sorted(environment_values.items(), key=lambda item: item[0].upper())
-                environment_text = "\0".join(f"{key}={value}" for key, value in entries) + "\0\0"
-                child_environment = ctypes.create_unicode_buffer(environment_text)
-                flags |= 0x00000400  # CREATE_UNICODE_ENVIRONMENT
+            environment_values = dict(os.environ if environment is None else environment)
+            private_path = str(self.worker_directory)
+            for variable in ("TMP", "TEMP", "TMPDIR", "APPDATA", "LOCALAPPDATA", "USERPROFILE", "HOME"):
+                for key in tuple(environment_values):
+                    if key.upper() == variable:
+                        environment_values.pop(key)
+                environment_values[variable] = private_path
+            entries = sorted(environment_values.items(), key=lambda item: item[0].upper())
+            environment_text = "\0".join(f"{key}={value}" for key, value in entries) + "\0\0"
+            child_environment = ctypes.create_unicode_buffer(environment_text)
+            flags = int(creation_flags) | 0x00080000 | 0x00000400
+            # EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT
             working_directory = str(self.worker_directory)
             if not kernel.CreateProcessW(
                 application_name,
@@ -396,6 +394,8 @@ def _appcontainer_popen(process_obj: Any) -> Any:
     with _SPAWN_LOCK:
         original_winapi = spawn_module._winapi
         original_get_command_line = spawn_module.spawn.get_command_line
+        from multiprocessing import connection as connection_module
+        original_pipe_reducer = getattr(connection_module, "reduce_pipe_connection", None)
 
         def appcontainer_command_line(**kwargs: Any) -> list[str]:
             if getattr(_SPAWN_LOCAL, "appcontainer", None) is not appcontainer:
@@ -407,8 +407,37 @@ def _appcontainer_popen(process_obj: Any) -> Any:
             sandbox_kwargs.pop("parent_pid", None)
             return original_get_command_line(**sandbox_kwargs)
 
+        def appcontainer_pipe_reducer(pipe: Any) -> Any:
+            if (
+                original_pipe_reducer is None
+                or getattr(_SPAWN_LOCAL, "appcontainer", None) is not appcontainer
+            ):
+                if original_pipe_reducer is None:
+                    raise WorkerIsolationError("Windows multiprocessing pipe reducer is unavailable")
+                return original_pipe_reducer(pipe)
+
+            from multiprocessing.context import get_spawning_popen, reduction
+
+            popen = get_spawning_popen()
+            if popen is None or popen.pid is None:
+                return original_pipe_reducer(pipe)
+
+            access = (
+                (connection_module._winapi.FILE_GENERIC_READ if pipe.readable else 0)
+                | (connection_module._winapi.FILE_GENERIC_WRITE if pipe.writable else 0)
+            )
+            duplicated_handle = reduction.DupHandle(pipe.fileno(), access, pid=popen.pid)
+            return connection_module.rebuild_pipe_connection, (
+                duplicated_handle,
+                pipe.readable,
+                pipe.writable,
+            )
+
         spawn_module._winapi = _WinApiProxy(original_winapi, appcontainer)
         spawn_module.spawn.get_command_line = appcontainer_command_line
+        if original_pipe_reducer is not None:
+            connection_module.reduce_pipe_connection = appcontainer_pipe_reducer
+            connection_module.reduction.register(connection_module.PipeConnection, appcontainer_pipe_reducer)
         _SPAWN_LOCAL.appcontainer = appcontainer
         try:
             popen = spawn_module.Popen(process_obj)
@@ -421,6 +450,9 @@ def _appcontainer_popen(process_obj: Any) -> Any:
             _SPAWN_LOCAL.appcontainer = None
             spawn_module._winapi = original_winapi
             spawn_module.spawn.get_command_line = original_get_command_line
+            if original_pipe_reducer is not None:
+                connection_module.reduce_pipe_connection = original_pipe_reducer
+                connection_module.reduction.register(connection_module.PipeConnection, original_pipe_reducer)
 
 
 class WindowsAppContainerProcess(_SPAWN_CONTEXT.Process):

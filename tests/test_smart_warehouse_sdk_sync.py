@@ -28,7 +28,9 @@ def test_sdk_sync_copies_each_protocol_module_from_the_canonical_source(tmp_path
     source = tmp_path / "digital-twin-app-protocol"
     destination = tmp_path / "webapp" / "sdk"
     source.mkdir()
-    expected = {}
+    license_payload = b"canonical license\n"
+    (source / "LICENSE.txt").write_bytes(license_payload)
+    expected = {"LICENSE.txt": license_payload}
     for filename in (
         "index.js",
         "client.js",
@@ -55,10 +57,12 @@ def test_sdk_sync_normalizes_windows_line_endings_to_lf(tmp_path):
     destination = tmp_path / "webapp" / "sdk"
     source.mkdir()
     (source / "index.js").write_bytes(b"export {\r\n  value,\r  other,\n};\r\n")
+    (source / "LICENSE.txt").write_bytes(b"canonical license\n")
 
     builder.sync_protocol_sdk(source / "index.js", destination)
 
     assert (destination / "index.js").read_bytes() == b"export {\n  value,\n  other,\n};\n"
+    assert (destination / "LICENSE.txt").read_bytes() == b"canonical license\n"
 
 
 def test_checked_in_warehouse_sdk_matches_marketplace_source_when_available():

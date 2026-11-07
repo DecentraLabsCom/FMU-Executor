@@ -159,7 +159,13 @@ def test_appcontainer_cleans_up_if_sid_conversion_or_acl_setup_fails(monkeypatch
     assert apis["userenv"].DeleteAppContainerProfile.calls
 
 
-def test_create_process_uses_explicit_appcontainer_and_handle_lists(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    "environment",
+    [None, {"B": "2", "A": "1", "TEMP": "C:\\old-temp"}],
+)
+def test_create_process_uses_private_environment_and_explicit_appcontainer(monkeypatch, tmp_path, environment):
+    observed_environment = {}
+
     def initialize_attribute_list(attribute_list, _count, _flags, size_pointer):
         if attribute_list is None:
             ctypes.cast(size_pointer, ctypes.POINTER(ctypes.c_size_t)).contents.value = 128
@@ -167,6 +173,19 @@ def test_create_process_uses_explicit_appcontainer_and_handle_lists(monkeypatch,
         return 1
 
     def create_process(*args):
+        environment_buffer = ctypes.cast(args[6], ctypes.POINTER(ctypes.c_wchar))
+        entries = []
+        entry = []
+        for index in range(65536):
+            character = environment_buffer[index]
+            if character == "\0":
+                if not entry:
+                    break
+                entries.append("".join(entry))
+                entry = []
+            else:
+                entry.append(character)
+        observed_environment.update(dict(item.split("=", 1) for item in entries))
         info = ctypes.cast(args[9], ctypes.POINTER(appcontainer._ProcessInformation)).contents
         info.hProcess, info.hThread = 11, 12
         info.dwProcessId, info.dwThreadId = 13, 14
@@ -185,12 +204,78 @@ def test_create_process_uses_explicit_appcontainer_and_handle_lists(monkeypatch,
     container._sid = ctypes.c_void_p(1234)
     result = container.create_process(
         object(), "python.exe", "python.exe -c pipe_handle=42", None, None,
-        True, 0, {"B": "2", "A": "1"}, None, SimpleNamespace(dwFlags=7),
+        True, 0, environment, None, SimpleNamespace(dwFlags=7),
     )
     assert result == (11, 12, 13, 14)
     assert kernel.SetHandleInformation.calls[0][0] == 42
     assert len(kernel.UpdateProcThreadAttribute.calls) == 2
     assert kernel.DeleteProcThreadAttributeList.calls
+    assert kernel.CreateProcessW.calls[0][5] & 0x00000400  # CREATE_UNICODE_ENVIRONMENT
+    private_path = str(tmp_path)
+    for variable in ("TMP", "TEMP", "TMPDIR", "APPDATA", "LOCALAPPDATA", "USERPROFILE", "HOME"):
+        assert observed_environment[variable] == private_path
+    if environment is None:
+        assert "PATH" in {key.upper() for key in observed_environment}
+    else:
+        assert observed_environment["A"] == "1"
+        assert observed_environment["B"] == "2"
+
+
+def test_appcontainer_pipe_reducer_duplicates_worker_handles_and_restores(monkeypatch, tmp_path):
+    import multiprocessing.connection as connection_module
+    import multiprocessing.context as context_module
+    import multiprocessing.reduction as reduction_module
+
+    class FakePipe:
+        readable = True
+        writable = False
+
+        @staticmethod
+        def fileno():
+            return 55
+
+    original_reducer = Mock(return_value=("original", ()))
+    registrations = []
+    fake_reduction = SimpleNamespace(register=lambda pipe_type, reducer: registrations.append((pipe_type, reducer)))
+    monkeypatch.setattr(connection_module, "PipeConnection", FakePipe, raising=False)
+    monkeypatch.setattr(connection_module, "rebuild_pipe_connection", Mock(), raising=False)
+    monkeypatch.setattr(
+        connection_module,
+        "_winapi",
+        SimpleNamespace(FILE_GENERIC_READ=1, FILE_GENERIC_WRITE=2),
+        raising=False,
+    )
+    monkeypatch.setattr(connection_module, "reduce_pipe_connection", original_reducer, raising=False)
+    monkeypatch.setattr(connection_module, "reduction", fake_reduction, raising=False)
+    duplicate_handle = Mock(return_value="duplicated-handle")
+    monkeypatch.setattr(reduction_module, "DupHandle", duplicate_handle, raising=False)
+    monkeypatch.setattr(context_module, "get_spawning_popen", lambda: SimpleNamespace(pid=987))
+
+    container = SimpleNamespace(close=Mock(), create_process=Mock(return_value="isolated"))
+    monkeypatch.setattr(appcontainer, "WindowsAppContainer", lambda _directory: container)
+    original_winapi = SimpleNamespace(CreateProcess=Mock(return_value="ordinary"))
+    spawn_module = ModuleType("multiprocessing.popen_spawn_win32")
+    spawn_module._winapi = original_winapi
+    spawn_module.spawn = SimpleNamespace(get_command_line=lambda **_kwargs: [])
+    captured = []
+
+    def popen(_process):
+        captured.append(connection_module.reduce_pipe_connection(FakePipe()))
+        return SimpleNamespace(pid=987)
+
+    spawn_module.Popen = popen
+    monkeypatch.setitem(sys.modules, "multiprocessing.popen_spawn_win32", spawn_module)
+    monkeypatch.setattr(multiprocessing, "popen_spawn_win32", spawn_module, raising=False)
+    process = SimpleNamespace(_fmu_worker_directory=str(tmp_path / "worker_test"))
+
+    assert appcontainer._appcontainer_popen(process).pid == 987
+    assert duplicate_handle.call_args.args == (55, 1)
+    assert duplicate_handle.call_args.kwargs == {"pid": 987}
+    assert captured == [(connection_module.rebuild_pipe_connection, ("duplicated-handle", True, False))]
+    assert connection_module.reduce_pipe_connection is original_reducer
+    assert registrations[0][0] is FakePipe
+    assert registrations[0][1] is not original_reducer
+    assert registrations[-1] == (FakePipe, original_reducer)
 
 
 def test_create_process_rejects_missing_security_and_bootstrap_state(monkeypatch, tmp_path):
