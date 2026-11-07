@@ -159,6 +159,18 @@ def _worker_process(
     return context.Process(target=target, args=args, name=name)
 
 
+def _write_worker_startup_trace(worker_directory: str | None, stage: str) -> None:
+    """Write opt-in worker startup breadcrumbs for the frozen runtime smoke test."""
+    if os.environ.get("FMU_WORKER_STARTUP_TRACE") != "1" or not worker_directory:
+        return
+    try:
+        trace_path = Path(worker_directory) / ".worker-startup-trace.txt"
+        with trace_path.open("a", encoding="utf-8") as trace_file:
+            trace_file.write(f"{time.monotonic():.6f} pid={os.getpid()} {stage}\n")
+    except OSError:
+        logger.debug("Unable to write FMU worker startup trace", exc_info=True)
+
+
 def _sanitize_worker_environment() -> None:
     for name in list(os.environ):
         upper_name = name.upper()
@@ -987,11 +999,17 @@ def _execute_worker(
     """Worker entry point; imports native FMU code only after OS limits apply."""
     session = None
     try:
+        _write_worker_startup_trace(worker_directory, "worker-entered")
         if expected_parent_pid is not None:
             bind_worker_to_parent(expected_parent_pid)
+            _write_worker_startup_trace(worker_directory, "parent-bound")
         if start_gate is not None:
+            _write_worker_startup_trace(worker_directory, "waiting-for-start-gate")
             start_gate.wait()
+            _write_worker_startup_trace(worker_directory, "start-gate-released")
+        _write_worker_startup_trace(worker_directory, "before-worker-limits")
         apply_worker_limits(resource_policy, worker_directory, fmu_path, access_key)
+        _write_worker_startup_trace(worker_directory, "worker-limits-applied")
         _sanitize_worker_environment()
         if worker_directory:
             os.chdir(worker_directory)
@@ -1000,7 +1018,9 @@ def _execute_worker(
             os.environ["TMPDIR"] = worker_directory
             config.TEMP_DIR = Path(worker_directory)
 
+        _write_worker_startup_trace(worker_directory, "before-engine-import")
         from .engine import FmuSession
+        _write_worker_startup_trace(worker_directory, "engine-imported")
 
         session = FmuSession(
             f"worker_{mp.current_process().pid}",
@@ -1008,12 +1028,15 @@ def _execute_worker(
             access_key=access_key,
             fmu_sha256=fmu_sha256,
         )
+        _write_worker_startup_trace(worker_directory, "session-created")
         if resource_policy is not None:
             session._max_simulation_steps = min(
                 config.MAX_SIMULATION_STEPS,
                 int(resource_policy.get("maxSteps", config.MAX_SIMULATION_STEPS)),
             )
+        _write_worker_startup_trace(worker_directory, "before-fmu-load")
         model_metadata = session.load()
+        _write_worker_startup_trace(worker_directory, "fmu-loaded")
         time_options = resolve_simulation_time_options(model_metadata, options)
         start = float(time_options["startTime"])
         stop = float(time_options["stopTime"])
@@ -1022,6 +1045,7 @@ def _execute_worker(
             session.initialize(start_time=start, stop_time=stop, step_size=step_value)
             output_queue.put({"kind": "result", "payload": {"type": "fmu.probe", "success": True}})
             return
+        _write_worker_startup_trace(worker_directory, "before-fmu-initialize")
         session.initialize(
             start_time=start,
             stop_time=stop,
@@ -1029,6 +1053,7 @@ def _execute_worker(
             parameters=parameters or None,
             early_return_allowed=options.get("earlyReturnAllowed", True),
         )
+        _write_worker_startup_trace(worker_directory, "fmu-initialized")
         if checkpoint_snapshot is not None:
             if not checkpoint_state_path:
                 raise ValueError("FMU state checkpoint data is unavailable")
@@ -1205,7 +1230,9 @@ def _execute_worker(
                     "finishReason": session._finished_reason,
                 }
             else:
+                _write_worker_startup_trace(worker_directory, "before-simulation")
                 result = session.run_until(stop, step_size=step_value)
+                _write_worker_startup_trace(worker_directory, "simulation-completed")
             outputs = session.get_outputs()
             selected_outputs = select_outputs(outputs.get("outputs", {}))
             payload = {
@@ -1391,6 +1418,19 @@ def run(
                 )
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                if os.environ.get("FMU_WORKER_STARTUP_TRACE") == "1":
+                    trace_path = worker_directory / ".worker-startup-trace.txt"
+                    try:
+                        startup_trace = trace_path.read_text(encoding="utf-8").strip()
+                    except OSError as exc:
+                        startup_trace = f"<unavailable: {type(exc).__name__}>"
+                    logger.error(
+                        "FMU worker timed out (pid=%s, alive=%s, exitcode=%s, startup_trace=%s)",
+                        process.pid,
+                        process.is_alive(),
+                        process.exitcode,
+                        startup_trace or "<empty>",
+                    )
                 terminate_worker(process, job)
                 job = None
                 raise ProcessExecutionError(
@@ -1493,6 +1533,19 @@ def stream(
                 break
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                if os.environ.get("FMU_WORKER_STARTUP_TRACE") == "1":
+                    trace_path = worker_directory / ".worker-startup-trace.txt"
+                    try:
+                        startup_trace = trace_path.read_text(encoding="utf-8").strip()
+                    except OSError as exc:
+                        startup_trace = f"<unavailable: {type(exc).__name__}>"
+                    logger.error(
+                        "FMU worker timed out (pid=%s, alive=%s, exitcode=%s, startup_trace=%s)",
+                        process.pid,
+                        process.is_alive(),
+                        process.exitcode,
+                        startup_trace or "<empty>",
+                    )
                 terminate_worker(process, job)
                 job = None
                 yield {

@@ -15,6 +15,20 @@ from app import process_runner
 from tests.fmu_fixture import write_test_fmu
 
 
+def test_worker_startup_trace_is_opt_in(monkeypatch, tmp_path):
+    worker_directory = tmp_path / "worker_trace"
+    worker_directory.mkdir()
+    trace_path = worker_directory / ".worker-startup-trace.txt"
+    monkeypatch.delenv("FMU_WORKER_STARTUP_TRACE", raising=False)
+
+    process_runner._write_worker_startup_trace(str(worker_directory), "ignored")
+    assert not trace_path.exists()
+
+    monkeypatch.setenv("FMU_WORKER_STARTUP_TRACE", "1")
+    process_runner._write_worker_startup_trace(str(worker_directory), "worker-entered")
+    assert "worker-entered" in trace_path.read_text(encoding="utf-8")
+
+
 def test_realtime_model_description_is_cached_for_the_immutable_session():
     session = process_runner.RealtimeSession.__new__(process_runner.RealtimeSession)
     session._rpc = Mock(return_value={"modelName": "snapshot", "modelVariables": []})
