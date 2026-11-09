@@ -854,7 +854,7 @@ class TestSessionAttach:
 
     def test_attach_after_station_websocket_disconnect_preserves_session(self, client, _isolate_config):
         """A new Station WebSocket can reattach to the existing FMU state."""
-        from app import engine, session_registry
+        from app import session_registry
 
         with _mock_fmu_patches(_isolate_config):
             gateway_context = {
@@ -899,7 +899,7 @@ class TestSessionAttach:
 
     def test_attach_after_disconnect_rejects_different_reservation_context(self, client, _isolate_config):
         """Reattach must retain the original reservation binding."""
-        from app import engine, session_registry
+        from app import session_registry
 
         with _mock_fmu_patches(_isolate_config):
             original_context = {
@@ -940,7 +940,7 @@ class TestSessionAttach:
 
     def test_detached_session_is_removed_after_attach_grace(self, client, _isolate_config, monkeypatch):
         """A disconnected session must not consume capacity indefinitely."""
-        from app import config, engine, session_registry
+        from app import config, session_registry
 
         monkeypatch.setattr(config, "FMU_ATTACH_GRACE_SECONDS", 0)
         with _mock_fmu_patches(_isolate_config):

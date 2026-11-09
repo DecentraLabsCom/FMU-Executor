@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import zipfile
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import zipfile
-from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest

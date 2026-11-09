@@ -34,13 +34,16 @@ jobs:
           cache-dependency-path: pyproject.toml
 
       - name: Install package and test dependencies
-        run: python -m pip install --editable ".[test]"
+        run: python -m pip install --editable ".[test,lint]"
+
+      - name: Check unused Python imports and local variables
+        run: python -m ruff check .
 
       - name: Run tests with coverage baseline
         # v0.3.6 Actions measured 60.71%; local Python 3.13 measured 60.50%.
         # Keep a cross-environment regression margin until coverage improves.
         run: >-
-          python -m pytest tests -q
+          python -m pytest tests examples/smart-warehouse-cell/test_archive_utils.py -q
           --cov=app
           --cov-report=term-missing
           --cov-report=xml

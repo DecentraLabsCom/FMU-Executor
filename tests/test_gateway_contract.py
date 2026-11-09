@@ -45,7 +45,7 @@ def _isolate_config(tmp_path: Path):
         import importlib
         from app import config as cfg
         importlib.reload(cfg)
-        from app import engine, process_runner
+        from app import engine
 
         def in_process_test_session(*args, resource_policy=None, **kwargs):
             return engine.FmuSession(*args, **kwargs)
@@ -598,7 +598,7 @@ class TestWsSimOutputsContract:
 
     def test_get_outputs_reports_missing_model_description(self, client, _isolate_config):
         """A selected-output request must report an unloaded model explicitly."""
-        from app import engine, session_registry
+        from app import session_registry
 
         _provision_fmu(_isolate_config)
         md = _make_mock_md()

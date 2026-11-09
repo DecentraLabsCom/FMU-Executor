@@ -50,9 +50,14 @@ are described in the [Gateway FMI/FMU guide](https://github.com/DecentraLabsCom/
 From the repository root:
 
 ```bash
-python -m pip install pytest httpx
-python -m pytest tests/ -v
+python -m pip install --editable ".[test,lint]"
+python -m ruff check .
+python -m pytest tests examples/smart-warehouse-cell/test_archive_utils.py -v
 ```
+
+Build the Python source distribution and wheel with `python -m pip install build`
+followed by `python -m build`. Station releases create and verify their pinned
+Git source archives in the owning Windows/Linux Station packaging workflows.
 
 ## Releases
 

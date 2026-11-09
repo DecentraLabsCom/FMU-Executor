@@ -318,7 +318,7 @@ function orientDirectionalLightsForGltf(scene, THREE) {
   }
 }
 
-export function attachScenePresentation(scene, presentation, THREE) {
+export function attachScenePresentation(scene, presentation, _THREE) {
   const normalized = normalizeScenePresentation(presentation)
   if (!normalized) throw new TypeError('A valid version 1 scene presentation is required')
   if (!scene || typeof scene !== 'object') throw new TypeError('A Three.js scene is required')
@@ -389,7 +389,7 @@ function assertNoSceneOverlays(surfaceElement) {
   if (marked.length > 0) throw new TypeError('DOM effects over the Three.js canvas are outside GLB scene presentation; remove them before export')
 }
 
-function cameraTarget(camera, controls, explicitTarget, existingCamera) {
+function cameraTarget(controls, explicitTarget, existingCamera) {
   const controlsTarget = vectorArray(controls?.target)
   const requestedTarget = vectorArray(explicitTarget)
   const profileTarget = vectorArray(existingCamera?.target)
@@ -415,7 +415,7 @@ export function captureScenePresentation(THREE, {
   assertNoSceneOverlays(surfaceElement)
   const existing = readScenePresentation(scene)
   const worldPosition = camera.getWorldPosition?.(new THREE.Vector3()) || camera.position
-  const capturedTarget = cameraTarget(camera, controls, target, existing?.camera)
+  const capturedTarget = cameraTarget(controls, target, existing?.camera)
   const cameraState = {
     projection: 'perspective',
     position: vectorArray(worldPosition),

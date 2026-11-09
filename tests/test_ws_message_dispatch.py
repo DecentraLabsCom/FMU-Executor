@@ -8,7 +8,7 @@ from unittest.mock import Mock
 import pytest
 from fastapi import HTTPException
 
-from app import engine, main, process_runner, session_registry
+from app import main, process_runner, session_registry
 
 
 class Session:

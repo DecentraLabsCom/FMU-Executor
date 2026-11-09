@@ -1023,7 +1023,7 @@ def test_terminated_realtime_session_remains_non_attachable():
 def test_registry_releases_crashed_worker_even_while_client_is_attached(monkeypatch):
     from unittest.mock import Mock
 
-    from app import engine, session_registry
+    from app import session_registry
 
     dead_session = SimpleNamespace(
         _terminated=True,

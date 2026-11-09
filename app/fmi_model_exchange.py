@@ -263,12 +263,6 @@ class FmiModelExchangeIntegrator:
         if self._clock_runtime is not None:
             self._clock_runtime.restore_snapshot(metadata["clockRuntime"], simulation_time)
 
-    def reset_after_restore(self, time: float) -> None:
-        if self._solver is None:
-            raise RuntimeError("Model Exchange integrator is closed")
-        self._fmu.setTime(time)
-        self._solver.reset(time)
-
     def close(self) -> None:
         self._solver = None
 

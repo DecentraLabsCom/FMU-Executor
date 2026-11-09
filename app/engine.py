@@ -40,7 +40,7 @@ from .fmi3_model_exchange import instantiate_fmi3_model_exchange
 from .fmi_ls_dae import Fmi3DaeIntegrator, FmiLsDaeDefinition, read_fmi_ls_dae
 from .fmi_model_exchange import FmiModelExchangeIntegrator
 from .fmu_metadata import describe_model_description
-from .simulation_defaults import DEFAULT_STEP_SIZE, resolve_simulation_time_options
+from .simulation_defaults import resolve_simulation_time_options
 
 logger = logging.getLogger(__name__)
 

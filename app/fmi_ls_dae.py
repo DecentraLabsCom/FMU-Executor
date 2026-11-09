@@ -88,10 +88,6 @@ class FmiLsDaeDefinition:
             if entry.kind == "ClockedState"
         )
 
-    @property
-    def residual_model_structure(self) -> tuple[FmiLsDaeModelStructureEntry, ...]:
-        return tuple(entry for entry in self.model_structure if entry.kind == "Residual")
-
     def describe(self) -> dict[str, Any]:
         return {
             "manifestName": MANIFEST_NAME,
@@ -792,7 +788,6 @@ class Fmi3DaeIntegrator:
         self._idas = idas
         self._fmu = fmu
         self._model_description = model_description
-        self._definition = definition
         self._initial_unknown_values = dict(initial_unknown_values or {})
         declared_initial_unknowns = set(definition.initial_unknown_value_references)
         if set(self._initial_unknown_values) - declared_initial_unknowns:
@@ -943,7 +938,6 @@ class Fmi3DaeIntegrator:
         self._output_derivative_vector = None
         self._id_vector = None
         self._linear_solver = None
-        self._matrix = None
         try:
             if not restoring_state:
                 self._initialize_event_mode(float(start_time))
