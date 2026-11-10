@@ -923,7 +923,7 @@ class Fmi3DaeIntegrator:
             if isinstance(relative_tolerance, (int, float))
             and not isinstance(relative_tolerance, bool)
             and math.isfinite(float(relative_tolerance))
-            and 1e-12 <= float(relative_tolerance) <= 1e-2
+            and float(relative_tolerance) > 0
             else 1e-6
         )
         self._absolute_tolerance = max(1e-12, self._relative_tolerance * 1e-3)

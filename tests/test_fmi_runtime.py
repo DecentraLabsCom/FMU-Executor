@@ -60,11 +60,12 @@ def test_fmi3_cosimulation_uses_generic_instantiation_and_arrays(tmp_path: Path)
             start_time=0.0,
             stop_time=2.0,
             step_size=0.1,
+            tolerance=1e-8,
             parameters={"vectorInput": [1, 2]},
         )
 
     instantiate.assert_called_once_with(tmp_path, model, early_return_allowed=False, event_mode_used=False)
-    fmu.enterInitializationMode.assert_called_once_with(startTime=0.0, stopTime=2.0)
+    fmu.enterInitializationMode.assert_called_once_with(startTime=0.0, stopTime=2.0, tolerance=1e-8)
     fmu.setFloat32.assert_called_once_with([1], [1.0, 2.0])
     assert result["state"] == "initialized"
 
@@ -129,6 +130,31 @@ def test_fmi_session_lifecycle_supports_pause_resume_and_reset(tmp_path: Path):
     assert instantiate.call_count == 2
     assert session._time == 0.0
     assert session.state == "initialized"
+
+
+def test_fmi2_cosimulation_passes_declared_default_experiment_tolerance(tmp_path: Path):
+    from types import SimpleNamespace
+
+    from app import engine
+
+    model = MagicMock()
+    model.fmiVersion = "2.0"
+    model.guid = "{fmi2-tolerance-guid}"
+    model.coSimulation = MagicMock(modelIdentifier="Fmi2Model")
+    model.defaultExperiment = SimpleNamespace(tolerance=1e-6)
+    model.modelVariables = []
+    model.modelExchange = None
+    fmu = MagicMock()
+    session = engine.FmuSession("fmi2-tolerance-test", tmp_path / "model.fmu")
+    session._extract_dir = tmp_path
+    session._md = model
+    session._execution_interface = "CoSimulation"
+
+    with patch.object(session, "_available_execution_interfaces", return_value=["CoSimulation"]), \
+            patch("app.engine.fmpy_instantiate_fmu", return_value=fmu):
+        session.initialize(stop_time=1.0, step_size=0.1, tolerance=1e-8)
+
+    fmu.setupExperiment.assert_called_once_with(startTime=0.0, stopTime=1.0, tolerance=1e-8)
 
 
 def test_array_inputs_require_the_declared_flat_size(tmp_path: Path):

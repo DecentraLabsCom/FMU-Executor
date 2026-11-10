@@ -1252,6 +1252,7 @@ async def run_simulation(body: SimulationBody):
             start_time=start,
             stop_time=stop,
             step_size=step,
+            tolerance=evidence_options.get("tolerance"),
             parameters=body.parameters or None,
             early_return_allowed=body.options.get("earlyReturnAllowed", False),
         )
@@ -1546,6 +1547,7 @@ async def stream_simulation(body: SimulationBody):
                     start_time=start,
                     stop_time=stop,
                     step_size=step,
+                    tolerance=evidence_options.get("tolerance"),
                     parameters=body.parameters or None,
                     early_return_allowed=body.options.get("earlyReturnAllowed", False),
                 )

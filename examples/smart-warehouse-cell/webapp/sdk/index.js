@@ -1,4 +1,6 @@
 // Host integration v2 carries authorization and optional FMI-LS controls.
+export { createFmiDependencyMetadata, getDependentOutputRecommendations } from './model-structure.js'
+export { resolveEffectiveTolerance } from './simulation-options.js'
 export const DIGITAL_TWIN_PROTOCOL_VERSION = 2
 export const DIGITAL_TWIN_APP_ASSET_FILENAME = 'index.js'
 export const MAX_RUN_PARAMETERS = 256
@@ -62,7 +64,11 @@ const text = (v, max = 128) => typeof v === 'string' && v.length > 0 && v.length
 export const isValidProtocolId = (v) => text(v) && /^[a-zA-Z0-9][a-zA-Z0-9._:-]*$/.test(v)
 export const isProtocolEnvelope = (v) => isRecord(v) && v.version === DIGITAL_TWIN_PROTOCOL_VERSION && typeof v.type === 'string'
 export const isFiniteScalar = (v) => typeof v === 'boolean' || (typeof v === 'number' && Number.isFinite(v)) || (typeof v === 'string' && v.length <= 1024)
-export const isValidOptions = (v) => isRecord(v) && Object.entries(v).every(([key, value]) => ['startTime', 'stopTime', 'stepSize'].includes(key) && typeof value === 'number' && Number.isFinite(value))
+export const isValidOptions = (v) => isRecord(v) && Object.entries(v).every(([key, value]) => (
+  ['startTime', 'stopTime', 'stepSize', 'tolerance'].includes(key)
+  && typeof value === 'number' && Number.isFinite(value)
+  && (key !== 'tolerance' || value > 0)
+))
 export const isValidParameters = (v) => isRecord(v) && Object.keys(v).length <= MAX_RUN_PARAMETERS && Object.entries(v).every(([key, value]) => text(key, 256) && isFiniteScalar(value))
 export const isValidInputSchedule = (v) => Array.isArray(v) && v.length <= 128 && v.every((event) => isRecord(event) && keys(event, ['time', 'values']) && Number.isFinite(event.time) && isValidParameters(event.values))
 export function isValidFmuStateCheckpoint(v) {
@@ -112,6 +118,32 @@ export function isValidAppReadyMessage(v) {
     && (v.defaultExecutionPace === undefined || (['fastest', 'realtime'].includes(v.defaultExecutionPace) && capabilities.includes(DIGITAL_TWIN_CAPABILITY.EXECUTION_PACE)))
     && (v.playbackControlPosition === undefined || ['top-left', 'top-right', 'bottom-left', 'bottom-right'].includes(v.playbackControlPosition))
 }
+function isValidFmiModelMetadata(v) {
+  if (!isRecord(v) || !keys(v, ['modelVariables', 'modelStructure'])
+    || !Array.isArray(v.modelVariables) || v.modelVariables.length > 4096
+    || !isRecord(v.modelStructure) || !keys(v.modelStructure, ['outputs'])
+    || !Array.isArray(v.modelStructure.outputs) || v.modelStructure.outputs.length > 4096) return false
+  const variableNames = new Map()
+  for (const variable of v.modelVariables) {
+    if (!isRecord(variable)
+      || !keys(variable, ['name', 'causality', 'type', 'variability', 'description', 'quantity', 'unit', 'displayUnit'])
+      || !text(variable.name, 512) || !['input', 'output'].includes(variable.causality)) return false
+    for (const [field, limit] of Object.entries({ type: 64, variability: 32, description: 512, quantity: 256, unit: 128, displayUnit: 128 })) {
+      if (variable[field] !== undefined && !text(variable[field], limit)) return false
+    }
+    variableNames.set(variable.name, variable.causality)
+  }
+  let dependencyCount = 0
+  for (const output of v.modelStructure.outputs) {
+    if (!isRecord(output) || !keys(output, ['name', 'dependencyNames'])
+      || variableNames.get(output.name) !== 'output' || !Array.isArray(output.dependencyNames)
+      || output.dependencyNames.length > 256 || !output.dependencyNames.length
+      || !output.dependencyNames.every((name) => variableNames.get(name) === 'input')) return false
+    dependencyCount += output.dependencyNames.length
+    if (dependencyCount > 8192) return false
+  }
+  try { return new TextEncoder().encode(JSON.stringify(v)).length <= 8 * 1024 * 1024 } catch { return false }
+}
 export const isValidAppErrorMessage = (v) => isProtocolEnvelope(v) && v.type === DIGITAL_TWIN_MESSAGE.APP_ERROR && keys(v, ['type', 'version', 'code']) && (v.code === undefined || text(v.code))
 export function isValidAppMessage(v) {
   if (!isProtocolEnvelope(v)) return false
@@ -149,7 +181,9 @@ export function isValidHostMessage(v) {
   if (!isProtocolEnvelope(v)) return false
   switch (v.type) {
     case DIGITAL_TWIN_MESSAGE.HOST_READY:
-      return keys(v, ['type', 'version', 'extensions']) && (v.extensions === undefined || (isRecord(v.extensions) && Object.keys(v.extensions).length <= 32))
+      return keys(v, ['type', 'version', 'extensions']) && (v.extensions === undefined || (isRecord(v.extensions)
+        && Object.keys(v.extensions).length <= 32
+        && (v.extensions.fmiModelMetadata === undefined || isValidFmiModelMetadata(v.extensions.fmiModelMetadata))))
     case DIGITAL_TWIN_MESSAGE.CONNECTION_READY:
       return keys(v, ['type', 'version', 'requestId', 'transport', 'connection', 'inputSchedule', 'executionPace', 'defaultStartTime', 'defaultStepSize', 'captureFmuStateAvailable'])
         && isValidProtocolId(v.requestId)
@@ -197,10 +231,11 @@ export function isValidBatchSimulationBody(v) {
     && keys(v, ['parameters', 'options', 'inputSchedule', 'checkpoint', 'captureFmuState'])
     && isValidParameters(v.parameters)
     && isRecord(v.options)
-    && keys(v.options, ['startTime', 'stopTime', 'stepSize'])
+    && keys(v.options, ['startTime', 'stopTime', 'stepSize', 'tolerance'])
     && Number.isFinite(v.options.startTime) && Number.isFinite(v.options.stopTime)
     && v.options.stopTime > v.options.startTime
     && Number.isFinite(v.options.stepSize) && v.options.stepSize > 0
+    && (v.options.tolerance === undefined || (Number.isFinite(v.options.tolerance) && v.options.tolerance > 0))
     && (v.inputSchedule === undefined || isValidInputSchedule(v.inputSchedule))
     && (v.checkpoint === undefined || isValidFmuStateCheckpoint(v.checkpoint))
     && (v.captureFmuState === undefined || typeof v.captureFmuState === 'boolean')

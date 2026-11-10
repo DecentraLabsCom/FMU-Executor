@@ -206,6 +206,8 @@ async def _handle_sim_initialize(
             "playback_speed": playback_speed,
             "early_return_allowed": early_return_allowed,
         }
+        if "tolerance" in time_options:
+            initialization_options["tolerance"] = time_options["tolerance"]
         if execution_interface is not None:
             initialization_options["execution_interface"] = execution_interface
         initialization_options["external_solver"] = external_solver

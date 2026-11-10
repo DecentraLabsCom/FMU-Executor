@@ -347,7 +347,17 @@ def test_run_route_executes_in_process_mode(route_client, monkeypatch, tmp_path)
     assert response.json()["type"] == "sim.result"
     assert response.json()["outputs"] == {"result": 12}
     assert response.json()["evidence"]["options"]["earlyReturnAllowed"] is False
-    assert slot.calls[:2] == [("load",), ("initialize", {"start_time": 0.2, "stop_time": 2.0, "step_size": 0.1, "parameters": {"input": 4}, "early_return_allowed": False})]
+    assert slot.calls[:2] == [
+        ("load",),
+        ("initialize", {
+            "start_time": 0.2,
+            "stop_time": 2.0,
+            "step_size": 0.1,
+            "tolerance": None,
+            "parameters": {"input": 4},
+            "early_return_allowed": False,
+        }),
+    ]
     assert slot.calls[-1] == ("terminate",)
     released.assert_called_once_with(capacity)
 

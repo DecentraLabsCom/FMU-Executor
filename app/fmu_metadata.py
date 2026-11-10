@@ -323,8 +323,10 @@ def describe_model_description(
     }
     if me is not None:
         result["numberOfContinuousStates"] = int(getattr(md, "numberOfContinuousStates", 0) or 0)
+    if cs is not None or me is not None:
         result["numberOfEventIndicators"] = int(getattr(md, "numberOfEventIndicators", 0) or 0)
         result["modelStructure"] = model_structure
+    if me is not None:
         if model_exchange_capabilities:
             result["modelExchangeCapabilities"] = model_exchange_capabilities
     if execution_interface in {"CoSimulation", "ModelExchange"}:

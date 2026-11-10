@@ -6,10 +6,12 @@ def test_resolves_fmu_defaults_before_executor_fallbacks():
         "defaultStartTime": 2.0,
         "defaultStopTime": 12.0,
         "defaultStepSize": 0.5,
+        "defaultTolerance": 1e-6,
     }) == {
         "startTime": 2.0,
         "stopTime": 12.0,
         "stepSize": 0.5,
+        "tolerance": 1e-6,
     }
 
 
@@ -32,6 +34,14 @@ def test_fills_missing_or_invalid_defaults_from_executor_contract():
 
 def test_explicit_request_values_override_fmu_defaults():
     assert resolve_simulation_time_options(
-        {"defaultStartTime": 2.0, "defaultStopTime": 12.0, "defaultStepSize": 0.5},
-        {"startTime": 0.0, "stopTime": 5.0, "stepSize": 0.25},
-    ) == {"startTime": 0.0, "stopTime": 5.0, "stepSize": 0.25}
+        {"defaultStartTime": 2.0, "defaultStopTime": 12.0, "defaultStepSize": 0.5, "defaultTolerance": 1e-6},
+        {"startTime": 0.0, "stopTime": 5.0, "stepSize": 0.25, "tolerance": 1e-8},
+    ) == {"startTime": 0.0, "stopTime": 5.0, "stepSize": 0.25, "tolerance": 1e-8}
+
+
+def test_rejects_invalid_experiment_tolerance():
+    import pytest
+
+    for tolerance in (0, -1, float("inf"), True, "invalid"):
+        with pytest.raises(ValueError, match="tolerance"):
+            resolve_simulation_time_options({}, {"tolerance": tolerance})

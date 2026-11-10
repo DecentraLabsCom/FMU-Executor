@@ -56,6 +56,16 @@ def resolve_simulation_time_options(
         name: requested[name] if name in requested and requested[name] is not None else default
         for name, default in defaults.items()
     }
+    requested_tolerance = requested.get("tolerance")
+    if "tolerance" in requested and requested_tolerance is not None:
+        tolerance = _finite_number(requested_tolerance)
+        if tolerance is None or tolerance <= 0:
+            raise ValueError("tolerance must be finite and positive")
+        resolved["tolerance"] = tolerance
+    else:
+        default_tolerance = _finite_number(metadata.get("defaultTolerance"))
+        if default_tolerance is not None and default_tolerance > 0:
+            resolved["tolerance"] = default_tolerance
     if allow_undefined_stop:
         if "stopTime" not in requested or requested.get("stopTime") is None:
             resolved["stopTime"] = None

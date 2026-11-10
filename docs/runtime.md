@@ -266,11 +266,11 @@ same probe discovers local FMI-LS-REF `Related` resources with role
 `experiment` or `experiment/smoke-test` and media type
 `application/x-ma-hs-experiments`, then runs up to eight supported experiments
 in isolated workers. The current subset accepts local SSP parameter sets,
-experiment time options, and local `text/csv` stimuli with a `time` column plus
+experiment time options including positive solver tolerances, and local `text/csv` stimuli with a `time` column plus
 numeric FMU input columns. Stimulus rows must start at `startTime`, increase
 strictly, align with `stepSize`, and fit the 128-event schedule limit; each row
-is applied as a runtime input change at its timestamp. Reference time series,
-solver tolerances or other unsupported features are reported as skipped in
+is applied as a runtime input change at its timestamp. Reference time series
+or other unsupported features are reported as skipped in
 `fmiLsExperiments`; they are never reported as passed. A failed supported
 smoke experiment fails the probe. The XML format is the current
 [MA-HS Experiments specification](https://modelica.github.io/ma-hs-experiments/main/).

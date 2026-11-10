@@ -1068,18 +1068,32 @@ def _execute_worker(
         start = float(time_options["startTime"])
         stop = float(time_options["stopTime"])
         step_value = float(time_options["stepSize"])
+        raw_tolerance = time_options.get("tolerance")
+        tolerance = (
+            float(raw_tolerance)
+            if isinstance(raw_tolerance, (int, float)) and not isinstance(raw_tolerance, bool)
+            else None
+        )
         if probe_only:
-            session.initialize(start_time=start, stop_time=stop, step_size=step_value)
+            session.initialize(
+                start_time=start,
+                stop_time=stop,
+                step_size=step_value,
+                tolerance=tolerance,
+            )
             output_queue.put({"kind": "result", "payload": {"type": "fmu.probe", "success": True}})
             return
         _write_worker_startup_trace(worker_directory, "before-fmu-initialize")
-        session.initialize(
-            start_time=start,
-            stop_time=stop,
-            step_size=step_value,
-            parameters=parameters or None,
-            early_return_allowed=options.get("earlyReturnAllowed", True),
-        )
+        initialization_options = {
+            "start_time": start,
+            "stop_time": stop,
+            "step_size": step_value,
+            "parameters": parameters or None,
+            "early_return_allowed": options.get("earlyReturnAllowed", True),
+        }
+        if "tolerance" in time_options:
+            initialization_options["tolerance"] = tolerance
+        session.initialize(**initialization_options)
         _write_worker_startup_trace(worker_directory, "fmu-initialized")
         if checkpoint_snapshot is not None:
             if not checkpoint_state_path:

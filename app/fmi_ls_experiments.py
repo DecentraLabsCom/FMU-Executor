@@ -41,8 +41,8 @@ def read_fmi_ls_ref_experiments(
     """Discover REF experiments and bounded local CSV stimuli.
 
     Only MA-HS-Experiments declarations, SSP parameter sets, and local
-    time/value CSV stimuli are interpreted. References and solver tolerances
-    remain unsupported; external URIs are never opened.
+    time/value CSV stimuli are interpreted. References remain unsupported;
+    external URIs are never opened.
     """
     try:
         with zipfile.ZipFile(fmu_path) as archive:
@@ -215,8 +215,8 @@ def _parse_experiment(
         if not math.isfinite(value):
             case["reason"] = "invalid_experiment_time_option"
             return case
-        if field == "stepSize" and value <= 0:
-            case["reason"] = "invalid_experiment_step_size"
+        if field in {"stepSize", "tolerance"} and value <= 0:
+            case["reason"] = "invalid_experiment_step_size" if field == "stepSize" else "invalid_experiment_tolerance"
             return case
         case["options"][field] = value
 
@@ -237,10 +237,6 @@ def _parse_experiment(
             return case
         children[local_name] = child
 
-    if "tolerance" in case["options"]:
-        case["status"] = "unsupported"
-        case["reason"] = "solver_tolerance_not_supported"
-        return case
     if "References" in children:
         case["status"] = "unsupported"
         case["reason"] = "reference_results_not_supported"

@@ -190,6 +190,7 @@ class FmuSession:
         self._use_dae = False
         self._time: float = 0.0
         self._step_size: float = 0.001
+        self._relative_tolerance: float | None = None
         self._start_time: float = 0.0
         self._stop_time: float | None = None
         self._initial_parameters: dict[str, Any] = {}
@@ -259,6 +260,7 @@ class FmuSession:
         execution_interface: str | None = None,
         external_solver: bool = False,
         defer_initialization_exit: bool = False,
+        tolerance: float | None = None,
     ) -> dict[str, Any]:
         if self._initialised:
             raise RuntimeError("Session already initialised")
@@ -300,6 +302,19 @@ class FmuSession:
         self._use_dae = False
 
         default_experiment = self._md.defaultExperiment
+        requested_tolerance = tolerance
+        if requested_tolerance is None:
+            declared_tolerance = getattr(default_experiment, "tolerance", None)
+            if isinstance(declared_tolerance, (int, float)) and not isinstance(declared_tolerance, bool):
+                requested_tolerance = declared_tolerance
+        self._relative_tolerance = None
+        if requested_tolerance is not None:
+            if isinstance(requested_tolerance, bool) or not isinstance(requested_tolerance, (int, float)):
+                raise ValueError("tolerance must be finite and positive")
+            parsed_tolerance = float(requested_tolerance)
+            if not math.isfinite(parsed_tolerance) or parsed_tolerance <= 0:
+                raise ValueError("tolerance must be finite and positive")
+            self._relative_tolerance = parsed_tolerance
         default_step_size = getattr(default_experiment, "stepSize", None)
         self._step_size = step_size if step_size is not None else resolve_simulation_time_options(
             {"defaultStepSize": default_step_size},
@@ -396,15 +411,21 @@ class FmuSession:
                 slave.exitConfigurationMode()
             if pre_initialization_values:
                 self._apply_validated_values(pre_initialization_values)
-            slave.enterInitializationMode(
-                startTime=self._start_time,
-                stopTime=self._stop_time,
-            )
+            initialization_options = {
+                "startTime": self._start_time,
+                "stopTime": self._stop_time,
+            }
+            if self._relative_tolerance is not None:
+                initialization_options["tolerance"] = self._relative_tolerance
+            slave.enterInitializationMode(**initialization_options)
         else:
-            slave.setupExperiment(
-                startTime=self._start_time,
-                stopTime=self._stop_time,
-            )
+            experiment_options = {
+                "startTime": self._start_time,
+                "stopTime": self._stop_time,
+            }
+            if self._relative_tolerance is not None:
+                experiment_options["tolerance"] = self._relative_tolerance
+            slave.setupExperiment(**experiment_options)
             if pre_initialization_values:
                 self._apply_validated_values(pre_initialization_values)
             slave.enterInitializationMode()
@@ -467,13 +488,12 @@ class FmuSession:
             slave.exitInitializationMode()
             if self._fmi_ls_dae is None:
                 raise RuntimeError("FMI-LS-DAE declarations are unavailable")
-            default_tolerance = getattr(default_experiment, "tolerance", None)
             self._dae_integrator = Fmi3DaeIntegrator(
                 slave,
                 self._fmi_ls_dae,
                 model_description=self._md,
                 start_time=self._start_time,
-                relative_tolerance=default_tolerance,
+                relative_tolerance=self._relative_tolerance,
                 input_clock_references=self._fmi3_input_clock_references,
                 clock_schedules=self._fmi3_clock_schedules,
                 initial_input_clock_references=initial_clock_references,
@@ -488,7 +508,7 @@ class FmuSession:
                 self._md,
                 start_time=self._start_time,
                 max_step=self._step_size,
-                relative_tolerance=getattr(default_experiment, "tolerance", None),
+                relative_tolerance=self._relative_tolerance,
                 clock_runtime=self._fmi3_clock_runtime,
                 initial_input_clock_references=initial_clock_references,
             )
@@ -1108,7 +1128,6 @@ class FmuSession:
                     self._me_integrator = None
                 self._fmi3_clock_runtime = None
 
-                default_tolerance = getattr(getattr(self._md, "defaultExperiment", None), "tolerance", None)
                 if target_dae_mode:
                     if definition is None:
                         raise ValueError("DAE mode is enabled but the FMI-LS-DAE manifest is unavailable")
@@ -1117,7 +1136,7 @@ class FmuSession:
                         definition,
                         model_description=self._md,
                         start_time=self._time,
-                        relative_tolerance=default_tolerance,
+                        relative_tolerance=self._relative_tolerance,
                         input_clock_references=self._fmi3_input_clock_references,
                         clock_schedules=self._fmi3_clock_schedules,
                         initial_clocked_outputs=initial_clocked_outputs,
@@ -1130,7 +1149,7 @@ class FmuSession:
                         self._md,
                         start_time=self._time,
                         max_step=self._step_size,
-                        relative_tolerance=default_tolerance,
+                        relative_tolerance=self._relative_tolerance,
                         clock_runtime=self._fmi3_clock_runtime,
                     )
                     self._collect_me_event_outputs()
@@ -1473,7 +1492,7 @@ class FmuSession:
                     dae_definition,
                     model_description=model_description,
                     start_time=self._time,
-                    relative_tolerance=getattr(getattr(self._md, "defaultExperiment", None), "tolerance", None),
+                    relative_tolerance=self._relative_tolerance,
                     input_clock_references=self._fmi3_input_clock_references,
                     clock_schedules=self._fmi3_clock_schedules,
                     initial_clocked_outputs=clocked_outputs,
@@ -1492,7 +1511,7 @@ class FmuSession:
                     self._md,
                     start_time=self._time,
                     max_step=self._step_size,
-                    relative_tolerance=getattr(getattr(self._md, "defaultExperiment", None), "tolerance", None),
+                    relative_tolerance=self._relative_tolerance,
                     clock_runtime=self._fmi3_clock_runtime,
                     restoring_state=True,
                 )
@@ -2104,6 +2123,7 @@ class FmuSession:
             execution_interface=self._execution_interface,
             external_solver=self._external_solver,
             defer_initialization_exit=self._defer_initialization_exit,
+            tolerance=self._relative_tolerance,
         )
 
     @property

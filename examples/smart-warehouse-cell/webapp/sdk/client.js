@@ -783,6 +783,7 @@ export function createDigitalTwinAppClient({
       startTime,
       ...(stopTime === undefined ? {} : { stopTime }),
       stepSize,
+      ...(options.tolerance === undefined ? {} : { tolerance: options.tolerance }),
     }
     if (!isValidOptions(resolvedOptions) || !Number.isFinite(stopTime)
       || stopTime <= startTime || stepSize <= 0) {
@@ -1003,6 +1004,7 @@ export function createDigitalTwinAppClient({
         startTime: options.startTime ?? model.defaultStartTime ?? 0,
         ...(options.stopTime !== undefined ? { stopTime: options.stopTime } : {}),
         stepSize: options.stepSize ?? model.defaultStepSize ?? 0.001,
+        ...(options.tolerance === undefined ? {} : { tolerance: options.tolerance }),
       }
       const { startTime, stopTime, stepSize } = current.options
       if (!isValidOptions(current.options) || (stopTime !== undefined && stopTime <= startTime) || stepSize <= 0) throw errorWithCode('Invalid simulation interval.', 'INVALID_RUN_REQUEST')
