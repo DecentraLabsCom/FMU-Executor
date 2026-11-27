@@ -144,8 +144,10 @@ Mode is expected to handle its events internally. For FMI 3 Model Exchange,
 the Executor handles FMI 3 Event Mode as required by the integration algorithm.
 In both interfaces, FMI 3 time-based input Clocks are scheduled from their
 declared or FMU-provided intervals, and output Clocks and clocked values are
-read only while valid in Event Mode. Scheduled Execution is a separate FMI
-interface and is not implied by this support. Step responses include the last successful
+read only while valid in Event Mode. Co-Simulation reads non-clocked outputs
+at the current sample time, including after an input event and subsequent
+step. Scheduled Execution is a separate FMI interface and is not implied by
+this support. Step responses include the last successful
 simulation time, early-return and termination flags, and whether an event
 occurred. `sim.advance` returns a bounded set of intermediate samples in one
 request; see the [WebSocket API reference](api.md#realtime-websocket-protocol).

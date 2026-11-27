@@ -2619,13 +2619,8 @@ class FmuSession:
             pending_clocks = due_clocks
             if not needs_update:
                 if not pending_clocks and not time_event_due:
-                    # Output Clocks and their clocked variables can only be
-                    # read while the FMU is still in Event Mode.
-                    event_outputs = self._read_outputs()
-                    self._pending_event_outputs = {
-                        **(self._pending_event_outputs or {}),
-                        **event_outputs,
-                    }
+                    # The clock runtime has captured the active clocked outputs.
+                    # Other outputs are read at the sample time in Step Mode.
                     slave.enterStepMode()
                     self._collect_fmi3_event_outputs()
                     return False

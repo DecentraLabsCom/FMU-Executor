@@ -593,6 +593,40 @@ def test_fmi3_triggered_clock_is_captured_before_step_mode(tmp_path):
     assert calls.index("getClock") < calls.index("enterStepMode")
 
 
+def test_fmi3_advance_reads_continuous_output_after_input_event(tmp_path):
+    session = make_live_session(tmp_path, version="3.0", time_mode="external")
+    _set_model_variables(session, [
+        SimpleNamespace(
+            name="u", type="Float64", causality="input", variability="continuous",
+            valueReference=2, shape=None, dimensions=[], min=None, max=None, declaredType=None,
+        ),
+        SimpleNamespace(
+            name="y", type="Float64", causality="output", variability="continuous",
+            valueReference=3, shape=None, dimensions=[],
+        ),
+    ])
+    session._fmi3_event_mode_used = True
+    slave = _fmu_slave(session)
+    slave.updateDiscreteStates.return_value = (False, False, False, False, False, 0.0)
+    slave.getFloat64.return_value = [0.0]
+
+    def do_step(**_kwargs):
+        slave.getFloat64.return_value = [0.25]
+        return False, False, False, 0.25
+
+    slave.doStep.side_effect = do_step
+
+    result = session.advance(
+        0.25, output_refs=[3], input_schedule=[{"time": 0.0, "values": {"u": 0.5}}],
+    )
+
+    assert result["inputEventsApplied"] == 1
+    assert result["samples"][0]["time"] == 0.25
+    assert result["samples"][0]["outputs"] == {"y": 0.25}
+    slave.enterEventMode.assert_called_once_with()
+    slave.enterStepMode.assert_called_once_with()
+
+
 def test_fmi3_fixed_structural_parameter_controls_initial_array_size(tmp_path):
     session = make_live_session(tmp_path, version="3.0")
     structural_size = SimpleNamespace(
