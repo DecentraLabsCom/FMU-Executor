@@ -9,14 +9,48 @@ permissions:
   contents: read
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install package and test dependencies
+        run: python -m pip install --editable ".[test,lint]"
+
+      - name: Check lint
+        run: python -m ruff check .
+
+      - name: Run tests with coverage baseline
+        run: >-
+          python -m pytest tests examples/smart-warehouse-cell/test_archive_utils.py -q
+          --cov=app
+          --cov-report=term-missing
+          --cov-fail-under=60
+
   publish:
+    needs: test
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
       packages: write
     steps:
       - name: Check out source
         uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - name: Validate release version
         id: version
@@ -43,10 +77,38 @@ jobs:
           IMAGE_VERSION: ${{ steps.version.outputs.value }}
         run: |
           set -euo pipefail
-          docker build \
+          docker buildx build \
             --platform linux/amd64 \
             --build-arg VERSION="$IMAGE_VERSION" \
             --build-arg VCS_REF="$GITHUB_SHA" \
             --tag "$IMAGE:$IMAGE_VERSION" \
+            --push \
+            --metadata-file "$RUNNER_TEMP/image-metadata.json" \
             .
-          docker push "$IMAGE:$IMAGE_VERSION"
+          image_digest="$(jq -er '.["containerimage.digest"]' "$RUNNER_TEMP/image-metadata.json")"
+          echo "value=$image_digest" >> "$GITHUB_OUTPUT"
+        id: image
+
+      - name: Generate the canonical release source lock
+        env:
+          IMAGE_DIGEST: ${{ steps.image.outputs.value }}
+        run: |
+          set -euo pipefail
+          python scripts/create_source_lock.py \
+            --commit "$GITHUB_SHA" \
+            --image-digest "$IMAGE_DIGEST" \
+            --output "$RUNNER_TEMP/SOURCE.lock.json"
+
+      - name: Publish release and source lock
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "$RUNNER_TEMP/SOURCE.lock.json" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              "$RUNNER_TEMP/SOURCE.lock.json" \
+              --title "FMU Executor ${{ steps.version.outputs.value }}" \
+              --generate-notes
+          fi

@@ -64,7 +64,10 @@ Git source archives in the owning Windows/Linux Station packaging workflows.
 
 `VERSION` is the source release version. Keep it aligned with the package
 version in `pyproject.toml` and the release snapshots carried by the Windows and
-Linux Lab Station repositories. The `Dockerfile` builds the optional Gateway
-Executor image. Pushing a matching `vX.Y.Z` tag publishes
-`ghcr.io/decentralabscom/fmu-executor:X.Y.Z`; Gateway pins a versioned image by
-default, so its local Executor profile does not need a source checkout.
+Linux Lab Station repositories. Pushing a matching `vX.Y.Z` tag runs the
+release test matrix, publishes
+`ghcr.io/decentralabscom/fmu-executor:X.Y.Z`, and attaches a generated
+`SOURCE.lock.json` to the GitHub release. The lock records the exact source
+commit and source/runtime hashes together with the immutable OCI image digest.
+Gateway and both Station repositories consume this same lock; platform release
+archives continue to publish their own checksums and signatures.
