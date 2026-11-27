@@ -2887,8 +2887,11 @@ class FmuSession:
             raise ValueError("External solver execution requires the ModelExchange interface")
         var_map = {v.name: v for v in self._md.modelVariables}
         normalized: dict[str, Any] = {}
-        dimension_values: dict[int, int] = {}
+        # Runtime writes use the resolved shape on the model variable. Passing
+        # an empty override map would resolve dimensions from declared starts.
+        dimension_values: dict[int, int] | None = None
         if phase in {"initialization", "reconfiguration"} and self._fmi_major() == "3":
+            dimension_values = {}
             dimension_value_references = {
                 int(dimension.valueReference)
                 for variable in self._md.modelVariables

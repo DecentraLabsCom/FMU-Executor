@@ -616,6 +616,12 @@ def test_fmi3_fixed_structural_parameter_controls_initial_array_size(tmp_path):
     assert session._variable_size(input_array) == 3
     with pytest.raises(ValueError, match="expects exactly 3 values"):
         session.validate_initial_values({"n": 3, "u": [1.0, 2.0]})
+    session._initialised = True
+    assert session.validate_inputs({"u": [1.0, 2.0, 3.0]}) == {
+        "u": [1.0, 2.0, 3.0],
+    }
+    with pytest.raises(ValueError, match="expects exactly 3 values"):
+        session.validate_inputs({"u": [1.0, 2.0]})
 
 
 def test_fmi3_tunable_boolean_structural_parameter_is_valid_at_initialization(tmp_path):
