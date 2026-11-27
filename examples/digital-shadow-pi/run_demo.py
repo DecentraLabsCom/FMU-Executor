@@ -63,21 +63,34 @@ class ExecutorClient:
 
 
 class PIController:
-    def __init__(self, *, setpoint: float, kp: float, ki: float):
+    def __init__(
+        self,
+        *,
+        setpoint: float,
+        kp: float,
+        ki: float,
+        lower: float = 0.0,
+        upper: float = 1.0,
+        initial_input: float = 0.0,
+        direction: int = 1,
+    ):
         self.setpoint = setpoint
         self.kp = kp
         self.ki = ki
-        self.integral = 0.0
+        self.lower = lower
+        self.upper = upper
+        self.direction = direction
+        self.integral = initial_input
 
     def update(self, measured_y: float, step_size: float) -> float:
-        error = self.setpoint - measured_y
+        error = self.direction * (self.setpoint - measured_y)
         candidate_integral = self.integral + self.ki * error * step_size
         raw_u = self.kp * error + candidate_integral
-        control_u = min(1.0, max(0.0, raw_u))
+        control_u = min(self.upper, max(self.lower, raw_u))
         if (
             raw_u == control_u
-            or (raw_u > 1.0 and error < 0.0)
-            or (raw_u < 0.0 and error > 0.0)
+            or (raw_u > self.upper and error < 0.0)
+            or (raw_u < self.lower and error > 0.0)
         ):
             self.integral = candidate_integral
         return control_u
@@ -437,11 +450,15 @@ def parse_args() -> argparse.Namespace:
 
 
 @contextmanager
-def local_executor() -> Iterator[tuple[int, str]]:
+def local_executor(fmu: Path | None = None) -> Iterator[tuple[int, str]]:
     with tempfile.TemporaryDirectory(prefix="fmu-digital-shadow-pi-") as temporary:
         temporary_root = Path(temporary)
         fmu_root = temporary_root / "fmu-data"
-        copy_reference_fmus(fmu_root)
+        if fmu is None:
+            copy_reference_fmus(fmu_root)
+        else:
+            fmu_root.mkdir()
+            shutil.copyfile(fmu, fmu_root / fmu.name)
 
         port = reserve_local_port()
         token = token_urlsafe(32)
