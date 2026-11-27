@@ -39,6 +39,7 @@ connection.
 | [Runtime and FMI support](docs/runtime.md) | FMI behavior, variable metadata, execution lifecycle, isolation, limits and validation |
 | [Dependency audit](docs/dependency-audit.md) | Dependency audit policy and the narrowly scoped upstream advisory exception |
 | [Reference FMUs](examples/reference-fmus/README.md) | Included reference models, provenance, licenses and supported platforms |
+| [Digital shadow PI fixture](examples/digital-shadow-pi/README.md) | StateSpace FMU with an external PI client and a Feedthrough signal smoke check |
 | [Smart Warehouse Cell](examples/smart-warehouse-cell/README.md) | Included visual FMI example, assets and build instructions |
 
 These guides are the source of truth for FMU Executor behavior. Lab Gateway's
