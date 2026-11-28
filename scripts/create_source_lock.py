@@ -9,6 +9,7 @@ import re
 import subprocess
 import tomllib
 from pathlib import Path
+from typing import TypedDict
 
 REPOSITORY = "DecentraLabsCom/FMU-Executor"
 IMAGE_REPOSITORY = "ghcr.io/decentralabscom/fmu-executor"
@@ -17,6 +18,28 @@ RUNTIME_PATHS = ("VERSION", "requirements.txt", "app")
 COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 IMAGE_DIGEST_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 VERSION_PATTERN = re.compile(r"^\d+\.\d+\.\d+$")
+
+
+class ContentDigest(TypedDict):
+    format: str
+    sha256: str
+
+
+class ContainerImage(TypedDict):
+    repository: str
+    reference: str
+    digest: str
+
+
+class SourceLock(TypedDict):
+    schemaVersion: int
+    repository: str
+    version: str
+    runtimeDownloads: bool
+    commit: str
+    sourceTree: ContentDigest
+    runtimePayload: ContentDigest
+    containerImage: ContainerImage
 
 
 def git_bytes(repository: Path, *arguments: str) -> bytes:
@@ -29,7 +52,7 @@ def git_bytes(repository: Path, *arguments: str) -> bytes:
     return result.stdout
 
 
-def source_lock(repository: Path, commit: str, image_digest: str) -> dict[str, object]:
+def source_lock(repository: Path, commit: str, image_digest: str) -> SourceLock:
     if not COMMIT_PATTERN.fullmatch(commit):
         raise ValueError("commit must be a full lowercase Git SHA")
     if not IMAGE_DIGEST_PATTERN.fullmatch(image_digest):
